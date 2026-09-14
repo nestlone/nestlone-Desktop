@@ -1,6 +1,11 @@
 /build/
 /release/
 /.claude/
+/.vs/
+*.exe
+*.manifest
 *.obj
 *.pdb
 *.ilk
+*.log
+*.dmp
