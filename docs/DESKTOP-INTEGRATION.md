@@ -14,7 +14,7 @@ handler caused the reported hang.
 ## Current behavior
 
 - Install the tray before desktop discovery; abort safely if it cannot be installed.
-- Start with the native desktop fully visible and its region unchanged.
+- Start with the native desktop fully visible and its region unchanged when no items belong to a box.
 - Only render boxes, never repaint unboxed desktop icons or wallpaper.
 - Keep all pixels outside boxes fully transparent. Render a successful layered
   frame before showing the overlay.
@@ -23,8 +23,8 @@ handler caused the reported hang.
 - On an explicit desktop-to-box drop, exclude the managed native tile rectangle
   from the ListView's window region. Other native icons remain visible, in their
   original positions, and retain Windows rendering and interaction.
-- Only paths explicitly dropped during this run participate in native masking.
-  Previously saved box items are NOT automatically masked on launch.
+- Paths belonging to boxes participate in native masking, including saved box
+  items restored after launch. Unboxed desktop items remain fully native.
 - Dragging out removes the mask and requests the native Shell to place the
   item at the drop point. Windows grid snapping may adjust that point.
 - Restore the original unrestricted region on pause, exit or process death.

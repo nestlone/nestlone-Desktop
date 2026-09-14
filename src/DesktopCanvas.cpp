@@ -40,6 +40,16 @@ bool InBox(const std::wstring& path) {
         if(_wcsicmp(path.c_str(),p.c_str())==0)return true;
     return false;
 }
+void RestoreManagedPaths() {
+    g_maskedPaths.clear();
+    if(!g_layout)return;
+    for(const auto& box:g_layout->boxes)for(const auto& path:box.items) {
+        if(std::find_if(g_maskedPaths.begin(),g_maskedPaths.end(),[&](const auto& known) {
+            return _wcsicmp(known.c_str(),path.c_str())==0;
+        })==g_maskedPaths.end())g_maskedPaths.push_back(path);
+    }
+    g_desktopMode=!g_maskedPaths.empty();
+}
 RECT DesktopRect(const DesktopEntry& entry) {
     POINT p=entry.position;
     if(g_layout)for(const auto& item:g_layout->desktop)
@@ -246,6 +256,7 @@ void SaveAndRedraw() {
 HWND g_nameEdit=nullptr;
 HFONT g_renameFont=nullptr;
 HBRUSH g_renameBrush=nullptr;
+COLORREF g_renameColor=RGB(26,54,68);
 std::wstring g_renameId;
 
 bool RenameBox(const std::wstring& id,std::wstring value) {
@@ -286,9 +297,11 @@ void BeginRename(int index) {
     HINSTANCE instance=GetModuleHandleW(nullptr);
     if(!g_renameFont)g_renameFont=CreateFontW(-15,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
-    RECT title{box.rect.left+62,box.rect.top+4,box.rect.right-62,box.rect.top+kHeader-4};
-    g_nameEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",box.title.c_str(),
-        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,title.left,title.top,
+    g_renameColor=box.color;
+    if(g_renameBrush){DeleteObject(g_renameBrush);g_renameBrush=nullptr;}
+    RECT title{box.rect.left+62,box.rect.top,box.rect.right-62,box.rect.top+kHeader};
+    g_nameEdit=CreateWindowExW(0,L"EDIT",box.title.c_str(),
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL|ES_CENTER,title.left,title.top,
         title.right-title.left,title.bottom-title.top,g_canvas,nullptr,instance,nullptr);
     if(!g_nameEdit){g_renameId.clear();return;}
     SendMessageW(g_nameEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_renameFont),TRUE);
@@ -341,8 +354,8 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CTLCOLOREDIT:
         if(reinterpret_cast<HWND>(lParam)==g_nameEdit) {
             HDC dc=reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc,RGB(245,253,255));SetBkColor(dc,RGB(26,54,68));
-            if(!g_renameBrush)g_renameBrush=CreateSolidBrush(RGB(26,54,68));
+            SetTextColor(dc,RGB(245,253,255));SetBkColor(dc,g_renameColor);
+            if(!g_renameBrush)g_renameBrush=CreateSolidBrush(g_renameColor);
             return reinterpret_cast<LRESULT>(g_renameBrush);
         }
         return DefWindowProcW(hwnd,message,wParam,lParam);
@@ -489,7 +502,10 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         POINT point{}; DragQueryPoint(drop, &point);
         const int boxIndex = HitBox(point);
         if (boxIndex >= 0) {
-            if(g_desktop.empty()) ReadDesktop(g_desktop);
+            // Explorer may have changed since the background snapshot. Resolve
+            // the dropped path against a fresh Shell view before applying a mask.
+            std::vector<DesktopEntry> fresh;
+            if(ReadDesktop(fresh))g_desktop=std::move(fresh);
             const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
             bool changed = false;
             for (UINT i = 0; i < count; ++i) {
@@ -542,8 +558,7 @@ bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout) {
         wc.lpszClassName, L"", WS_POPUP, parentRect.left, parentRect.top,
         virtualWidth, virtualHeight, parent, nullptr, instance, nullptr);
     if (!g_canvas) { Gdiplus::GdiplusShutdown(g_gdiplusToken);g_gdiplusToken=0;return false; }
-    g_desktopMode=false;
-    g_maskedPaths.clear();
+    RestoreManagedPaths();
     g_frameReady=false;
     HDC firstFrame=GetDC(g_canvas);Paint(g_canvas,firstFrame);ReleaseDC(g_canvas,firstFrame);
     if(!g_frameReady){DestroyWindow(g_canvas);g_canvas=nullptr;Gdiplus::GdiplusShutdown(g_gdiplusToken);g_gdiplusToken=0;return false;}
@@ -585,11 +600,15 @@ void HandleCanvasCommand(CanvasCommand command) {
     if (command == CanvasCommand::Toggle) {
         if(CanvasVisible()) {EndDesktopSession();g_desktopMode=false;g_maskedPaths.clear();ShowWindow(g_canvas,SW_HIDE);}
         else {
-            g_desktopMode=false;PollDesktop(g_desktop);ShowWindow(g_canvas,SW_SHOWNOACTIVATE);CanvasSetOpacity(g_layout->opacity);
+            RestoreManagedPaths();PollDesktop(g_desktop);ShowWindow(g_canvas,SW_SHOWNOACTIVATE);CanvasSetOpacity(g_layout->opacity);
         }
     }
     if (command == CanvasCommand::NewBox) AddBox();
-    if (command == CanvasCommand::Reload) { *g_layout = LoadLayout(); if (g_layout->boxes.empty()) AddBox(); else InvalidateRect(g_canvas, nullptr, TRUE); }
+    if (command == CanvasCommand::Reload) {
+        *g_layout=LoadLayout();
+        if(g_layout->boxes.empty())AddBox();
+        else {RestoreManagedPaths();UpdateCanvasInputRegion();PaintNow();}
+    }
     if (command == CanvasCommand::Exit) DestroyCanvas();
 }
 }

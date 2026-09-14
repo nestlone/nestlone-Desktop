@@ -10,6 +10,7 @@
 #include <mutex>
 #include <memory>
 #include <atomic>
+#include <algorithm>
 #pragma comment(lib,"uuid.lib")
 using Microsoft::WRL::ComPtr;
 namespace nestlone {
@@ -130,12 +131,18 @@ bool MaskDesktopItems(const std::vector<DesktopEntry>& entries,const std::vector
     HRGN region=CreateRectRgn(0,0,bounds.right-bounds.left,bounds.bottom-bounds.top);
     const int virtualLeft=GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int virtualTop=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    for(const auto& entry:entries)for(const auto& path:paths)if(_wcsicmp(entry.path.c_str(),path.c_str())==0) {
-        POINT topLeft{entry.bounds.left+virtualLeft,entry.bounds.top+virtualTop};
-        POINT bottomRight{entry.bounds.right+virtualLeft,entry.bounds.bottom+virtualTop};
+    for(const auto& path:paths) {
+        auto entry=std::find_if(entries.begin(),entries.end(),[&](const DesktopEntry& candidate) {
+            return _wcsicmp(candidate.path.c_str(),path.c_str())==0;
+        });
+        // Do not silently report success when the Shell cannot resolve a saved
+        // desktop entry; callers keep the native desktop untouched instead.
+        if(entry==entries.end()){DeleteObject(region);EndDesktopSession();return false;}
+        POINT topLeft{entry->bounds.left+virtualLeft,entry->bounds.top+virtualTop};
+        POINT bottomRight{entry->bounds.right+virtualLeft,entry->bounds.bottom+virtualTop};
         ScreenToClient(nativeIcons,&topLeft);ScreenToClient(nativeIcons,&bottomRight);
         HRGN hole=CreateRectRgn(topLeft.x,topLeft.y,bottomRight.x,bottomRight.y);
-        CombineRgn(region,region,hole,RGN_DIFF);DeleteObject(hole);break;
+        CombineRgn(region,region,hole,RGN_DIFF);DeleteObject(hole);
     }
     if(!SetWindowRgn(nativeIcons,region,TRUE)){DeleteObject(region);EndDesktopSession();return false;}
     return true;
