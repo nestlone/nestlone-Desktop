@@ -1,5 +1,6 @@
 #include "Tray.h"
 #include "IconFactory.h"
+#include "resource.h"
 #include <shellapi.h>
 
 namespace nestlone {
@@ -12,6 +13,7 @@ bool TrayInstall(HWND owner, HINSTANCE) {
     g_data.uID = 1;
     g_data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_data.uCallbackMessage = WM_TRAY;
+    if (!g_trayIcon) g_trayIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_NESTLONE), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     if (!g_trayIcon) g_trayIcon = CreateNestloneIcon(GetSystemMetrics(SM_CXSMICON));
     g_data.hIcon = g_trayIcon;
     wcscpy_s(g_data.szTip, L"nestlone-D 桌面盒子");
@@ -26,7 +28,7 @@ void TrayRemove(HWND) {
 
 void TrayShowMenu(HWND owner) {
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"暂停 / 启用桌面接管");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"显示 / 隐藏盒子（恢复桌面图标）");
     AppendMenuW(menu, MF_STRING, ID_TRAY_NEW_BOX, L"新建盒子");
     AppendMenuW(menu, MF_STRING, ID_TRAY_RELOAD, L"重新加载布局");
     AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"设置中心");

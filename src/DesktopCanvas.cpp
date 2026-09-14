@@ -30,6 +30,8 @@ std::wstring g_pressedPath;
 std::wstring g_selectedPath;
 POINT g_pressPoint{},g_dragPoint{};
 bool g_itemDragging=false;
+bool g_frameReady=false;
+std::vector<std::wstring> g_maskedPaths;
 
 bool InBox(const std::wstring& path) {
     if(!g_layout)return false;
@@ -133,35 +135,6 @@ void Label(Gdiplus::Graphics& g, const std::wstring& text, RECT r, COLORREF colo
 
 // Render against two mattes with DrawIconEx: preserves both modern alpha icons
 // and legacy AND masks. GDI+ Bitmap(HICON) discards alpha for some Shell icons.
-std::vector<DWORD> IconPixels(HICON icon,int size) {
-    std::vector<DWORD> result;
-    HDC dc=CreateCompatibleDC(nullptr);
-    BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth=size; bi.bmiHeader.biHeight=-size;
-    bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32;
-    void* raw=nullptr;
-    HBITMAP bitmap=CreateDIBSection(dc,&bi,DIB_RGB_COLORS,&raw,nullptr,0);
-    if(!bitmap || !raw) { if(bitmap)DeleteObject(bitmap); DeleteDC(dc); return result; }
-    auto old=SelectObject(dc,bitmap);
-    auto* pixels=static_cast<DWORD*>(raw);
-    std::fill(pixels,pixels+size*size,0);
-    DrawIconEx(dc,0,0,icon,size,size,0,nullptr,DI_NORMAL);
-    GdiFlush();
-    result.assign(pixels,pixels+size*size);
-    std::fill(pixels,pixels+size*size,0x00ffffff);
-    DrawIconEx(dc,0,0,icon,size,size,0,nullptr,DI_NORMAL);
-    GdiFlush();
-    for(int i=0;i<size*size;++i) {
-        DWORD black=result[i],white=pixels[i];
-        int delta=0;
-        for(int shift=0;shift<24;shift+=8)
-            delta=max(delta,static_cast<int>((white>>shift)&255)-static_cast<int>((black>>shift)&255));
-        DWORD a=static_cast<DWORD>(255-delta);
-        result[i]=(a<<24)|(min(a,(black>>16)&255)<<16)|(min(a,(black>>8)&255)<<8)|min(a,black&255);
-    }
-    SelectObject(dc,old);DeleteObject(bitmap);DeleteDC(dc);
-    return result;
-}
 
 void PaintBox(Gdiplus::Graphics& g, const Box& box, int opacity) {
     const RECT visible = DisplayRect(box);
@@ -182,19 +155,18 @@ void PaintBox(Gdiplus::Graphics& g, const Box& box, int opacity) {
         if (item.bottom>box.rect.bottom-8) break;
         const auto& path=box.items[i];
         if(path==g_selectedPath)Rounded(g,item,Gdiplus::Color(85,80,160,210));
-        SHFILEINFOW fi{};
-        if (SHGetFileInfoW(path.c_str(),0,&fi,sizeof(fi),SHGFI_ICON | SHGFI_DISPLAYNAME |
-            (box.iconView ? SHGFI_LARGEICON : SHGFI_SMALLICON))) {
-            int size=box.iconView ? 32 : 16;
-            int x=box.iconView ? (item.left+item.right-size)/2 : item.left+4;
-            auto pixels=IconPixels(fi.hIcon,size);
+        const DesktopEntry* cached=nullptr;
+        for(const auto& entry:g_desktop)if(_wcsicmp(entry.path.c_str(),path.c_str())==0){cached=&entry;break;}
+        if(cached) {
+            const int size=box.iconView?32:16;
+            const auto& pixels=box.iconView?cached->largeIcon:cached->smallIcon;
             if(!pixels.empty()) {
-                Gdiplus::Bitmap icon(size,size,size*4,PixelFormat32bppPARGB,reinterpret_cast<BYTE*>(pixels.data()));
-                g.DrawImage(&icon,x,item.top+(box.iconView ? 2 : 5),size,size);
+                Gdiplus::Bitmap icon(size,size,size*4,PixelFormat32bppPARGB,reinterpret_cast<BYTE*>(const_cast<DWORD*>(pixels.data())));
+                int x=box.iconView?(item.left+item.right-size)/2:item.left+4;
+                g.DrawImage(&icon,x,item.top+(box.iconView?2:5),size,size);
             }
-            DestroyIcon(fi.hIcon);
         }
-        std::wstring name=fi.szDisplayName[0] ? fi.szDisplayName : std::filesystem::path(path).filename().wstring();
+        std::wstring name=cached?cached->name:std::filesystem::path(path).filename().wstring();
         if (box.iconView) { item.left+=2; item.right-=2; item.top+=36; }
         else item.left+=26;
         Label(g,name,item,theme::text,box.iconView,box.iconView);
@@ -204,20 +176,9 @@ void PaintBox(Gdiplus::Graphics& g, const Box& box, int opacity) {
 bool RenderPixels(void* pixels, int width, int height, const Layout& layout) {
     Gdiplus::Bitmap surface(width,height,width*4,PixelFormat32bppPARGB,static_cast<BYTE*>(pixels));
     Gdiplus::Graphics g(&surface);
-    g.Clear(Gdiplus::Color(g_desktopMode ? 1 : 0,0,0,0));
+    g.Clear(Gdiplus::Color(0,0,0,0));
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-    if(g_desktopMode)for(const auto& entry:g_desktop) if(!InBox(entry.path)) {
-        RECT r=DesktopRect(entry);
-        if(entry.path==g_selectedPath)Rounded(g,r,Gdiplus::Color(90,90,180,220));
-        SHFILEINFOW fi{};
-        if(SHGetFileInfoW(entry.path.c_str(),0,&fi,sizeof(fi),SHGFI_ICON|SHGFI_LARGEICON)) {
-            auto data=IconPixels(fi.hIcon,32);DestroyIcon(fi.hIcon);
-            if(!data.empty()) {Gdiplus::Bitmap icon(32,32,128,PixelFormat32bppPARGB,reinterpret_cast<BYTE*>(data.data()));
-                g.DrawImage(&icon,r.left+22,r.top+2,32,32);}
-        }
-        r.top+=38;Label(g,entry.name,r,theme::text,true,true);
-    }
     for (const Box& box:layout.boxes) PaintBox(g,box,layout.opacity);
     if(g_itemDragging) {
         RECT r{g_dragPoint.x+12,g_dragPoint.y+12,g_dragPoint.x+190,g_dragPoint.y+42};
@@ -247,11 +208,34 @@ void Paint(HWND hwnd, HDC target) {
         BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
         if (!UpdateLayeredWindow(hwnd,nullptr,&position,&size,memory,&source,0,&blend,ULW_ALPHA))
             db::LogF("UpdateLayeredWindow failed: %lu",GetLastError());
+        else g_frameReady=true;
     }
     SelectObject(memory,old); DeleteObject(bitmap); DeleteDC(memory);
 }
 
-void SaveAndRedraw() { SaveLayout(*g_layout); InvalidateRect(g_canvas, nullptr, TRUE); }
+bool SyncMask() {
+    if(!g_desktopMode)return true;
+    std::vector<std::wstring> paths;
+    for(const auto& path:g_maskedPaths)if(InBox(path))paths.push_back(path);
+    return MaskDesktopItems(g_desktop,paths);
+}
+void UpdateCanvasInputRegion() {
+    if(!g_canvas || !g_layout) return;
+    HRGN region=CreateRectRgn(0,0,0,0);
+    for(const Box& box:g_layout->boxes) {
+        const RECT visible=DisplayRect(box);
+        HRGN part=CreateRoundRectRgn(visible.left,visible.top,visible.right+1,visible.bottom+1,14,14);
+        CombineRgn(region,region,part,RGN_OR);
+        DeleteObject(part);
+    }
+    // SetWindowRgn takes ownership of region on success.
+    if(!SetWindowRgn(g_canvas,region,TRUE)) DeleteObject(region);
+}
+void SaveAndRedraw() {
+    if(!SyncMask()){g_desktopMode=false;EndDesktopSession();}
+    UpdateCanvasInputRegion();
+    SaveLayout(*g_layout);InvalidateRect(g_canvas,nullptr,TRUE);
+}
 
 HWND g_rename=nullptr;
 HWND g_nameEdit=nullptr;
@@ -371,11 +355,9 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     switch (message) {
     case WM_CREATE: DragAcceptFiles(hwnd, TRUE); SetTimer(hwnd,1,2000,nullptr); return 0;
     case WM_TIMER:
-        if(g_desktopMode && GetCapture()!=hwnd) {
-            if(!DesktopSessionAlive()) {
-                EndDesktopSession();g_desktopMode=false;ShowWindow(hwnd,SW_HIDE);
-                MessageBoxW(nullptr,L"桌面宿主发生变化，已停止接管。可从托盘重新启用。",L"nestlone-D",MB_OK);
-            } else if(ReadDesktop(g_desktop)) InvalidateRect(hwnd,nullptr,FALSE);
+        if(GetCapture()!=hwnd && PollDesktop(g_desktop)) {
+            if(!SyncMask()){EndDesktopSession();g_desktopMode=false;}
+            InvalidateRect(hwnd,nullptr,FALSE);
         }
         return 0;
     case WM_CANCELMODE:
@@ -496,6 +478,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     int target=HitBox(p);
                     POINT topLeft{max(0L,min(client.right-76,p.x-38)),max(0L,min(client.bottom-78,p.y-16))};
                     AssignDesktopItem(*g_layout,g_pressedPath,target,topLeft);SaveAndRedraw();
+                    if(target<0)PlaceDesktopItem(g_pressedPath,topLeft);
                 }
             }
             g_pressedPath.clear();g_itemDragging=false;
@@ -510,6 +493,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         POINT point{}; DragQueryPoint(drop, &point);
         const int boxIndex = HitBox(point);
         if (boxIndex >= 0) {
+            if(g_desktop.empty()) ReadDesktop(g_desktop);
             const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
             bool changed = false;
             for (UINT i = 0; i < count; ++i) {
@@ -517,6 +501,8 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 std::wstring path(size+1,L'\0');DragQueryFileW(drop,i,path.data(),size+1);path.resize(size);
                 // This is a desktop-only organizer. Import only existing desktop entries.
                 for(const auto& entry:g_desktop) if(_wcsicmp(entry.path.c_str(),path.c_str())==0) {
+                    g_desktopMode=true;
+                    if(std::find(g_maskedPaths.begin(),g_maskedPaths.end(),path)==g_maskedPaths.end())g_maskedPaths.push_back(path);
                     changed=AssignDesktopItem(*g_layout,path,boxIndex,point)||changed;break;
                 }
             }
@@ -533,7 +519,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
 bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout) {
     g_layout = layout;
-    if(!ReadDesktop(g_desktop))return false;
+    PollDesktop(g_desktop);
     WNDCLASSW wc{};
     wc.hInstance = instance;
     wc.style = CS_DBLCLKS;
@@ -541,19 +527,28 @@ bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout) {
     wc.lpszClassName = L"nestlone-D.Canvas";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    RECT parentRect{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),
-        GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+    const int virtualLeft=GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualTop=GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth=GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtualHeight=GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    RECT parentRect{virtualLeft,virtualTop,virtualLeft+virtualWidth,virtualTop+virtualHeight};
     // Layered child windows are rejected on some Explorer/Windows configurations.
     // Use a borderless popup owned by the desktop host instead; it keeps the same
     // z-order intent while allowing the color-key transparency to work reliably.
     g_canvas = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        wc.lpszClassName, L"", WS_POPUP | WS_VISIBLE, parentRect.left, parentRect.top,
-        parentRect.right, parentRect.bottom, parent, nullptr, instance, nullptr);
+        wc.lpszClassName, L"", WS_POPUP, parentRect.left, parentRect.top,
+        virtualWidth, virtualHeight, parent, nullptr, instance, nullptr);
     if (!g_canvas) return false;
-    g_desktopMode=true;
-    InvalidateRect(g_canvas, nullptr, TRUE);
-    UpdateWindow(g_canvas);
-    if(!BeginDesktopSession()) {g_desktopMode=false;DestroyWindow(g_canvas);g_canvas=nullptr;return false;}
+    g_desktopMode=false;
+    g_maskedPaths.clear();
+    g_frameReady=false;
+    HDC firstFrame=GetDC(g_canvas);Paint(g_canvas,firstFrame);ReleaseDC(g_canvas,firstFrame);
+    if(!g_frameReady){DestroyWindow(g_canvas);g_canvas=nullptr;return false;}
+    UpdateCanvasInputRegion();
+    // A shaped popup sits above Explorer only where boxes are visible; elsewhere
+    // the native desktop owns both paint and mouse interaction.
+    SetWindowPos(g_canvas,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    ShowWindow(g_canvas,SW_SHOWNOACTIVATE);
     return true;
 }
 
@@ -577,10 +572,10 @@ void CanvasSetOpacity(int opacity) {
 void HandleCanvasCommand(CanvasCommand command) {
     if (!g_canvas) return;
     if (command == CanvasCommand::Toggle) {
-        if(CanvasVisible()) {EndDesktopSession();g_desktopMode=false;ShowWindow(g_canvas,SW_HIDE);}
-        else if(ReadDesktop(g_desktop) && BeginDesktopSession()) {
-            g_desktopMode=true;ShowWindow(g_canvas,SW_SHOWNOACTIVATE);CanvasSetOpacity(g_layout->opacity);
-        } else MessageBoxW(nullptr,L"暂时无法接管桌面，原生图标保持可见。",L"nestlone-D",MB_OK|MB_ICONWARNING);
+        if(CanvasVisible()) {EndDesktopSession();g_desktopMode=false;g_maskedPaths.clear();ShowWindow(g_canvas,SW_HIDE);}
+        else {
+            g_desktopMode=false;PollDesktop(g_desktop);ShowWindow(g_canvas,SW_SHOWNOACTIVATE);CanvasSetOpacity(g_layout->opacity);
+        }
     }
     if (command == CanvasCommand::NewBox) AddBox();
     if (command == CanvasCommand::Reload) { *g_layout = LoadLayout(); if (g_layout->boxes.empty()) AddBox(); else InvalidateRect(g_canvas, nullptr, TRUE); }

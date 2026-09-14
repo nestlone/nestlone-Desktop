@@ -1,78 +1,68 @@
 #include "../../src/DesktopCanvas.cpp"
 #include "../../src/DesktopHost.h"
 #include <cstdio>
+#include <shlobj.h>
 #include <gdiplus.h>
-
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--restore-desktop")==0) {
-        std::wstring args;
-        for(int i=1;i<argc;++i){if(i>1)args+=L" ";args+=argv[i];}
+        std::wstring args;for(int i=1;i<argc;++i){if(i>1)args+=L" ";args+=argv[i];}
         return nestlone::DesktopRecovery(args.c_str());
     }
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
-    Gdiplus::GdiplusStartupInput input;ULONG_PTR token=0;
-    Gdiplus::GdiplusStartup(&token,&input,nullptr);
+    Gdiplus::GdiplusStartupInput input;ULONG_PTR token=0;Gdiplus::GdiplusStartup(&token,&input,nullptr);
     int failures=0;
     auto check=[&](bool ok,const char* message){printf("%s %s\n",ok?"PASS":"FAIL",message);fflush(stdout);if(!ok)++failures;};
     auto host=db::DiscoverDesktopHost();
+    auto noMask=[&] {HRGN r=CreateRectRgn(0,0,0,0);int result=GetWindowRgn(host.listview,r);DeleteObject(r);return result==ERROR;};
     if(argc>1 && wcscmp(argv[1],L"--verify-native")==0) {
-        for(int i=0;i<40 && !IsWindowVisible(host.listview);++i)Sleep(50);
-        check(IsWindowVisible(host.listview),"recovery restores native icons after forced termination");
+        for(int i=0;i<40 && !noMask();++i)Sleep(50);
+        check(IsWindowVisible(host.listview)&&noMask(),"native desktop visible and region restored");
         Gdiplus::GdiplusShutdown(token);CoUninitialize();return failures?1:0;
     }
-    check(host.listview && IsWindowVisible(host.listview),"native desktop initially visible");
+    check(host.listview && IsWindowVisible(host.listview)&&noMask(),"native desktop initially visible with no custom region");
     if(failures)return 1;
-    nestlone::Layout layout;nestlone::Box box;
-    box.id=L"test-box";box.title=L"Hosting test";box.rect={600,120,960,400};
-    layout.boxes.push_back(box);
-    check(nestlone::CreateCanvas(GetModuleHandleW(nullptr),host.wallpaperWorker ? host.wallpaperWorker : GetDesktopWindow(),&layout),"create hosting canvas and arm recovery");
-    check(!IsWindowVisible(host.listview),"native icons suppressed");
-    if(argc>1 && wcscmp(argv[1],L"--crash-test")==0) {
-        printf("Intentional termination to test recovery\n");fflush(stdout);
-        TerminateProcess(GetCurrentProcess(),77);
-    }
-    if(!failures && !nestlone::g_desktop.empty()) {
-        auto entry=nestlone::g_desktop.front();
-        for(const auto& candidate:nestlone::g_desktop)
-            if(candidate.name.find(L"DeskBox-hosting-test")!=std::wstring::npos){entry=candidate;break;}
-        DWORD attributes=GetFileAttributesW(entry.path.c_str());
-        auto source=nestlone::DesktopRect(entry);
-        POINT p{source.left+24,source.top+20},inside{680,240},outside{450,420};
+    nestlone::Layout layout;nestlone::Box box;box.id=L"test";box.title=L"Mask test";box.rect={600,120,960,400};layout.boxes.push_back(box);
+    check(nestlone::CreateCanvas(GetModuleHandleW(nullptr),host.wallpaperWorker?host.wallpaperWorker:GetDesktopWindow(),&layout),"create overlay without Shell work on paint thread");
+    check(IsWindowVisible(host.listview)&&noMask(),"startup leaves native desktop untouched");
+    std::vector<nestlone::DesktopEntry> entries;
+    check(nestlone::ReadDesktop(entries),"read metadata for test");
+    nestlone::g_desktop=entries;
+    auto found=std::find_if(entries.begin(),entries.end(),[](const auto& e){return e.name==L"DeskBox-hosting-test-20260914";});
+    check(found!=entries.end(),"disposable test folder exists");
+    if(found!=entries.end() && !failures) {
+        auto entry=*found;DWORD attrs=GetFileAttributesW(entry.path.c_str());
         HWND canvas=nestlone::g_canvas;
-        SendMessageW(canvas,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(p.x,p.y));
-        SendMessageW(canvas,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(inside.x,inside.y));
-        SendMessageW(canvas,WM_LBUTTONUP,0,MAKELPARAM(inside.x,inside.y));
-        check(layout.boxes[0].items.size()==1 && nestlone::InBox(entry.path),"desktop to box changes ownership exactly once");
-        check(nestlone::HitDesktop(p).empty(),"boxed icon is absent from desktop hit testing");
+        const SIZE_T bytes=sizeof(DROPFILES)+(entry.path.size()+2)*sizeof(wchar_t);
+        HGLOBAL drop=GlobalAlloc(GHND,bytes);
+        auto data=static_cast<DROPFILES*>(GlobalLock(drop));data->pFiles=sizeof(DROPFILES);data->fWide=TRUE;data->pt={680,240};
+        memcpy(reinterpret_cast<BYTE*>(data)+sizeof(DROPFILES),entry.path.c_str(),(entry.path.size()+1)*sizeof(wchar_t));
+        GlobalUnlock(drop);
+        SendMessageW(canvas,WM_DROPFILES,reinterpret_cast<WPARAM>(drop),0);
+        check(layout.boxes[0].items.size()==1,"desktop drop is accepted");
+        HRGN region=CreateRectRgn(0,0,0,0);int kind=GetWindowRgn(host.listview,region);
+        check(kind!=ERROR && !PtInRegion(region,(entry.bounds.left+entry.bounds.right)/2,(entry.bounds.top+entry.bounds.bottom)/2),"only managed tile excluded from native view");
+        check(IsWindowVisible(host.listview),"native icon window remains visible after drop");
+        int otherVisible=0;
+        for(const auto& e:entries)if(e.path!=entry.path &&
+            PtInRegion(region,(e.bounds.left+e.bounds.right)/2,(e.bounds.top+e.bounds.bottom)/2))++otherVisible;
+        check(otherVisible==static_cast<int>(entries.size())-1,"all other native icon areas remain visible");
+        DeleteObject(region);
+        if(argc>1 && wcscmp(argv[1],L"--crash-test")==0){printf("Intentional termination\n");fflush(stdout);TerminateProcess(GetCurrentProcess(),77);}
         auto item=nestlone::ItemRect(layout.boxes[0],0);
-        POINT boxPoint{item.left+10,item.top+10};
-        SendMessageW(canvas,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(boxPoint.x,boxPoint.y));
-        SendMessageW(canvas,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(outside.x,outside.y));
-        SendMessageW(canvas,WM_LBUTTONUP,0,MAKELPARAM(outside.x,outside.y));
-        check(layout.boxes[0].items.empty() && !nestlone::InBox(entry.path),"box to desktop clears ownership");
-        check(nestlone::HitDesktop(outside)==entry.path,"desktop icon placed at drop location");
-        SendMessageW(canvas,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(outside.x,outside.y));
-        SendMessageW(canvas,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(inside.x,inside.y));
-        SendMessageW(canvas,WM_KEYDOWN,VK_ESCAPE,0);
-        SendMessageW(canvas,WM_LBUTTONUP,0,MAKELPARAM(inside.x,inside.y));
-        check(layout.boxes[0].items.empty(),"Escape cancels a drag without ownership changes");
-        auto path=entry.path;
-        nestlone::Box second;second.id=L"second";layout.boxes.push_back(second);
-        nestlone::AssignDesktopItem(layout,path,0,{});
-        nestlone::AssignDesktopItem(layout,path,1,{});
-        check(layout.boxes[0].items.empty() && layout.boxes[1].items.size()==1,"box-to-box transfer has one owner");
-        nestlone::AssignDesktopItem(layout,path,-1,{412,404});
-        nestlone::SaveLayout(layout);
-        check(GetFileAttributesW(entry.path.c_str())==attributes,"file attributes unchanged");
-        auto loaded=nestlone::LoadLayout();
-        check(!loaded.desktop.empty() && loaded.desktop.back().path==entry.path,"drop location persists to isolated test layout");
-        nestlone::HandleCanvasCommand(nestlone::CanvasCommand::Toggle);
-        check(IsWindowVisible(host.listview),"pause restores native desktop");
-        nestlone::HandleCanvasCommand(nestlone::CanvasCommand::Toggle);
-        check(!IsWindowVisible(host.listview),"resume hides native desktop");
+        POINT out{450,420};
+        SendMessageW(canvas,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(item.left+10,item.top+10));
+        SendMessageW(canvas,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(out.x,out.y));
+        SendMessageW(canvas,WM_LBUTTONUP,0,MAKELPARAM(out.x,out.y));
+        check(layout.boxes[0].items.empty() && noMask(),"drag out restores native tile");
+        Sleep(500);
+        nestlone::PlaceDesktopItem(entry.path,entry.position);Sleep(500);
+        check(GetFileAttributesW(entry.path.c_str())==attrs,"file attributes unchanged");
+        std::vector<nestlone::DesktopEntry> after;nestlone::ReadDesktop(after);
+        int same=0;
+        for(const auto& before:entries)if(before.path!=entry.path)for(const auto& e:after)
+            if(before.path==e.path && before.position.x==e.position.x && before.position.y==e.position.y)++same;
+        check(same==static_cast<int>(entries.size())-1,"all other native icon positions unchanged");
     }
-    nestlone::DestroyCanvas();
-    check(IsWindowVisible(host.listview),"normal exit restores native desktop");
-    Gdiplus::GdiplusShutdown(token);CoUninitialize();
-    return failures ? 1 : 0;
+    nestlone::DestroyCanvas();check(IsWindowVisible(host.listview)&&noMask(),"normal exit restores original native region");
+    Gdiplus::GdiplusShutdown(token);CoUninitialize();return failures?1:0;
 }

@@ -9,6 +9,7 @@
 #include "Settings.h"
 #include "DesktopItems.h"
 #include "DesktopSession.h"
+#include "resource.h"
 #include "log.h"
 
 namespace {
@@ -52,7 +53,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     if(wcsncmp(arguments,L"--restore-desktop ",18)==0)return nestlone::DesktopRecovery(arguments);
     g_mutex = CreateMutexW(nullptr, TRUE, kMutex);
     if (!g_mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND existing = FindWindowW(kControlClass, nullptr);
+        HWND existing = FindWindowExW(HWND_MESSAGE,nullptr,kControlClass,nullptr);
         if (existing) PostMessageW(existing, WM_COMMAND, nestlone::ID_TRAY_TOGGLE, 0);
         if (g_mutex) CloseHandle(g_mutex);
         return 0;
@@ -72,12 +73,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     wc.hInstance = instance;
     wc.lpfnWndProc = ControlProc;
     wc.lpszClassName = kControlClass;
-    wc.hIcon = nestlone::CreateNestloneIcon(GetSystemMetrics(SM_CXICON));
-    wc.hIconSm = nestlone::CreateNestloneIcon(GetSystemMetrics(SM_CXSMICON));
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_NESTLONE));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_NESTLONE), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    if (!wc.hIcon) wc.hIcon = nestlone::CreateNestloneIcon(GetSystemMetrics(SM_CXICON));
+    if (!wc.hIconSm) wc.hIconSm = nestlone::CreateNestloneIcon(GetSystemMetrics(SM_CXSMICON));
     RegisterClassExW(&wc);
     g_control = CreateWindowExW(0, kControlClass, L"nestlone-D", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, instance, nullptr);
     if (!g_control) return 1;
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    // Always expose an exit/settings route before any desktop discovery.
+    if(!nestlone::TrayInstall(g_control,instance)) {
+        MessageBoxW(nullptr,L"无法建立托盘入口，程序将退出，桌面保持不变。",L"nestlone-D",MB_OK|MB_ICONWARNING);
+        DestroyWindow(g_control);return 1;
+    }
 
     db::HostInfo host = db::DiscoverDesktopHost();
     db::LogHostInfo(host);
@@ -86,15 +94,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
         db::LogF("CreateCanvas failed: %lu", GetLastError());
         MessageBoxW(nullptr,L"桌面接管未能启动，原生桌面保持不变。请查看日志。",L"nestlone-D",MB_OK|MB_ICONWARNING);
         DestroyWindow(g_control);
-    } else {
-        nestlone::TrayInstall(g_control, instance);
     }
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
     db::LogClose();
-    if (wc.hIcon) DestroyIcon(wc.hIcon);
-    if (wc.hIconSm) DestroyIcon(wc.hIconSm);
     CoUninitialize();
     CloseHandle(g_mutex);
     return static_cast<int>(message.wParam);

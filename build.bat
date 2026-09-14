@@ -15,21 +15,24 @@ if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" (echo [BUILD] Visual Stud
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 (echo [BUILD] vcvars64 failed & exit /b 1)
 
-set OUTDIR=%~1
+set OUTDIR=%~f1
 if "%OUTDIR%"=="" set OUTDIR=%~dp0build
 set OUTNAME=%~2
 if "%OUTNAME%"=="" set OUTNAME=nestlone-D.exe
 set SRCDIR=%~3
 if "%SRCDIR%"=="" set SRCDIR=%~dp0src
 set EXTRA=%~4
+set RCFILE=%~dp0src\DeskBox.rc
 
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 set OBJDIR=%~dp0build\obj
 if not exist "%OBJDIR%" mkdir "%OBJDIR%"
 pushd "%OUTDIR%"
+rc /nologo /fo"%OBJDIR%\DeskBox.res" "%RCFILE%"
+if errorlevel 1 (echo [BUILD] resource compilation failed & popd & exit /b 1)
 cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W4 /DUNICODE /D_UNICODE %EXTRA% ^
    /Fo"%OBJDIR%\\" /Fe"%OUTDIR%\%OUTNAME%" "%SRCDIR%\*.cpp" ^
-   /link /SUBSYSTEM:WINDOWS /INCREMENTAL:NO ^
+   "%OBJDIR%\DeskBox.res" /link /SUBSYSTEM:WINDOWS /INCREMENTAL:NO ^
    user32.lib shell32.lib shlwapi.lib gdiplus.lib gdi32.lib ole32.lib oleaut32.lib comctl32.lib advapi32.lib
 set RC=%errorlevel%
 popd

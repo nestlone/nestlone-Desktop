@@ -1,5 +1,8 @@
 # Whole-desktop hosting experiment
 
+Historical report for f755572. Superseded after the user reported failure;
+see NATIVE-OVERLAY.md for the corrected behavior and current test coverage.
+
 Branch: codex/desktop-icon-hosting.
 Original snapshot: 0a0f535 / snapshot/pre-desktop-hosting.
 
