@@ -32,6 +32,7 @@ POINT g_pressPoint{},g_dragPoint{};
 bool g_itemDragging=false;
 bool g_frameReady=false;
 std::vector<std::wstring> g_maskedPaths;
+ULONG_PTR g_gdiplusToken=0;
 
 bool InBox(const std::wstring& path) {
     if(!g_layout)return false;
@@ -518,6 +519,13 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 }
 
 bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout) {
+    // The embedded application icon means IconFactory may not run at startup.
+    // Canvas rendering always uses GDI+, so initialize it explicitly instead of
+    // relying on that unrelated fallback path.
+    if(!g_gdiplusToken) {
+        Gdiplus::GdiplusStartupInput input;
+        if(Gdiplus::GdiplusStartup(&g_gdiplusToken,&input,nullptr)!=Gdiplus::Ok) return false;
+    }
     g_layout = layout;
     PollDesktop(g_desktop);
     WNDCLASSW wc{};
@@ -538,12 +546,12 @@ bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout) {
     g_canvas = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         wc.lpszClassName, L"", WS_POPUP, parentRect.left, parentRect.top,
         virtualWidth, virtualHeight, parent, nullptr, instance, nullptr);
-    if (!g_canvas) return false;
+    if (!g_canvas) { Gdiplus::GdiplusShutdown(g_gdiplusToken);g_gdiplusToken=0;return false; }
     g_desktopMode=false;
     g_maskedPaths.clear();
     g_frameReady=false;
     HDC firstFrame=GetDC(g_canvas);Paint(g_canvas,firstFrame);ReleaseDC(g_canvas,firstFrame);
-    if(!g_frameReady){DestroyWindow(g_canvas);g_canvas=nullptr;return false;}
+    if(!g_frameReady){DestroyWindow(g_canvas);g_canvas=nullptr;Gdiplus::GdiplusShutdown(g_gdiplusToken);g_gdiplusToken=0;return false;}
     UpdateCanvasInputRegion();
     // A shaped popup sits above Explorer only where boxes are visible; elsewhere
     // the native desktop owns both paint and mouse interaction.
@@ -552,7 +560,13 @@ bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout) {
     return true;
 }
 
-void DestroyCanvas() { EndDesktopSession();g_desktopMode=false; if(g_rename)DestroyWindow(g_rename); if (g_canvas) DestroyWindow(g_canvas); g_canvas = nullptr; }
+void DestroyCanvas() {
+    EndDesktopSession();g_desktopMode=false;
+    if(g_rename)DestroyWindow(g_rename);
+    if(g_canvas)DestroyWindow(g_canvas);
+    g_canvas=nullptr;
+    if(g_gdiplusToken){Gdiplus::GdiplusShutdown(g_gdiplusToken);g_gdiplusToken=0;}
+}
 
 bool CanvasVisible() { return g_canvas && IsWindowVisible(g_canvas); }
 
