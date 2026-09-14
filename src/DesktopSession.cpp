@@ -104,6 +104,13 @@ bool BeginDesktopSession() {
     if(nativeIcons)return DesktopSessionAlive();
     auto host=db::DiscoverDesktopHost();
     if(!host.listview || !IsWindowVisible(host.listview))return false;
+    const DWORD previousOwner=static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(GetPropW(host.listview,lease)));
+    if(previousOwner) {
+        HANDLE previous=OpenProcess(SYNCHRONIZE,FALSE,previousOwner);
+        const bool dead=previous ? WaitForSingleObject(previous,0)==WAIT_OBJECT_0 : GetLastError()==ERROR_INVALID_PARAMETER;
+        if(previous)CloseHandle(previous);
+        if(dead) {SetWindowRgn(host.listview,nullptr,TRUE);RemovePropW(host.listview,lease);}
+    }
     HRGN existing=CreateRectRgn(0,0,0,0);
     int kind=GetWindowRgn(host.listview,existing);DeleteObject(existing);
     if(kind!=ERROR)return false; // Do not overwrite another application's region.

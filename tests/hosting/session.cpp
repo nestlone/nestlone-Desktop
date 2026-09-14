@@ -13,17 +13,32 @@ int wmain(int argc,wchar_t** argv) {
     int failures=0;
     auto check=[&](bool ok,const char* message){printf("%s %s\n",ok?"PASS":"FAIL",message);fflush(stdout);if(!ok)++failures;};
     auto host=db::DiscoverDesktopHost();
+    printf("Desktop view=%p visible=%d\n",host.listview,IsWindowVisible(host.listview));
     auto noMask=[&] {HRGN r=CreateRectRgn(0,0,0,0);int result=GetWindowRgn(host.listview,r);DeleteObject(r);return result==ERROR;};
     if(argc>1 && wcscmp(argv[1],L"--verify-native")==0) {
         for(int i=0;i<40 && !noMask();++i)Sleep(50);
         check(IsWindowVisible(host.listview)&&noMask(),"native desktop visible and region restored");
         Gdiplus::GdiplusShutdown(token);CoUninitialize();return failures?1:0;
     }
+    if(!noMask()) {nestlone::BeginDesktopSession();nestlone::EndDesktopSession();}
     check(host.listview && IsWindowVisible(host.listview)&&noMask(),"native desktop initially visible with no custom region");
     if(failures)return 1;
     nestlone::Layout layout;nestlone::Box box;box.id=L"test";box.title=L"Mask test";box.rect={600,120,960,400};layout.boxes.push_back(box);
     check(nestlone::CreateCanvas(GetModuleHandleW(nullptr),host.wallpaperWorker?host.wallpaperWorker:GetDesktopWindow(),&layout),"create overlay without Shell work on paint thread");
     check(IsWindowVisible(host.listview)&&noMask(),"startup leaves native desktop untouched");
+    nestlone::BeginRename(0);
+    HWND editor=nestlone::g_nameEdit;
+    DWORD selectionStart=99,selectionEnd=99;
+    SendMessageW(editor,EM_GETSEL,reinterpret_cast<WPARAM>(&selectionStart),reinterpret_cast<LPARAM>(&selectionEnd));
+    check(editor && IsWindowVisible(editor) && GetFocus()==editor,"inline rename visible and keyboard focused");
+    check(selectionStart==0 && selectionEnd==layout.boxes[0].title.size(),"current title initially selected in full");
+    SendMessageW(editor,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(L"New title"));
+    SendMessageW(editor,WM_KEYDOWN,VK_RETURN,0);
+    check(layout.boxes[0].title==L"New title" && !nestlone::g_nameEdit,"typing replaces selection and Enter commits");
+    nestlone::BeginRename(0);
+    SendMessageW(nestlone::g_nameEdit,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(L"Cancelled"));
+    SendMessageW(nestlone::g_nameEdit,WM_KEYDOWN,VK_ESCAPE,0);
+    check(layout.boxes[0].title==L"New title","Escape preserves original title");
     std::vector<nestlone::DesktopEntry> entries;
     check(nestlone::ReadDesktop(entries),"read metadata for test");
     nestlone::g_desktop=entries;
@@ -42,6 +57,11 @@ int wmain(int argc,wchar_t** argv) {
         HRGN region=CreateRectRgn(0,0,0,0);int kind=GetWindowRgn(host.listview,region);
         check(kind!=ERROR && !PtInRegion(region,(entry.bounds.left+entry.bounds.right)/2,(entry.bounds.top+entry.bounds.bottom)/2),"only managed tile excluded from native view");
         check(IsWindowVisible(host.listview),"native icon window remains visible after drop");
+        layout.boxes[0].items.push_back(L"C:\\missing-nestlone-test-item.lnk");
+        nestlone::EndDesktopSession();
+        nestlone::RestoreManagedPaths();
+        check(nestlone::SyncMask() && !noMask(),"saved ownership restores mask despite an obsolete path");
+        layout.boxes[0].items.pop_back();
         int otherVisible=0;
         for(const auto& e:entries)if(e.path!=entry.path &&
             PtInRegion(region,(e.bounds.left+e.bounds.right)/2,(e.bounds.top+e.bounds.bottom)/2))++otherVisible;

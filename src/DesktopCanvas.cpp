@@ -227,7 +227,8 @@ void Paint(HWND hwnd, HDC target) {
 bool SyncMask() {
     if(!g_desktopMode)return true;
     std::vector<std::wstring> paths;
-    for(const auto& path:g_maskedPaths)if(InBox(path))paths.push_back(path);
+    for(const auto& path:g_maskedPaths)if(InBox(path) &&
+        std::any_of(g_desktop.begin(),g_desktop.end(),[&](const auto& entry){return _wcsicmp(entry.path.c_str(),path.c_str())==0;}))paths.push_back(path);
     return MaskDesktopItems(g_desktop,paths);
 }
 void UpdateCanvasInputRegion() {
@@ -248,7 +249,7 @@ void PaintNow() {
     if(dc){Paint(g_canvas,dc);ReleaseDC(g_canvas,dc);}
 }
 void SaveAndRedraw() {
-    if(!SyncMask()){g_desktopMode=false;EndDesktopSession();}
+    if(!SyncMask()){db::LogF("Desktop mask failed; will retry on refresh: %lu",GetLastError());EndDesktopSession();}
     UpdateCanvasInputRegion();
     SaveLayout(*g_layout);PaintNow();
 }
@@ -282,6 +283,9 @@ void FinishInlineRename(bool save) {
 }
 
 LRESULT CALLBACK RenameEditProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
+    if(msg==WM_LBUTTONUP && GetPropW(hwnd,L"SelectInitialTitle")) {
+        RemovePropW(hwnd,L"SelectInitialTitle");SendMessageW(hwnd,EM_SETSEL,0,-1);return 0;
+    }
     if(msg==WM_KEYDOWN && wp==VK_RETURN) {FinishInlineRename(true);return 0;}
     if(msg==WM_KEYDOWN && wp==VK_ESCAPE) {FinishInlineRename(false);return 0;}
     if(msg==WM_KILLFOCUS) {FinishInlineRename(true);return 0;}
@@ -295,18 +299,24 @@ void BeginRename(int index) {
     const Box& box=g_layout->boxes[index];
     g_renameId=box.id;
     HINSTANCE instance=GetModuleHandleW(nullptr);
-    if(!g_renameFont)g_renameFont=CreateFontW(-15,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+    if(!g_renameFont)g_renameFont=CreateFontW(-12,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
     g_renameColor=box.color;
     if(g_renameBrush){DeleteObject(g_renameBrush);g_renameBrush=nullptr;}
-    RECT title{box.rect.left+62,box.rect.top,box.rect.right-62,box.rect.top+kHeader};
-    g_nameEdit=CreateWindowExW(0,L"EDIT",box.title.c_str(),
-        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL|ES_CENTER,title.left,title.top,
+    RECT title{box.rect.left+62,box.rect.top+8,box.rect.right-62,box.rect.top+kHeader-7};
+    MapWindowPoints(g_canvas,nullptr,reinterpret_cast<POINT*>(&title),2);
+    // A native edit must have its own surface: child controls are not composed
+    // into the bitmap supplied to UpdateLayeredWindow.
+    SendMessageW(g_canvas,WM_CANCELMODE,0,0);
+    g_nameEdit=CreateWindowExW(WS_EX_TOOLWINDOW,L"EDIT",box.title.c_str(),
+        WS_POPUP|ES_AUTOHSCROLL|ES_CENTER,title.left,title.top,
         title.right-title.left,title.bottom-title.top,g_canvas,nullptr,instance,nullptr);
     if(!g_nameEdit){g_renameId.clear();return;}
     SendMessageW(g_nameEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_renameFont),TRUE);
     SendMessageW(g_nameEdit,EM_SETLIMITTEXT,80,0);
     SetWindowSubclass(g_nameEdit,RenameEditProc,1,0);
+    SetPropW(g_nameEdit,L"SelectInitialTitle",reinterpret_cast<HANDLE>(1));
+    ShowWindow(g_nameEdit,SW_SHOW);SetForegroundWindow(g_nameEdit);
     SetFocus(g_nameEdit);SendMessageW(g_nameEdit,EM_SETSEL,0,-1);
 }
 
@@ -362,7 +372,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CREATE: DragAcceptFiles(hwnd, TRUE); SetTimer(hwnd,1,2000,nullptr); return 0;
     case WM_TIMER:
         if(GetCapture()!=hwnd && PollDesktop(g_desktop)) {
-            if(!SyncMask()){EndDesktopSession();g_desktopMode=false;}
+            if(!SyncMask()){db::LogF("Desktop mask refresh failed: %lu",GetLastError());EndDesktopSession();}
             InvalidateRect(hwnd,nullptr,FALSE);
         }
         return 0;
