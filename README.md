@@ -36,6 +36,17 @@ build.bat release nestlone-D.exe
 
 运行生成的 `nestlone-D.exe` 后，可从系统托盘打开菜单。
 
+## 发布版本
+
+推送以 `v` 开头的 Git 标签会触发 GitHub Actions，在 Windows x64 Runner 上重新编译并创建 / 更新同名 GitHub Release。Release 附件包含单独的 `nestlone-D.exe` 与 `nestlone-D-windows-x64.zip`。
+
+```bat
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流需要仓库的 Actions `GITHUB_TOKEN` 拥有 **Contents: read and write** 权限。详情见 [.github/workflows/release.yml](.github/workflows/release.yml)。
+
 ## 使用方式
 
 1. 通过托盘菜单新建一个盒子。

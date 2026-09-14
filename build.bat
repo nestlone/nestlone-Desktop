@@ -8,9 +8,12 @@ rem chcp here. Chinese comments live in the .cpp/.h files instead,
 rem and cl reads them correctly thanks to /utf-8.
 rem ---------------------------------------------------------------
 setlocal
-set VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools
+if "%VSDIR%"=="" set VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools
 if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" set VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools
 if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" set VSDIR=C:\Program Files\Microsoft Visual Studio\2022\BuildTools
+if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" set VSDIR=
+if "%VSDIR%"=="" set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
+if "%VSDIR%"=="" if exist "%VSWHERE%" for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSDIR=%%I
 if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" (echo [BUILD] Visual Studio Build Tools not found & exit /b 1)
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 (echo [BUILD] vcvars64 failed & exit /b 1)

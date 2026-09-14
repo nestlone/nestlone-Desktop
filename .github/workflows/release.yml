@@ -1,0 +1,59 @@
+name: Build and publish Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build nestlone-D for Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build release executable
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'nestlone-D'
+          .\build.bat $dist 'nestlone-D.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item .\README.md $dist
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath "$env:RUNNER_TEMP\nestlone-D-windows-x64.zip"
+
+      - name: Preserve build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: nestlone-D-windows-x64-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/nestlone-D/nestlone-D.exe
+            ${{ runner.temp }}/nestlone-D-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ARCHIVE: ${{ runner.temp }}/nestlone-D-windows-x64.zip
+          EXECUTABLE: ${{ runner.temp }}/nestlone-D/nestlone-D.exe
+        run: |
+          gh release view $env:TAG 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:ARCHIVE $env:EXECUTABLE --clobber
+          } else {
+            gh release create $env:TAG $env:ARCHIVE $env:EXECUTABLE --title "nestlone-D $env:TAG" --generate-notes
+          }
