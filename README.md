@@ -82,3 +82,11 @@ src/        Win32 C++ 源码与资源脚本
 tests/      当前维护的渲染和桌面交互测试
 build.bat   一键构建脚本
 ```
+
+## License
+
+本项目采用 [MIT License](LICENSE)。
+
+## Credit
+
+First introduced on the [LINUX DO](https://linux.do/) community — thanks to everyone there for the first round of discussion.
