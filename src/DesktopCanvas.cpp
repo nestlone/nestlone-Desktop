@@ -243,9 +243,9 @@ void SaveAndRedraw() {
     SaveLayout(*g_layout);PaintNow();
 }
 
-HWND g_rename=nullptr;
 HWND g_nameEdit=nullptr;
 HFONT g_renameFont=nullptr;
+HBRUSH g_renameBrush=nullptr;
 std::wstring g_renameId;
 
 bool RenameBox(const std::wstring& id,std::wstring value) {
@@ -259,62 +259,41 @@ bool RenameBox(const std::wstring& id,std::wstring value) {
     return false;
 }
 
+void FinishInlineRename(bool save) {
+    HWND edit=g_nameEdit;
+    if(!edit)return;
+    wchar_t text[81]{};GetWindowTextW(edit,text,81);
+    g_nameEdit=nullptr;
+    if(save)RenameBox(g_renameId,text);
+    g_renameId.clear();
+    DestroyWindow(edit);
+    PaintNow();
+}
+
 LRESULT CALLBACK RenameEditProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
-    if(msg==WM_KEYDOWN && (wp==VK_RETURN || wp==VK_ESCAPE)) {
-        SendMessageW(GetParent(hwnd),WM_COMMAND,wp==VK_RETURN ? IDOK : IDCANCEL,0); return 0;
-    }
+    if(msg==WM_KEYDOWN && wp==VK_RETURN) {FinishInlineRename(true);return 0;}
+    if(msg==WM_KEYDOWN && wp==VK_ESCAPE) {FinishInlineRename(false);return 0;}
+    if(msg==WM_KILLFOCUS) {FinishInlineRename(true);return 0;}
     if(msg==WM_NCDESTROY) RemoveWindowSubclass(hwnd,RenameEditProc,1);
     return DefSubclassProc(hwnd,msg,wp,lp);
 }
 
-LRESULT CALLBACK RenameProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
-    switch(msg) {
-    case WM_COMMAND:
-        if(LOWORD(wp)==IDOK) {
-            wchar_t text[81]{};
-            GetWindowTextW(g_nameEdit,text,81);
-            if(!RenameBox(g_renameId,text)) { MessageBeep(MB_ICONWARNING);SetFocus(g_nameEdit);return 0; }
-            DestroyWindow(hwnd);return 0;
-        }
-        if(LOWORD(wp)==IDCANCEL) {DestroyWindow(hwnd);return 0;}
-        break;
-    case WM_CLOSE: DestroyWindow(hwnd);return 0;
-    case WM_DESTROY:
-        g_rename=nullptr;g_nameEdit=nullptr;g_renameId.clear();
-        if(g_renameFont) {DeleteObject(g_renameFont);g_renameFont=nullptr;}
-        return 0;
-    }
-    return DefWindowProcW(hwnd,msg,wp,lp);
-}
-
 void BeginRename(int index) {
-    if(g_rename) {SetForegroundWindow(g_rename);return;}
+    if(g_nameEdit) {SetFocus(g_nameEdit);return;}
     if(index<0 || index>=static_cast<int>(g_layout->boxes.size()))return;
     const Box& box=g_layout->boxes[index];
     g_renameId=box.id;
     HINSTANCE instance=GetModuleHandleW(nullptr);
-    WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=RenameProc;
-    wc.lpszClassName=L"nestlone-D.Rename";
-    wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);
-    RegisterClassW(&wc);
-    g_rename=CreateWindowExW(WS_EX_TOOLWINDOW,wc.lpszClassName,L"重命名盒子",
-        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,360,155,
-        nullptr,nullptr,instance,nullptr);
-    if(!g_rename)return;
-    g_renameFont=CreateFontW(-15,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+    if(!g_renameFont)g_renameFont=CreateFontW(-15,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
+    RECT title{box.rect.left+62,box.rect.top+4,box.rect.right-62,box.rect.top+kHeader-4};
     g_nameEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",box.title.c_str(),
-        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,20,20,302,28,g_rename,nullptr,instance,nullptr);
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,title.left,title.top,
+        title.right-title.left,title.bottom-title.top,g_canvas,nullptr,instance,nullptr);
+    if(!g_nameEdit){g_renameId.clear();return;}
     SendMessageW(g_nameEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_renameFont),TRUE);
     SendMessageW(g_nameEdit,EM_SETLIMITTEXT,80,0);
     SetWindowSubclass(g_nameEdit,RenameEditProc,1,0);
-    HWND ok=CreateWindowW(L"BUTTON",L"保存",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON,
-        150,65,80,28,g_rename,reinterpret_cast<HMENU>(IDOK),instance,nullptr);
-    HWND cancel=CreateWindowW(L"BUTTON",L"取消",WS_CHILD|WS_VISIBLE|WS_TABSTOP,
-        242,65,80,28,g_rename,reinterpret_cast<HMENU>(IDCANCEL),instance,nullptr);
-    SendMessageW(ok,WM_SETFONT,reinterpret_cast<WPARAM>(g_renameFont),TRUE);
-    SendMessageW(cancel,WM_SETFONT,reinterpret_cast<WPARAM>(g_renameFont),TRUE);
-    ShowWindow(g_rename,SW_SHOWNORMAL);SetForegroundWindow(g_rename);
     SetFocus(g_nameEdit);SendMessageW(g_nameEdit,EM_SETSEL,0,-1);
 }
 
@@ -359,6 +338,14 @@ void ShowContextMenu(HWND hwnd, POINT point) {
 
 LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_CTLCOLOREDIT:
+        if(reinterpret_cast<HWND>(lParam)==g_nameEdit) {
+            HDC dc=reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc,RGB(245,253,255));SetBkColor(dc,RGB(26,54,68));
+            if(!g_renameBrush)g_renameBrush=CreateSolidBrush(RGB(26,54,68));
+            return reinterpret_cast<LRESULT>(g_renameBrush);
+        }
+        return DefWindowProcW(hwnd,message,wParam,lParam);
     case WM_CREATE: DragAcceptFiles(hwnd, TRUE); SetTimer(hwnd,1,2000,nullptr); return 0;
     case WM_TIMER:
         if(GetCapture()!=hwnd && PollDesktop(g_desktop)) {
@@ -570,7 +557,9 @@ bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout) {
 
 void DestroyCanvas() {
     EndDesktopSession();g_desktopMode=false;
-    if(g_rename)DestroyWindow(g_rename);
+    if(g_nameEdit)DestroyWindow(g_nameEdit);
+    if(g_renameFont){DeleteObject(g_renameFont);g_renameFont=nullptr;}
+    if(g_renameBrush){DeleteObject(g_renameBrush);g_renameBrush=nullptr;}
     if(g_canvas)DestroyWindow(g_canvas);
     g_canvas=nullptr;
     if(g_gdiplusToken){Gdiplus::GdiplusShutdown(g_gdiplusToken);g_gdiplusToken=0;}
