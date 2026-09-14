@@ -17,10 +17,13 @@ struct Box {
 struct Layout {
     std::vector<Box> boxes;
     int opacity{88}; // 20..100, shared canvas opacity
+    struct Placement { std::wstring path; POINT point; };
+    std::vector<Placement> desktop;
 };
 
 std::wstring LayoutPath();
 Layout LoadLayout();
 bool SaveLayout(const Layout& layout);
 bool AddItem(Box& box, const std::wstring& path);
+bool AssignDesktopItem(Layout& layout, const std::wstring& path, int boxIndex, POINT point);
 }

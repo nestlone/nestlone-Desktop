@@ -118,6 +118,9 @@ std::wstring ObjectAt(const std::wstring& json, size_t begin, size_t& next) {
 }
 
 std::wstring LayoutPath() {
+#ifdef DESKBOX_TESTING
+    return std::filesystem::absolute(L"build/hosting-test-layout.json").wstring();
+#else
     PWSTR appData = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) return {};
     std::filesystem::path directory = std::filesystem::path(appData) / L"nestlone-desktop";
@@ -125,17 +128,30 @@ std::wstring LayoutPath() {
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     return (directory / L"layout.json").wstring();
+#endif
 }
 
 bool AddItem(Box& box, const std::wstring& input) {
     std::error_code error;
     std::filesystem::path path(input);
     const std::filesystem::path absolute = std::filesystem::absolute(path, error);
-    const std::wstring normalized = (error ? path : absolute).lexically_normal().wstring();
+    const std::wstring normalized = input.rfind(L"::",0)==0 ? input : (error ? path : absolute).lexically_normal().wstring();
     if (normalized.empty()) return false;
     const auto existing = std::find_if(box.items.begin(), box.items.end(), [&](const std::wstring& item) { return _wcsicmp(item.c_str(), normalized.c_str()) == 0; });
     if (existing != box.items.end()) return false;
     box.items.push_back(normalized);
+    return true;
+}
+
+bool AssignDesktopItem(Layout& layout,const std::wstring& path,int boxIndex,POINT point) {
+    if(path.empty() || boxIndex < -1 || boxIndex>=static_cast<int>(layout.boxes.size()))return false;
+    for(auto& box:layout.boxes) {
+        box.items.erase(std::remove_if(box.items.begin(),box.items.end(),
+            [&](const auto& p){return _wcsicmp(p.c_str(),path.c_str())==0;}),box.items.end());
+    }
+    if(boxIndex>=0) return AddItem(layout.boxes[boxIndex],path);
+    for(auto& item:layout.desktop) if(_wcsicmp(item.path.c_str(),path.c_str())==0) {item.point=point;return true;}
+    layout.desktop.push_back({path,point});
     return true;
 }
 
@@ -166,6 +182,14 @@ Layout LoadLayout() {
         for (const auto& item : ReadItems(object)) AddItem(box, item);
         layout.boxes.push_back(std::move(box));
     }
+    at=0;
+    while((at=json.find(L"{\"desktopPath\":",at))!=std::wstring::npos) {
+        size_t next=at; const auto object=ObjectAt(json,at,next);at=next;
+        Layout::Placement item{};long x=0,y=0;
+        if(ReadString(object,L"desktopPath",item.path)&&ReadNumber(object,L"x",x)&&ReadNumber(object,L"y",y)) {
+            item.point={x,y};layout.desktop.push_back(std::move(item));
+        }
+    }
     return layout;
 }
 
@@ -173,13 +197,19 @@ bool SaveLayout(const Layout& layout) {
     const std::wstring path = LayoutPath();
     if (path.empty()) return false;
     const int opacity = std::clamp(layout.opacity, 20, 100);
-    std::wstring json = L"{\"version\":3,\"opacity\":" + std::to_wstring(opacity) + L",\"boxes\":[";
+    std::wstring json = L"{\"version\":4,\"opacity\":" + std::to_wstring(opacity) + L",\"boxes\":[";
     for (size_t i = 0; i < layout.boxes.size(); ++i) {
         const Box& box = layout.boxes[i];
         if (i) json += L',';
         json += L"{\"id\":\"" + Escape(box.id) + L"\",\"title\":\"" + Escape(box.title) + L"\",\"left\":" + std::to_wstring(box.rect.left) + L",\"top\":" + std::to_wstring(box.rect.top) + L",\"right\":" + std::to_wstring(box.rect.right) + L",\"bottom\":" + std::to_wstring(box.rect.bottom) + L",\"color\":" + std::to_wstring(static_cast<unsigned long>(box.color)) + L",\"collapsed\":" + std::to_wstring(box.collapsed ? 1 : 0) + L",\"iconView\":" + std::to_wstring(box.iconView ? 1 : 0) + L",\"items\":[";
         for (size_t j = 0; j < box.items.size(); ++j) { if (j) json += L','; json += L"\"" + Escape(box.items[j]) + L"\""; }
         json += L"]}";
+    }
+    json += L"],\"desktop\":[";
+    for(size_t i=0;i<layout.desktop.size();++i) {
+        if(i)json+=L',';
+        const auto& item=layout.desktop[i];
+        json+=L"{\"desktopPath\":\""+Escape(item.path)+L"\",\"x\":"+std::to_wstring(item.point.x)+L",\"y\":"+std::to_wstring(item.point.y)+L"}";
     }
     json += L"]}";
     const std::wstring temporary = path + L".tmp";

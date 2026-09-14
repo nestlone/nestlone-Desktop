@@ -18,7 +18,6 @@ std::vector<DesktopItem> EnumerateDesktopItems();
 bool OpenItem(const DesktopItem& item);
 bool RevealItem(const DesktopItem& item);
 bool DeleteItem(const DesktopItem& item);
-bool SetDesktopItemHidden(const std::wstring& path, bool hidden);
 std::wstring FormatModified(const FILETIME& time);
 
 }

@@ -8,6 +8,7 @@
 #include "IconFactory.h"
 #include "Settings.h"
 #include "DesktopItems.h"
+#include "DesktopSession.h"
 #include "log.h"
 
 namespace {
@@ -47,7 +48,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
 }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
+    if(wcsncmp(arguments,L"--restore-desktop ",18)==0)return nestlone::DesktopRecovery(arguments);
     g_mutex = CreateMutexW(nullptr, TRUE, kMutex);
     if (!g_mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(kControlClass, nullptr);
@@ -58,10 +60,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     db::LogInit();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const std::wstring layoutFile=nestlone::LayoutPath();
+    if(GetFileAttributesW(layoutFile.c_str())!=INVALID_FILE_ATTRIBUTES)
+        CopyFileW(layoutFile.c_str(),(layoutFile+L".pre-hosting").c_str(),TRUE);
     g_layout = nestlone::LoadLayout();
     if (g_layout.boxes.empty()) { nestlone::Box box; box.id = L"default"; box.title = L"我的盒子"; g_layout.boxes.push_back(box); }
-    // Items already managed by a box remain hidden from the desktop after restart.
-    for (const auto& box : g_layout.boxes) for (const auto& item : box.items) nestlone::SetDesktopItemHidden(item, true);
+    // Hosting affects only presentation; file paths and attributes are unchanged.
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -80,6 +84,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     HWND canvasParent = host.wallpaperWorker ? host.wallpaperWorker : GetDesktopWindow();
     if (!nestlone::CreateCanvas(instance, canvasParent, &g_layout)) {
         db::LogF("CreateCanvas failed: %lu", GetLastError());
+        MessageBoxW(nullptr,L"桌面接管未能启动，原生桌面保持不变。请查看日志。",L"nestlone-D",MB_OK|MB_ICONWARNING);
         DestroyWindow(g_control);
     } else {
         nestlone::TrayInstall(g_control, instance);

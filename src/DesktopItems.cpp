@@ -71,18 +71,6 @@ bool DeleteItem(const DesktopItem& item) {
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
 }
 
-bool SetDesktopItemHidden(const std::wstring& path, bool hidden) {
-    const std::wstring desktop = DesktopDirectory();
-    const std::wstring parent = std::filesystem::path(path).parent_path().wstring();
-    if (desktop.empty() || _wcsicmp(desktop.c_str(), parent.c_str()) != 0) return false;
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) return false;
-    const DWORD updated = hidden ? (attributes | FILE_ATTRIBUTE_HIDDEN) : (attributes & ~FILE_ATTRIBUTE_HIDDEN);
-    if (updated == attributes) return true;
-    const bool ok = SetFileAttributesW(path.c_str(), updated) != FALSE;
-    if (ok) SHChangeNotify(SHCNE_ATTRIBUTES, SHCNF_PATHW, path.c_str(), nullptr);
-    return ok;
-}
 
 std::wstring FormatModified(const FILETIME& time) {
     if (time.dwHighDateTime == 0 && time.dwLowDateTime == 0) return L"-";
