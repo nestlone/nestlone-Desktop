@@ -1,0 +1,6 @@
+/build/
+/release/
+/.claude/
+*.obj
+*.pdb
+*.ilk
