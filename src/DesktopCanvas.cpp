@@ -232,10 +232,15 @@ void UpdateCanvasInputRegion() {
     // SetWindowRgn takes ownership of region on success.
     if(!SetWindowRgn(g_canvas,region,TRUE)) DeleteObject(region);
 }
+void PaintNow() {
+    if(!g_canvas || !g_layout)return;
+    HDC dc=GetDC(g_canvas);
+    if(dc){Paint(g_canvas,dc);ReleaseDC(g_canvas,dc);}
+}
 void SaveAndRedraw() {
     if(!SyncMask()){g_desktopMode=false;EndDesktopSession();}
     UpdateCanvasInputRegion();
-    SaveLayout(*g_layout);InvalidateRect(g_canvas,nullptr,TRUE);
+    SaveLayout(*g_layout);PaintNow();
 }
 
 HWND g_rename=nullptr;
@@ -443,7 +448,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             if(GetAsyncKeyState(VK_ESCAPE)&0x8000) {SendMessageW(hwnd,WM_CANCELMODE,0,0);return 0;}
             if(abs(p.x-g_pressPoint.x)>=GetSystemMetrics(SM_CXDRAG)||abs(p.y-g_pressPoint.y)>=GetSystemMetrics(SM_CYDRAG))g_itemDragging=true;
             g_dragPoint=p;SetCursor(LoadCursorW(nullptr,g_itemDragging ? IDC_SIZEALL : IDC_ARROW));
-            InvalidateRect(hwnd,nullptr,FALSE);return 0;
+            PaintNow();return 0;
         }
         if (GetCapture() != hwnd) {
             const int hoveredBox = HitBox(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
@@ -467,7 +472,10 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             }
             else OffsetRect(&box.rect, dx, dy);
             g_last = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            InvalidateRect(hwnd, nullptr, TRUE);
+            // WM_PAINT may be deferred by a layered window during mouse capture.
+            // Render immediately so the box stays attached to the pointer.
+            UpdateCanvasInputRegion();
+            PaintNow();
         }
         return 0;
     case WM_LBUTTONUP:
