@@ -12,6 +12,7 @@
 #include <memory>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nestlone {
 namespace {
@@ -20,7 +21,7 @@ Layout* g_layout=nullptr;
 HWND g_manager=nullptr,g_background=nullptr,g_edit=nullptr;
 HINSTANCE g_instance=nullptr;
 ULONG_PTR g_token=0;
-bool g_visible=true,g_drag=false,g_resizing=false,g_nativeHidden=false;
+bool g_visible=true,g_drag=false,g_resizing=false,g_tabPending=false,g_tabDetached=false,g_nativeHidden=false;
 HWND g_hiddenListview=nullptr;
 db::HostInfo g_host;
 DesktopSnapshot g_snapshot;
@@ -60,6 +61,26 @@ Box* FindBox(const std::wstring& id) {
     if(g_layout)for(auto& box:g_layout->boxes)if(box.id==id)return &box;
     return nullptr;
 }
+Box* GroupRoot(Box& box) {
+    if(box.groupId.empty())return &box;
+    if(auto* root=FindBox(box.groupId))return root;
+    box.groupId.clear();return &box;
+}
+const Box* GroupRoot(const Box& box) {
+    if(box.groupId.empty())return &box;
+    for(const auto& candidate:g_layout->boxes)if(candidate.id==box.groupId)return &candidate;
+    return &box;
+}
+bool IsGroupRoot(const Box& box) { return box.groupId.empty() || !FindBox(box.groupId); }
+bool IsActiveTab(const Box& box) {
+    const Box* root=GroupRoot(box);
+    return root->activeTabId.empty()?box.id==root->id:box.id==root->activeTabId;
+}
+std::vector<Box*> GroupTabs(Box& root) {
+    std::vector<Box*> tabs;tabs.push_back(&root);
+    for(auto& box:g_layout->boxes)if(box.groupId==root.id)tabs.push_back(&box);
+    return tabs;
+}
 bool HasPath(const Box& box,const std::wstring& path) {
     return std::any_of(box.items.begin(),box.items.end(),[&](const auto& p){return _wcsicmp(p.c_str(),path.c_str())==0;});
 }
@@ -70,6 +91,41 @@ const DesktopEntry* FindEntry(const DesktopSnapshot& snapshot,const std::wstring
 int ClampDesktopX(int x) { return static_cast<int>(std::clamp<LONG>(static_cast<LONG>(x),0L,max(0L,static_cast<LONG>(GetSystemMetrics(SM_CXVIRTUALSCREEN))-max(1L,g_snapshot.spacing.x)))); }
 int ClampDesktopY(int y) { return static_cast<int>(std::clamp<LONG>(static_cast<LONG>(y),0L,max(0L,static_cast<LONG>(GetSystemMetrics(SM_CYVIRTUALSCREEN))-max(1L,g_snapshot.spacing.y)))); }
 POINT ClampDesktopPosition(POINT point) { return {ClampDesktopX(point.x),ClampDesktopY(point.y)}; }
+LONG NearestGridSlot(LONG pixel,LONG step) {
+    if(pixel>=0)return (pixel+step/2)/step;
+    return -((-pixel+step/2)/step);
+}
+uint64_t GridKey(LONG column,LONG row) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(column))<<32)|static_cast<uint32_t>(row);
+}
+std::vector<std::pair<std::wstring,POINT>> SnapDesktopDrop(const std::vector<std::pair<std::wstring,POINT>>& dragged) {
+    const LONG sx=max(1L,g_snapshot.spacing.x),sy=max(1L,g_snapshot.spacing.y);
+    const LONG padding=max(0L,(sx-max(16,g_snapshot.iconSize))/2);
+    const LONG maxColumn=max(0L,(GetSystemMetrics(SM_CXVIRTUALSCREEN)-sx)/sx);
+    const LONG maxRow=max(0L,(GetSystemMetrics(SM_CYVIRTUALSCREEN)-sy)/sy);
+    std::unordered_set<uint64_t> occupied;
+    for(const auto& icon:g_visualIcons) {
+        const bool moving=std::any_of(dragged.begin(),dragged.end(),[&](const auto& item){return _wcsicmp(item.first.c_str(),icon.path.c_str())==0;});
+        if(!moving)occupied.insert(GridKey(NearestGridSlot(icon.position.x-padding,sx),NearestGridSlot(icon.position.y,sy)));
+    }
+    std::vector<std::pair<std::wstring,POINT>> result;result.reserve(dragged.size());
+    for(const auto& item:dragged) {
+        const LONG preferredColumn=std::clamp(NearestGridSlot(item.second.x-padding,sx),0L,maxColumn);
+        const LONG preferredRow=std::clamp(NearestGridSlot(item.second.y,sy),0L,maxRow);
+        LONG column=preferredColumn,row=preferredRow;
+        bool found=false;
+        for(LONG radius=0;radius<=maxColumn+maxRow&&!found;++radius) {
+            for(LONG y=max(0L,preferredRow-radius);y<=min(maxRow,preferredRow+radius)&&!found;++y) {
+                for(LONG x=max(0L,preferredColumn-radius);x<=min(maxColumn,preferredColumn+radius);++x) {
+                    if(abs(x-preferredColumn)+abs(y-preferredRow)!=radius)continue;
+                    if(occupied.find(GridKey(x,y))==occupied.end()){column=x;row=y;found=true;break;}
+                }
+            }
+        }
+        occupied.insert(GridKey(column,row));result.push_back({item.first,{column*sx+padding,row*sy}});
+    }
+    return result;
+}
 RECT DisplayRect(const Box& box) {RECT r=box.rect;if(box.collapsed)r.bottom=r.top+HeaderHeight();return r;}
 int ContainingBox(const DesktopEntry& entry) {
     POINT center{entry.position.x+g_snapshot.iconSize/2,entry.position.y+g_snapshot.iconSize/2};
@@ -95,7 +151,7 @@ Gdiplus::Color Background(COLORREF color,int opacity) {
 bool RenderPixels(void* pixels,int width,int height,const Layout& layout) {
     Gdiplus::Bitmap bitmap(width,height,width*4,PixelFormat32bppPARGB,static_cast<BYTE*>(pixels));
     Gdiplus::Graphics g(&bitmap);g.Clear(Gdiplus::Color(0,0,0,0));g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    for(const auto& box:layout.boxes)Rounded(g,DisplayRect(box),Background(box.color,layout.opacity));
+    for(const auto& box:layout.boxes)if(IsGroupRoot(box))Rounded(g,DisplayRect(box),Background(box.color,layout.opacity));
     g.Flush();return g.GetLastStatus()==Gdiplus::Ok;
 }
 void Label(Gdiplus::Graphics& g,const std::wstring& value,RECT r) {
@@ -130,7 +186,14 @@ bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false) {
         if(grip)Label(g,L"◢",r);
         else {
             const int h=HeaderHeight();
-            Label(g,box->title,{h,0,r.right-3*h,h});
+            auto tabs=GroupTabs(*box);const int contentRight=r.right-3*h;
+            if(tabs.size()==1) Label(g,box->title,{h,0,contentRight,h});
+            else for(size_t i=0;i<tabs.size();++i) {
+                const int left=static_cast<int>(i*contentRight/tabs.size());
+                const int right=static_cast<int>((i+1)*contentRight/tabs.size());
+                Label(g,tabs[i]->title,{left,0,right,h});
+                if(IsActiveTab(*tabs[i])) {Gdiplus::Pen line(Gdiplus::Color(220,255,255,255),1.0f);g.DrawLine(&line,left+8,h-3,right-8,h-3);}
+            }
             Label(g,L"▦",{r.right-3*h,0,r.right-2*h,h});
             Label(g,box->collapsed?L"+":L"−",{r.right-2*h,0,r.right-h,h});
             Label(g,L"×",{r.right-h,0,r.right,h});
@@ -170,6 +233,20 @@ void QueueMoves(const std::vector<DesktopMove>& moves) {
 }
 // Reserve complete native cells (including labels), plus a separate footer for
 // the resize handle. Grid origin belongs to the box, not Explorer's screen grid.
+LONG BoxGridMinimumWidth(const DesktopSnapshot& snapshot) {
+    const int dpi=static_cast<int>(g_host.listview?GetDpiForWindow(g_host.listview):96);
+    // The desktop's spacing is intentionally generous. Box grids use a
+    // denser, Explorer-like folder layout while keeping room for titles.
+    return max(static_cast<LONG>(snapshot.iconSize+20),MulDiv(72,dpi,96));
+}
+int BoxGridColumns(const Box& box,const DesktopSnapshot& snapshot) {
+    return max(1L,(box.rect.right-box.rect.left-16)/max(1L,BoxGridMinimumWidth(snapshot)));
+}
+LONG BoxGridCellWidth(const Box& box,const DesktopSnapshot& snapshot) {
+    return max(1L,(box.rect.right-box.rect.left-16)/BoxGridColumns(box,snapshot));
+}
+LONG BoxGridLeft(const Box& box) { return box.rect.left+8; }
+LONG BoxGridCellHeight(const DesktopSnapshot& snapshot) { return max(static_cast<LONG>(snapshot.iconSize+48),snapshot.spacing.y); }
 RECT FitGrid(const Box& box,const DesktopSnapshot& snapshot) {
     RECT r=box.rect;
     if(!box.iconView){
@@ -177,9 +254,10 @@ RECT FitGrid(const Box& box,const DesktopSnapshot& snapshot) {
         r.bottom=max(r.bottom,r.top+HeaderHeight()+16+static_cast<LONG>(box.items.size())*rowHeight);
         return r;
     }
-    const LONG sx=max(1L,snapshot.spacing.x),sy=max(1L,snapshot.spacing.y);
-    r.right=max(r.right,r.left+sx+24);
-    const LONG columns=max(1L,(r.right-r.left-24)/sx);
+    const LONG sy=BoxGridCellHeight(snapshot);
+    r.right=max(r.right,r.left+BoxGridMinimumWidth(snapshot)+16);
+    Box fitted=box;fitted.rect=r;
+    const LONG columns=BoxGridColumns(fitted,snapshot);
     LONG count=0;for(const auto& path:box.items)if(FindEntry(snapshot,path))++count;
     const LONG rows=max(1L,(count+columns-1)/columns);
     r.bottom=max(r.bottom,r.top+HeaderHeight()+12+rows*sy+24);
@@ -187,12 +265,11 @@ RECT FitGrid(const Box& box,const DesktopSnapshot& snapshot) {
 }
 std::vector<DesktopMove> GridMoves(const Box& box,const DesktopSnapshot& snapshot) {
     if(!box.iconView)return {};
-    const LONG sx=max(1L,snapshot.spacing.x),sy=max(1L,snapshot.spacing.y);
-    const LONG columns=max(1L,(box.rect.right-box.rect.left-24)/sx);
-    const LONG inset=(box.rect.right-box.rect.left-columns*sx)/2;
+    const LONG sx=BoxGridCellWidth(box,snapshot),sy=BoxGridCellHeight(snapshot);
+    const LONG columns=BoxGridColumns(box,snapshot),left=BoxGridLeft(box);
     std::vector<DesktopMove> moves;int slot=0;
     for(const auto& path:box.items)if(FindEntry(snapshot,path)) {
-        LONG x=box.rect.left+inset+(slot%columns)*sx;
+        LONG x=left+(slot%columns)*sx;
         LONG y=box.rect.top+HeaderHeight()+12+(slot/columns)*sy;
         moves.push_back({path,{x+max(0L,(sx-snapshot.iconSize)/2),y}});++slot;
     }
@@ -221,25 +298,39 @@ int BoxRowHeight(const Box& box) { return max(30,HeaderHeight())+(box.iconView?0
 RECT BoxItemRect(const Box& box,int slot) {
     const int h=HeaderHeight();
     if(!box.iconView){int rowHeight=BoxRowHeight(box);return {box.rect.left+8,box.rect.top+h+8+slot*rowHeight,box.rect.right-8,box.rect.top+h+8+(slot+1)*rowHeight};}
-    const LONG sx=max(1L,g_snapshot.spacing.x),sy=max(1L,g_snapshot.spacing.y);const LONG columns=max(1L,(box.rect.right-box.rect.left-24)/sx);const LONG inset=(box.rect.right-box.rect.left-columns*sx)/2;
-    return {box.rect.left+inset+(slot%columns)*sx,box.rect.top+h+12+(slot/columns)*sy,box.rect.left+inset+(slot%columns)*sx+sx,box.rect.top+h+12+(slot/columns)*sy+sy};
+    const LONG sx=BoxGridCellWidth(box,g_snapshot),sy=BoxGridCellHeight(g_snapshot),columns=BoxGridColumns(box,g_snapshot),left=BoxGridLeft(box);
+    return {left+(slot%columns)*sx,box.rect.top+h+12+(slot/columns)*sy,left+(slot%columns)*sx+sx,box.rect.top+h+12+(slot/columns)*sy+sy};
 }
 int BoxSlot(const Box& box,POINT point) {
     const int h=HeaderHeight();
     if(!box.iconView)return max(0,(point.y-box.rect.top-h-8)/BoxRowHeight(box));
-    const LONG sx=max(1L,g_snapshot.spacing.x),sy=max(1L,g_snapshot.spacing.y);const LONG columns=max(1L,(box.rect.right-box.rect.left-24)/sx);const LONG inset=(box.rect.right-box.rect.left-columns*sx)/2;
-    LONG column=(point.x-box.rect.left-inset)/sx,row=(point.y-box.rect.top-h-12)/sy;return max(0L,row*columns+column);
+    const LONG sx=BoxGridCellWidth(box,g_snapshot),sy=BoxGridCellHeight(g_snapshot),columns=BoxGridColumns(box,g_snapshot),left=BoxGridLeft(box);
+    LONG column=(point.x-left)/sx,row=(point.y-box.rect.top-h-12)/sy;return max(0L,row*columns+column);
 }
 void SetVisualGeometry(VisualIcon& visual,const Box* box,int slot) {
-    if(!box){visual.list=false;visual.size=max(16,g_snapshot.iconSize);visual.hit={visual.position.x-8,visual.position.y-4,visual.position.x+g_snapshot.spacing.x-8,visual.position.y+g_snapshot.spacing.y};visual.label={visual.hit.left,visual.position.y+visual.size+2,visual.hit.right,visual.hit.bottom};return;}
-    visual.list=!box->iconView;visual.size=visual.list?min(24,HeaderHeight()):max(16,g_snapshot.iconSize);RECT row=BoxItemRect(*box,slot);visual.hit=row;visual.position={visual.list?row.left+8:row.left+max(0L,(g_snapshot.spacing.x-visual.size)/2),visual.list?row.top+(row.bottom-row.top-visual.size)/2:row.top};visual.label={visual.list?visual.position.x+visual.size+8:row.left,row.top,visual.list?row.right-8:row.right,row.bottom};
+    if(!box){
+        visual.list=false;visual.size=max(16,g_snapshot.iconSize);
+        // IFolderView positions are the icon's top-left point. Centre the
+        // clickable cell and title around that point; the old fixed -8 offset
+        // only happened to work for one particular Windows icon spacing.
+        const LONG padding=max(0L,(g_snapshot.spacing.x-visual.size)/2);
+        visual.hit={visual.position.x-padding,visual.position.y,visual.position.x-padding+g_snapshot.spacing.x,visual.position.y+g_snapshot.spacing.y};
+        visual.label={visual.hit.left,visual.position.y+visual.size+3,visual.hit.right,visual.hit.bottom};return;
+    }
+    visual.list=!box->iconView;visual.size=visual.list?min(24,HeaderHeight()):max(16,g_snapshot.iconSize);RECT row=BoxItemRect(*box,slot);visual.hit=row;visual.position={visual.list?row.left+8:row.left+max(0L,((row.right-row.left)-visual.size)/2),visual.list?row.top+(row.bottom-row.top-visual.size)/2:row.top};
+    // Explorer's icon view reserves the lower part of each grid cell for the
+    // (potentially two-line) title.  Do not vertically centre it over the icon.
+    const LONG titleHeight=MulDiv(32,static_cast<int>(g_host.listview?GetDpiForWindow(g_host.listview):96),96);
+    visual.label=visual.list
+        ? RECT{visual.position.x+visual.size+8,row.top,row.right-8,row.bottom}
+        : RECT{row.left,visual.position.y+visual.size+3,row.right,min(row.bottom,visual.position.y+visual.size+3+titleHeight)};
 }
 void ReleaseVisualIcons() { g_visualIcons.clear(); }
 POINT VisualPosition(const std::wstring& path) {
     for(const auto& box:g_layout->boxes)if(HasPath(box,path)&&!box.collapsed) {
         int slot=0;for(const auto& item:box.items){if(_wcsicmp(item.c_str(),path.c_str())==0)break;if(FindEntry(g_snapshot,item))++slot;}
         if(!box.iconView){RECT row=BoxItemRect(box,slot);return {row.left+8,row.top+(row.bottom-row.top-min(24,HeaderHeight()))/2};}
-        RECT cell=BoxItemRect(box,slot);return {cell.left+max(0L,(g_snapshot.spacing.x-g_snapshot.iconSize)/2),cell.top};
+        RECT cell=BoxItemRect(box,slot);return {cell.left+max(0L,((cell.right-cell.left)-g_snapshot.iconSize)/2),cell.top};
     }
     for(const auto& placement:g_layout->desktop)
         if(_wcsicmp(placement.path.c_str(),path.c_str())==0)return placement.point;
@@ -251,7 +342,7 @@ void RebuildVisualIcons() {
     for(const auto& entry:g_snapshot.entries) {
         const Box* owner=nullptr;int slot=0;
         for(const auto& box:g_layout->boxes)if(HasPath(box,entry.path)){owner=&box;for(const auto& item:box.items){if(_wcsicmp(item.c_str(),entry.path.c_str())==0)break;if(FindEntry(g_snapshot,item))++slot;}break;}
-        if(owner&&owner->collapsed)continue;
+        if(owner&&(!IsActiveTab(*owner)||GroupRoot(*owner)->collapsed))continue;
         VisualIcon visual;visual.path=entry.path;visual.name=entry.path;auto slash=visual.name.find_last_of(L"\\/");if(slash!=std::wstring::npos)visual.name=visual.name.substr(slash+1);
         visual.position=VisualPosition(entry.path);visual.image=LoadIconImage(entry.path,owner&& !owner->iconView?min(24,HeaderHeight()):max(16,g_snapshot.iconSize));visual.selected=std::any_of(selected.begin(),selected.end(),[&](const auto& path){return _wcsicmp(path.c_str(),entry.path.c_str())==0;});SetVisualGeometry(visual,owner,slot);g_visualIcons.push_back(std::move(visual));
     }
@@ -282,8 +373,25 @@ void DrawVisualIcons(Gdiplus::Graphics& g) {
     for(auto& item:g_visualIcons) {
         if(item.selected){Gdiplus::SolidBrush selected(Gdiplus::Color(72,55,133,190));Gdiplus::RectF r(static_cast<float>(item.hit.left),static_cast<float>(item.hit.top),static_cast<float>(item.hit.right-item.hit.left),static_cast<float>(item.hit.bottom-item.hit.top));g.FillRectangle(&selected,r);}
         if(item.image)g.DrawImage(item.image.get(),item.position.x,item.position.y,item.size,item.size);
-        Gdiplus::StringFormat format;format.SetAlignment(item.list?Gdiplus::StringAlignmentNear:Gdiplus::StringAlignmentCenter);format.SetLineAlignment(Gdiplus::StringAlignmentCenter);format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        Gdiplus::SolidBrush text(Gdiplus::Color(255,255,255,255));Gdiplus::Font font(&family,item.list?Gdiplus::REAL(12):Gdiplus::REAL(12),Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);Gdiplus::RectF label(static_cast<float>(item.label.left),static_cast<float>(item.label.top),static_cast<float>(max(1L,item.label.right-item.label.left)),static_cast<float>(max(1L,item.label.bottom-item.label.top)));g.DrawString(item.name.c_str(),-1,&font,label,&format,&text);
+        Gdiplus::StringFormat format;format.SetAlignment(item.list?Gdiplus::StringAlignmentNear:Gdiplus::StringAlignmentCenter);format.SetLineAlignment(item.list?Gdiplus::StringAlignmentCenter:Gdiplus::StringAlignmentNear);format.SetTrimming(Gdiplus::StringTrimmingEllipsisWord);if(item.list)format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);else format.SetFormatFlags(Gdiplus::StringFormatFlagsLineLimit);
+        Gdiplus::SolidBrush text(Gdiplus::Color(255,255,255,255)),shadow(Gdiplus::Color(190,0,0,0));Gdiplus::Font font(&family,item.list?Gdiplus::REAL(12):Gdiplus::REAL(12),Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);Gdiplus::RectF label(static_cast<float>(item.label.left),static_cast<float>(item.label.top),static_cast<float>(max(1L,item.label.right-item.label.left)),static_cast<float>(max(1L,item.label.bottom-item.label.top))),offset=label;offset.X+=1.0f;offset.Y+=1.0f;g.DrawString(item.name.c_str(),-1,&font,offset,&format,&shadow);g.DrawString(item.name.c_str(),-1,&font,label,&format,&text);
+    }
+    // A selected icon reveals its complete file name without permanently
+    // widening the grid. This mirrors the desktop's focus-only title affordance.
+    if(g_focusIcon>=0&&g_focusIcon<static_cast<int>(g_visualIcons.size())) {
+        const auto& item=g_visualIcons[g_focusIcon];
+        if(item.selected&&!item.list) {
+            const int dpi=static_cast<int>(g_host.listview?GetDpiForWindow(g_host.listview):96);
+            Gdiplus::Font font(&family,static_cast<Gdiplus::REAL>(MulDiv(12,dpi,96)),Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);
+            Gdiplus::StringFormat format;format.SetAlignment(Gdiplus::StringAlignmentCenter);format.SetLineAlignment(Gdiplus::StringAlignmentNear);
+            const float width=static_cast<float>(min(440L,max(160L,g_snapshot.spacing.x*3L)));
+            Gdiplus::RectF measure(0,0,width-16.0f,2000.0f),used{};g.MeasureString(item.name.c_str(),-1,&font,measure,&format,&used);
+            const float height=max(static_cast<float>(MulDiv(28,dpi,96)),used.Height+10.0f);
+            const float x=max(4.0f,min(static_cast<float>(GetSystemMetrics(SM_CXVIRTUALSCREEN))-width-4.0f,static_cast<float>(item.position.x+item.size/2)-width/2.0f));
+            const float y=static_cast<float>(item.label.top);
+            Gdiplus::SolidBrush background(Gdiplus::Color(238,55,133,190));g.FillRectangle(&background,x,y,width,height);
+            Gdiplus::SolidBrush text(Gdiplus::Color(255,255,255,255));Gdiplus::RectF title(x+8.0f,y+5.0f,width-16.0f,height-10.0f);g.DrawString(item.name.c_str(),-1,&font,title,&format,&text);
+        }
     }
     if(g_marquee&&g_marqueeMoved){Gdiplus::SolidBrush fill(Gdiplus::Color(45,80,160,230));Gdiplus::Pen edge(Gdiplus::Color(190,130,190,255),1.0f);Gdiplus::RectF r(static_cast<float>(g_marqueeRect.left),static_cast<float>(g_marqueeRect.top),static_cast<float>(g_marqueeRect.right-g_marqueeRect.left),static_cast<float>(g_marqueeRect.bottom-g_marqueeRect.top));g.FillRectangle(&fill,r);g.DrawRectangle(&edge,r);}
 }
@@ -361,7 +469,11 @@ void DestroyDecorations() {
 }
 LRESULT CALLBACK DecorationProc(HWND,UINT,WPARAM,LPARAM);
 int HitVisualIcon(int x,int y) { for(int i=static_cast<int>(g_visualIcons.size())-1;i>=0;--i)if(PtInRect(&g_visualIcons[i].hit,POINT{x,y}))return i;return -1; }
-void RefreshIconHit(VisualIcon& item) { item.hit={item.position.x-8,item.position.y-4,item.position.x+g_snapshot.spacing.x-8,item.position.y+g_snapshot.spacing.y}; }
+void RefreshIconHit(VisualIcon& item) {
+    const LONG padding=max(0L,(g_snapshot.spacing.x-item.size)/2);
+    item.hit={item.position.x-padding,item.position.y,item.position.x-padding+g_snapshot.spacing.x,item.position.y+g_snapshot.spacing.y};
+    item.label={item.hit.left,item.position.y+item.size+3,item.hit.right,item.hit.bottom};
+}
 void ClearSelections() {
     for(auto& item:g_visualIcons)item.selected=false;
     for(auto& box:g_layout->boxes)box.selected=false;
@@ -417,6 +529,7 @@ void FinishVisualDrag() {
         }),g_layout->desktop.end());
         affected.push_back(target);
     } else {
+        dragged=SnapDesktopDrop(dragged);
         for(const auto& item:dragged)AssignDesktopItem(*g_layout,item.first,-1,item.second);
     }
     std::sort(affected.begin(),affected.end());affected.erase(std::unique(affected.begin(),affected.end()),affected.end());
@@ -443,7 +556,7 @@ bool Attach() {
     // This is the owned desktop surface. Explorer's list view is hidden while
     // the surface is alive; file paths remain unchanged.
     SetWindowPos(g_background,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-    for(const auto& box:g_layout->boxes) {
+    for(const auto& box:g_layout->boxes)if(IsGroupRoot(box)) {
         auto d=std::make_unique<Decoration>();d->id=box.id;
         d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,200,HeaderHeight(),host.defviewParent,nullptr,g_instance,d.get());
         d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,18,18,host.defviewParent,nullptr,g_instance,d.get());
@@ -527,6 +640,13 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             else g_boxButton=1;
             SetCapture(hwnd);return 0;
         }
+        if(hwnd==d->header) {
+            auto tabs=GroupTabs(*box);
+            if(tabs.size()>1&&x<width-3*h) {
+                const size_t index=min(tabs.size()-1,static_cast<size_t>(max(0,x)*static_cast<int>(tabs.size())/max(1,width-3*h)));
+                g_tabPending=true;g_dragId=tabs[index]->id;g_boxStart=tabs[index]->rect;GetCursorPos(&g_mouseStart);SetCapture(hwnd);return 0;
+            }
+        }
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         if(!ctrl)for(auto& item:g_visualIcons)item.selected=false;
         if(ctrl){box->selected=!box->selected;if(!box->selected){g_visualDirty=true;PaintAll();}return 0;}
@@ -537,7 +657,17 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         SetCapture(hwnd);return 0;
     }
     case WM_MOUSEMOVE:
+        if(g_tabPending&&GetCapture()==hwnd) {
+            POINT p{};GetCursorPos(&p);LONG dx=p.x-g_mouseStart.x,dy=p.y-g_mouseStart.y;
+            if(abs(dx)<4&&abs(dy)<4)return 0;
+            if(auto* tab=FindBox(g_dragId)) {
+                Box* root=GroupRoot(*tab);tab->groupId.clear();tab->activeTabId.clear();
+                if(root!=tab&&root->activeTabId==tab->id)root->activeTabId.clear();
+                tab->rect=g_boxStart;tab->selected=true;g_boxDragStart={{tab->id,g_boxStart}};g_drag=true;g_tabPending=false;g_tabDetached=true;g_resizing=false;g_visualDirty=true;box=tab;
+            }
+        }
         if(g_drag && GetCapture()==hwnd) {
+            if(auto* dragged=FindBox(g_dragId))box=dragged;
             POINT p{};GetCursorPos(&p);LONG dx=p.x-g_mouseStart.x,dy=p.y-g_mouseStart.y;box->rect=g_boxStart;
             if(g_resizing){box->rect.right=max(box->rect.left+240,box->rect.right+dx);box->rect.bottom=max(box->rect.top+HeaderHeight()+100,box->rect.bottom+dy);box->rect=FitGrid(*box,g_snapshot);}
             else {for(auto& start:g_boxDragStart)if(auto* selected=FindBox(start.first)){selected->rect=start.second;OffsetRect(&selected->rect,dx,dy);}if(g_nativeHidden){RefreshVisualGeometry();}else {std::vector<DesktopMove> moves=g_dragStart;for(auto& m:moves){m.position.x+=dx;m.position.y+=dy;}if(!moves.empty())QueueMoves(moves);}}
@@ -545,10 +675,30 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         }
         return 0;
     case WM_CANCELMODE:
-        g_boxButton=0;g_drag=false;g_resizing=false;g_boxDragStart.clear();CancelIconGesture();return 0;
+        g_boxButton=0;g_drag=false;g_tabPending=false;g_tabDetached=false;g_resizing=false;g_boxDragStart.clear();CancelIconGesture();return 0;
     case WM_LBUTTONUP:
+        if(g_tabPending){g_tabPending=false;ReleaseCapture();if(auto* tab=FindBox(g_dragId)){if(auto* root=GroupRoot(*tab)){root->activeTabId=tab->id;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}}return 0;}
         if(g_boxButton){int button=g_boxButton;g_boxButton=0;ReleaseCapture();if(button==1)ToggleBoxView(*box);else if(button==2){box->collapsed=!box->collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}else {auto id=box->id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}return 0;}
-        if(g_drag){g_drag=false;ReleaseCapture();if(g_resizing)Arrange(*box);g_boxDragStart.clear();SaveLayout(*g_layout);}return 0;
+        if(g_drag){
+            if(auto* dragged=FindBox(g_dragId))box=dragged;
+            g_drag=false;ReleaseCapture();
+            if(g_resizing)Arrange(*box);
+            else {
+                POINT cursor{};GetCursorPos(&cursor);cursor.x-=GetSystemMetrics(SM_XVIRTUALSCREEN);cursor.y-=GetSystemMetrics(SM_YVIRTUALSCREEN);
+                Box* source=GroupRoot(*box);Box* destination=nullptr;
+                for(auto& candidate:g_layout->boxes)if(IsGroupRoot(candidate)&&candidate.id!=source->id) {
+                    RECT header=DisplayRect(candidate);header.bottom=header.top+HeaderHeight();
+                    if(PtInRect(&header,cursor)){destination=&candidate;break;}
+                }
+                if(destination) {
+                    for(auto& candidate:g_layout->boxes)if(GroupRoot(candidate)->id==source->id) {candidate.groupId=destination->id;candidate.rect=destination->rect;candidate.color=destination->color;}
+                    destination->activeTabId=box->id;g_visualDirty=true;g_boxDragStart.clear();SaveLayout(*g_layout);PostMessageW(g_manager,WM_APP+11,0,0);return 0;
+                }
+            }
+            const bool rebuildDecorations=g_tabDetached;g_tabDetached=false;
+            g_boxDragStart.clear();SaveLayout(*g_layout);
+            if(rebuildDecorations)PostMessageW(g_manager,WM_APP+11,0,0);
+        }return 0;
     case WM_CAPTURECHANGED:if(g_drag){g_drag=false;if(g_resizing)Arrange(*box);g_boxDragStart.clear();SaveLayout(*g_layout);}return 0;
     }
     return DefWindowProcW(hwnd,message,wp,lp);

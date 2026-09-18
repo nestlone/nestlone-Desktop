@@ -164,6 +164,8 @@ Layout LoadLayout() {
     if (json.empty()) return layout;
     long savedOpacity = layout.opacity;
     if (ReadNumber(json, L"opacity", savedOpacity)) layout.opacity = static_cast<int>(std::clamp(savedOpacity, 20L, 100L));
+    long automatic = 0;
+    if (ReadNumber(json, L"autoOrganize", automatic)) layout.autoOrganize = automatic != 0;
     size_t at = 0;
     while ((at = json.find(L"{\"id\":", at)) != std::wstring::npos) {
         size_t next = at;
@@ -180,6 +182,8 @@ Layout LoadLayout() {
         box.collapsed = collapsed != 0;
         long iconView = 0;
         if (ReadNumber(object, L"iconView", iconView)) box.iconView = iconView != 0;
+        ReadString(object, L"groupId", box.groupId);
+        ReadString(object, L"activeTabId", box.activeTabId);
         for (const auto& item : ReadItems(object)) AddItem(box, item);
         layout.boxes.push_back(std::move(box));
     }
@@ -191,6 +195,15 @@ Layout LoadLayout() {
             item.point={x,y};layout.desktop.push_back(std::move(item));
         }
     }
+    at=0;
+    while((at=json.find(L"{\"ruleBox\":",at))!=std::wstring::npos) {
+        size_t next=at; const auto object=ObjectAt(json,at,next);at=next;
+        Layout::AutoRule rule;long folders=0;
+        if(ReadString(object,L"ruleBox",rule.boxId)) {
+            ReadNumber(object,L"folders",folders);rule.folders=folders!=0;ReadString(object,L"extensions",rule.extensions);
+            layout.autoRules.push_back(std::move(rule));
+        }
+    }
     return layout;
 }
 
@@ -198,11 +211,11 @@ bool SaveLayout(const Layout& layout) {
     const std::wstring path = LayoutPath();
     if (path.empty()) return false;
     const int opacity = std::clamp(layout.opacity, 20, 100);
-    std::wstring json = L"{\"version\":4,\"opacity\":" + std::to_wstring(opacity) + L",\"boxes\":[";
+    std::wstring json = L"{\"version\":5,\"opacity\":" + std::to_wstring(opacity) + L",\"autoOrganize\":" + std::to_wstring(layout.autoOrganize ? 1 : 0) + L",\"boxes\":[";
     for (size_t i = 0; i < layout.boxes.size(); ++i) {
         const Box& box = layout.boxes[i];
         if (i) json += L',';
-        json += L"{\"id\":\"" + Escape(box.id) + L"\",\"title\":\"" + Escape(box.title) + L"\",\"left\":" + std::to_wstring(box.rect.left) + L",\"top\":" + std::to_wstring(box.rect.top) + L",\"right\":" + std::to_wstring(box.rect.right) + L",\"bottom\":" + std::to_wstring(box.rect.bottom) + L",\"color\":" + std::to_wstring(static_cast<unsigned long>(box.color)) + L",\"collapsed\":" + std::to_wstring(box.collapsed ? 1 : 0) + L",\"iconView\":" + std::to_wstring(box.iconView ? 1 : 0) + L",\"items\":[";
+        json += L"{\"id\":\"" + Escape(box.id) + L"\",\"title\":\"" + Escape(box.title) + L"\",\"left\":" + std::to_wstring(box.rect.left) + L",\"top\":" + std::to_wstring(box.rect.top) + L",\"right\":" + std::to_wstring(box.rect.right) + L",\"bottom\":" + std::to_wstring(box.rect.bottom) + L",\"color\":" + std::to_wstring(static_cast<unsigned long>(box.color)) + L",\"collapsed\":" + std::to_wstring(box.collapsed ? 1 : 0) + L",\"iconView\":" + std::to_wstring(box.iconView ? 1 : 0) + L",\"groupId\":\"" + Escape(box.groupId) + L"\",\"activeTabId\":\"" + Escape(box.activeTabId) + L"\",\"items\":[";
         for (size_t j = 0; j < box.items.size(); ++j) { if (j) json += L','; json += L"\"" + Escape(box.items[j]) + L"\""; }
         json += L"]}";
     }
@@ -212,6 +225,8 @@ bool SaveLayout(const Layout& layout) {
         const auto& item=layout.desktop[i];
         json+=L"{\"desktopPath\":\""+Escape(item.path)+L"\",\"x\":"+std::to_wstring(item.point.x)+L",\"y\":"+std::to_wstring(item.point.y)+L"}";
     }
+    json += L"],\"autoRules\":[";
+    for(size_t i=0;i<layout.autoRules.size();++i) { if(i)json+=L',';const auto& rule=layout.autoRules[i];json+=L"{\"ruleBox\":\""+Escape(rule.boxId)+L"\",\"folders\":"+std::to_wstring(rule.folders?1:0)+L",\"extensions\":\""+Escape(rule.extensions)+L"\"}"; }
     json += L"]}";
     const std::wstring temporary = path + L".tmp";
     if (!WriteUtf8(temporary, ToUtf8(json))) return false;
