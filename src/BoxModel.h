@@ -11,6 +11,7 @@ struct Box {
     COLORREF color{RGB(184, 235, 238)};
     bool collapsed{false};
     bool iconView{false};
+    bool selected{false}; // transient owned-view selection, not persisted
     std::vector<std::wstring> items;
 };
 

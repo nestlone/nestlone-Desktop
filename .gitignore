@@ -1,5 +1,7 @@
 /build/
 /release/
+/references/DeskBox/
+/references/coodesker-desktop/
 /.claude/
 /.vs/
 *.exe

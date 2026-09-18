@@ -67,7 +67,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
         CopyFileW(layoutFile.c_str(),(layoutFile+L".pre-hosting").c_str(),TRUE);
     g_layout = nestlone::LoadLayout();
     if (g_layout.boxes.empty()) { nestlone::Box box; box.id = L"default"; box.title = L"我的盒子"; g_layout.boxes.push_back(box); }
-    // Explorer owns every desktop icon; our windows only decorate the desktop.
+    // The owned surface reads Explorer's paths and Shell icons, then temporarily
+    // hides the native list view while keeping every file at its original path.
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -91,6 +92,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     }
 
     db::HostInfo host = db::DiscoverDesktopHost();
+    nestlone::RestoreHiddenDesktopListView();
     db::LogHostInfo(host);
     HWND canvasParent = host.wallpaperWorker ? host.wallpaperWorker : GetDesktopWindow();
     if (!nestlone::CreateCanvas(instance, canvasParent, &g_layout)) {

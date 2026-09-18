@@ -17,14 +17,19 @@ using Microsoft::WRL::ComPtr;
 namespace nestlone {
 namespace {
 constexpr wchar_t lease[]=L"nestlone-D.DesktopOwner";
-bool View(ComPtr<IFolderView2>& view) {
+constexpr wchar_t hiddenLease[]=L"nestlone-D.HiddenListViewOwner";
+bool ShellView(ComPtr<IShellView>& view) {
     ComPtr<IShellWindows> windows;
     if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_LOCAL_SERVER,IID_PPV_ARGS(&windows))))return false;
     VARIANT empty{};long handle=0;ComPtr<IDispatch> dispatch;
     if(FAILED(windows->FindWindowSW(&empty,&empty,SWC_DESKTOP,&handle,SWFO_NEEDDISPATCH,&dispatch))||!dispatch)return false;
-    ComPtr<IServiceProvider> provider;ComPtr<IShellBrowser> browser;ComPtr<IShellView> shellView;
+    ComPtr<IServiceProvider> provider;ComPtr<IShellBrowser> browser;
     return SUCCEEDED(dispatch.As(&provider)) && SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&browser))) &&
-        SUCCEEDED(browser->QueryActiveShellView(&shellView)) && SUCCEEDED(shellView.As(&view));
+        SUCCEEDED(browser->QueryActiveShellView(&view));
+}
+bool View(ComPtr<IFolderView2>& view) {
+    ComPtr<IShellView> shellView;
+    return ShellView(shellView) && SUCCEEDED(shellView.As(&view));
 }
 struct Worker {
     std::mutex mutex;
@@ -35,6 +40,31 @@ struct Worker {
 };
 auto state=std::make_shared<Worker>();
 }
+bool ShellBackgroundMenuAvailable() {
+    ComPtr<IShellView> view;ComPtr<IContextMenu> menu;
+    return ShellView(view) && SUCCEEDED(view->GetItemObject(SVGIO_BACKGROUND,IID_PPV_ARGS(&menu)));
+}
+
+bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint) {
+    ComPtr<IShellView> view;
+    if(!ShellView(view))return false;
+    ComPtr<IContextMenu> menu;
+    if(FAILED(view->GetItemObject(SVGIO_BACKGROUND,IID_PPV_ARGS(&menu))))return false;
+    HMENU popup=CreatePopupMenu();
+    if(!popup)return false;
+    constexpr UINT first=1,last=0x7fff;
+    bool shown=false;
+    if(SUCCEEDED(menu->QueryContextMenu(popup,0,first,last,CMF_NORMAL))) {
+        int command=TrackPopupMenuEx(popup,TPM_RETURNCMD|TPM_RIGHTBUTTON,screenPoint.x,screenPoint.y,owner,nullptr);
+        if(command>=static_cast<int>(first)) {
+            CMINVOKECOMMANDINFOEX invoke{};invoke.cbSize=sizeof(invoke);invoke.fMask=CMIC_MASK_UNICODE;
+            invoke.hwnd=owner;invoke.lpVerb=MAKEINTRESOURCEA(command-first);invoke.lpVerbW=MAKEINTRESOURCEW(command-first);invoke.nShow=SW_SHOWNORMAL;
+            shown=SUCCEEDED(menu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke)));
+        } else shown=true;
+    }
+    DestroyMenu(popup);return shown;
+}
+
 bool ReadDesktop(DesktopSnapshot& result) {
     result={};
     auto host=db::DiscoverDesktopHost();
@@ -133,6 +163,25 @@ bool PollDesktop(DesktopSnapshot& output) {
         {std::lock_guard<std::mutex> lock(worker->mutex);worker->result=std::move(next);worker->ready=true;worker->running=false;}
     }).detach();
     return updated;
+}
+void ClaimHiddenDesktopListView(HWND listview) {
+    if(listview)SetPropW(listview,hiddenLease,reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(GetCurrentProcessId())));
+}
+void ReleaseHiddenDesktopListView(HWND listview) {
+    if(!listview)return;
+    ShowWindow(listview,SW_SHOWNOACTIVATE);RemovePropW(listview,hiddenLease);
+}
+bool RestoreHiddenDesktopListView() {
+    auto host=db::DiscoverDesktopHost();
+    if(!host.listview)return false;
+    HWND listview=host.listview;
+    DWORD owner=static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(GetPropW(listview,hiddenLease)));
+    if(!owner || owner==GetCurrentProcessId())return false;
+    HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,owner);
+    bool dead=process?WaitForSingleObject(process,0)==WAIT_OBJECT_0:GetLastError()==ERROR_INVALID_PARAMETER;
+    if(process)CloseHandle(process);
+    if(!dead)return false;
+    ReleaseHiddenDesktopListView(listview);return true;
 }
 void RestoreLegacyMask(HWND listview) {
     DWORD owner=static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(GetPropW(listview,lease)));

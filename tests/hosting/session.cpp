@@ -1,6 +1,23 @@
 #include "../../src/DesktopCanvas.cpp"
 #include <cstdio>
 #include <commctrl.h>
+#include <exdisp.h>
+#include <shlguid.h>
+#include <shlobj.h>
+#include <wrl/client.h>
+void PrintVisibilityCapabilities() {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IShellWindows> windows;ComPtr<IDispatch> dispatch;
+    ComPtr<IServiceProvider> provider;ComPtr<IShellBrowser> browser;ComPtr<IShellView> view;
+    VARIANT empty{};long handle=0;
+    if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_LOCAL_SERVER,IID_PPV_ARGS(&windows))) ||
+       FAILED(windows->FindWindowSW(&empty,&empty,SWC_DESKTOP,&handle,SWFO_NEEDDISPATCH,&dispatch)) ||
+       FAILED(dispatch.As(&provider)) || FAILED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&browser))) ||
+       FAILED(browser->QueryActiveShellView(&view)))return;
+    ComPtr<IFolderFilterSite> filter;ComPtr<IShellFolderView> legacy;
+    printf("Desktop IFolderFilterSite QueryInterface=0x%08lx\n",static_cast<unsigned long>(view.As(&filter)));
+    printf("Desktop IShellFolderView QueryInterface=0x%08lx\n",static_cast<unsigned long>(view.As(&legacy)));
+}
 int wmain(int argc,wchar_t** argv) {
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     if(argc>1 && wcscmp(argv[1],L"--close-old")==0) {
@@ -12,6 +29,20 @@ int wmain(int argc,wchar_t** argv) {
     auto check=[&](bool ok,const char* what){printf("%s %s\n",ok?"PASS":"FAIL",what);fflush(stdout);if(!ok)++failures;};
     nestlone::DesktopSnapshot before;
     check(nestlone::ReadDesktop(before),"read native desktop through Shell");if(failures)return 1;
+    if(argc>1 && wcscmp(argv[1],L"--capabilities")==0){PrintVisibilityCapabilities();CoUninitialize();return 0;}
+    if(argc>1 && wcscmp(argv[1],L"--diagnose")==0) {
+        printf("autoArrange=%d iconMode=%d count=%zu listview=%p\n",before.autoArrange,before.iconMode,before.entries.size(),before.listview);
+        POINT sample{};GetCursorPos(&sample);
+        if(argc>=4)sample={_wtol(argv[2]),_wtol(argv[3])};
+        for(POINT p: {sample}) {
+            HWND hit=WindowFromPoint(p);wchar_t name[128]{};GetClassNameW(hit,name,128);
+            DWORD pid=0;GetWindowThreadProcessId(hit,&pid);
+            printf("point=%ld,%ld hit=%p class=%ls pid=%lu\n",p.x,p.y,hit,name,pid);
+            HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
+            if(process){wchar_t path[32768]{};DWORD size=32768;if(QueryFullProcessImageNameW(process,0,path,&size))wprintf(L"hit process=%ls\n",path);CloseHandle(process);}
+        }
+        CoUninitialize();return 0;
+    }
     nestlone::RestoreLegacyMask(before.listview);
     HRGN nativeRegion=CreateRectRgn(0,0,0,0);
     check(GetWindowRgn(before.listview,nativeRegion)==ERROR,"native view has no mask");
@@ -19,19 +50,21 @@ int wmain(int argc,wchar_t** argv) {
     nestlone::Layout layout;nestlone::Box box;box.id=L"native-test";box.title=L"Native desktop";box.rect={700,140,1100,500};layout.boxes.push_back(box);
     check(nestlone::CreateCanvas(GetModuleHandleW(nullptr),nullptr,&layout),"create decoration manager");
     check(nestlone::g_background && IsWindow(nestlone::g_background),"layered background created on real desktop");
-    check((GetWindowLongPtrW(nestlone::g_background,GWL_EXSTYLE)&WS_EX_TRANSPARENT)!=0,"background is input transparent");
+    check((GetWindowLongPtrW(nestlone::g_background,GWL_EXSTYLE)&WS_EX_TRANSPARENT)==0,"owned surface receives icon input");
     check(GetParent(nestlone::g_background)==GetParent(nestlone::g_host.defview),"background is a sibling of the native Shell view");
-    bool below=false;
-    for(HWND h=GetWindow(nestlone::g_host.defview,GW_HWNDNEXT);h;h=GetWindow(h,GW_HWNDNEXT))if(h==nestlone::g_background)below=true;
-    check(below,"background z-order is below native icons");
-    check(nestlone::g_decorations.size()==1,"only title and corner handle receive box input");
-    check(GetWindowRgn(before.listview,nativeRegion)==ERROR && IsWindowVisible(before.listview),"native icons stay visible and unmasked");
+    check(GetWindow(nestlone::g_background,GW_HWNDPREV)!=nestlone::g_host.defview,"owned surface is above the native view");
+    SetWindowPos(nestlone::g_background,HWND_BOTTOM,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    nestlone::KeepSurfaceAboveIcons();
+    check(GetWindow(nestlone::g_background,GW_HWNDPREV)!=nestlone::g_host.defview,"owned surface z-order repairs above native view");
+    check(nestlone::g_decorations.size()==1 && !nestlone::g_visualIcons.empty(),"owned title surface and shell icons created");
+    check(nestlone::ShellBackgroundMenuAvailable(),"Explorer background context menu is available");
+    check(GetWindowRgn(before.listview,nativeRegion)==ERROR && !IsWindowVisible(before.listview),"Explorer icons are hidden while owned view is active");
     nestlone::DesktopSnapshot after;nestlone::ReadDesktop(after);
     bool unchanged=before.entries.size()==after.entries.size();
     for(const auto& e:before.entries){auto* now=nestlone::FindEntry(after,e.path);if(!now||now->position.x!=e.position.x||now->position.y!=e.position.y)unchanged=false;}
     check(unchanged,"starting decorations does not move any real icon");
     DWORD_PTR selectedAfter=0;SendMessageTimeoutW(before.listview,LVM_GETSELECTEDCOUNT,0,0,SMTO_ABORTIFHUNG,1000,&selectedAfter);
-    check(selectedAfter==selectedBefore,"native selection is untouched");
+    check(selectedAfter==selectedBefore,"Explorer selection state is preserved for restoration");
     if(argc>1 && wcscmp(argv[argc-1],L"--position-test")==0) {
         auto disposable=std::find_if(before.entries.begin(),before.entries.end(),[](const auto& e){return e.path.find(L"DeskBox-hosting-test-20260914")!=std::wstring::npos;});
         check(disposable!=before.entries.end(),"dedicated disposable desktop test item exists");
@@ -71,6 +104,6 @@ int wmain(int argc,wchar_t** argv) {
     nestlone::Observe(a,b);check(nestlone::HasPath(layout.boxes[0],synthetic.path),"native movement into rectangle records membership");
     nestlone::Observe(b,a);check(!nestlone::HasPath(layout.boxes[0],synthetic.path),"native movement out releases membership");
     nestlone::DestroyCanvas();
-    check(GetWindowRgn(before.listview,nativeRegion)==ERROR && IsWindowVisible(before.listview),"exit leaves the original native view intact");
+    check(GetWindowRgn(before.listview,nativeRegion)==ERROR && IsWindowVisible(before.listview),"exit restores the original native view");
     DeleteObject(nativeRegion);CoUninitialize();return failures?1:0;
 }

@@ -149,8 +149,9 @@ bool AssignDesktopItem(Layout& layout,const std::wstring& path,int boxIndex,POIN
         box.items.erase(std::remove_if(box.items.begin(),box.items.end(),
             [&](const auto& p){return _wcsicmp(p.c_str(),path.c_str())==0;}),box.items.end());
     }
+    layout.desktop.erase(std::remove_if(layout.desktop.begin(),layout.desktop.end(),
+        [&](const auto& item){return _wcsicmp(item.path.c_str(),path.c_str())==0;}),layout.desktop.end());
     if(boxIndex>=0) return AddItem(layout.boxes[boxIndex],path);
-    for(auto& item:layout.desktop) if(_wcsicmp(item.path.c_str(),path.c_str())==0) {item.point=point;return true;}
     layout.desktop.push_back({path,point});
     return true;
 }
