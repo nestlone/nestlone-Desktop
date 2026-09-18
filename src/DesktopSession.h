@@ -2,22 +2,35 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 namespace nestlone {
+// Coordinates are physical pixels relative to the virtual-screen origin.
 struct DesktopEntry {
     std::wstring path;
-    std::wstring name;
     POINT position{};
     RECT bounds{};
-    std::vector<DWORD> largeIcon,smallIcon;
+    int index=-1;
 };
-bool ReadDesktop(std::vector<DesktopEntry>& entries);
-bool BeginDesktopSession();
-void EndDesktopSession();
-bool DesktopSessionAlive();
+struct DesktopSnapshot {
+    HWND listview=nullptr;
+    DWORD process=0;
+    POINT spacing{76,91};
+    int iconSize=32;
+    bool autoArrange=false;
+    bool iconMode=false;
+    bool readable=false;
+    std::wstring error;
+    uint64_t applied=0;
+    std::vector<DesktopEntry> entries;
+};
+struct DesktopMove {std::wstring path; POINT position;};
+bool ReadDesktop(DesktopSnapshot& result);
+// Coalesced requests are handled on a COM worker, never on the painting thread.
+uint64_t QueueDesktopMoves(const std::vector<DesktopMove>& moves);
+bool PollDesktop(DesktopSnapshot& result);
+void CancelDesktopMoves();
+void RestoreLegacyMask(HWND listview);
+// Only for old recovery subprocess command lines, no new helper is launched.
 int DesktopRecovery(const wchar_t* arguments);
-bool PollDesktop(std::vector<DesktopEntry>& entries);
-bool MaskDesktopItems(const std::vector<DesktopEntry>& entries,const std::vector<std::wstring>& paths);
-void PlaceDesktopItem(const std::wstring& path,POINT point);
-std::vector<DWORD> IconPixels(HICON icon,int size);
 }

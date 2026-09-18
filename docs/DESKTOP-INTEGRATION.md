@@ -1,63 +1,78 @@
-# Native-desktop-preserving correction
+# Native desktop decoration and position rules
 
-Supersedes the whole-desktop replacement in f755572 after the user reported a
-black screen, no tray icon and a nonresponsive application.
+Explorer's `SysListView32` owns every icon, label, selection, context menu,
+keyboard gesture, rename editor, accessibility object and drag/drop target.
+nestlone-D neither paints nor masks desktop items and registers no drop target
+or mouse hook for the desktop body.
 
-## Evidence and diagnosis
+## Windows and input
 
-The previous executable did synchronous Shell enumeration and icon extraction
-on the UI/paint thread, installed the tray only after creating its entire
-replacement canvas, and hid the native icon window. These are confirmed code
-defects matching the failure symptoms; no crash dump proves a specific Shell
-handler caused the reported hang.
+The background is a `WS_CHILD | WS_EX_LAYERED | WS_EX_TRANSPARENT |
+WS_EX_NOACTIVATE` window sharing a parent with `SHELLDLL_DefView`. Its sibling
+Z order is below that complete view. Only two small windows per box sit above
+the native view: the title bar and the bottom-right resize grip. File input
+always remains with Explorer, including input on empty space inside a box.
 
-## Current behavior
+Title rename uses a focused native edit positioned over the title. This edits
+box metadata only; Explorer handles file rename independently.
 
-- Install the tray before desktop discovery; abort safely if it cannot be installed.
-- Start with the native desktop fully visible and its region unchanged when no items belong to a box.
-- Only render boxes, never repaint unboxed desktop icons or wallpaper.
-- Keep all pixels outside boxes fully transparent. Render a successful layered
-  frame before showing the overlay.
-- Read Shell metadata and extract icons on a detached worker. The paint thread
-  only consumes cached pixels. A slow Shell handler cannot block tray/painting.
-- On an explicit desktop-to-box drop, exclude the managed native tile rectangle
-  from the ListView's window region. Other native icons remain visible, in their
-  original positions, and retain Windows rendering and interaction.
-- Paths belonging to boxes participate in native masking, including saved box
-  items restored after launch. Unboxed desktop items remain fully native.
-- Dragging out removes the mask and requests the native Shell to place the
-  item at the drop point. Windows grid snapping may adjust that point.
-- Restore the original unrestricted region on pause, exit or process death.
-  Refuse masking if another application already assigned a custom region.
-- Do not move files, set hidden attributes, modify the wallpaper, or change
-  desktop global visibility/auto-arrange preferences.
+The embedded compatibility manifest declares Windows 8+ layered-child support
+and per-monitor V2 DPI awareness. Stored positions use physical pixels relative
+to the virtual-screen origin, converted to ListView client coordinates before
+positioning. Mixed-DPI hardware still requires manual testing.
+
+## Position rules
+
+A COM worker reads the desktop `IFolderView2` and maps Shell parsing names to
+current item indices and physical positions. It does not extract icon bitmaps.
+After a native drag finishes, position differences update box membership.
+Dragging outside the background releases membership. Items already under a new
+background can be explicitly adopted from the title-bar menu.
+
+Dragging a title queues translated positions for its members. The arrange
+button queues grid positions using native icon spacing. A coalescing worker
+rechecks each item's identity before sending `LVM_SETITEMPOSITION`, with scalar
+packed coordinates rather than remote pointers. Read-back detects grid snapping
+or rejection. Windows can still reorder items between verification and the
+message; this is not a transaction with Explorer.
+
+The worker refuses automatic-arrange / incompatible view modes, uses bounded
+cross-process messages, and reports positioning errors in the title-bar menu.
+It does not change global arrangement preferences or request elevation.
+Packed positions outside 0..32767 are unsupported. An arrange request refuses
+occupied slots; if a box is full, remaining items stay in place.
+
+Starting or reconnecting does not automatically move icons. Membership is saved;
+positions themselves are retained by Explorer. Renaming/deleting files can leave
+obsolete metadata paths, which are skipped by positioning. A renamed item that
+appears inside a box is adopted on the next snapshot.
+
+## Recovery and boundaries
+
+The manager rediscovers Explorer and recreates its own decorations after the
+native windows disappear. It never hides the native view. Exit/termination only
+removes decoration windows; real icon positions and Explorer state survive.
+The only call that clears a native window region is migration cleanup of a
+pre-existing nestlone-D mask whose recorded owner process has exited.
+
+There is no per-box native list mode, icon clipping, private marquee selection,
+scrolling viewport or icon-hiding collapse. Collapse removes the background
+body only; native icons remain visible. Global desktop view settings apply to
+all boxes. No replacement Shell context menus or file-operation handlers exist.
 
 ## Verification
 
-tests/hosting/session.bat tests real native window regions and the overlay
-WM_DROPFILES/internal mouse handlers with an existing disposable test folder.
-It uses build/hosting-test-layout.json, not the user's layout.
+`tests/render/run.bat` checks background alpha, absence of any painted icon
+pixels, and collapsed backgrounds. `tests/hosting/session.bat` checks real
+Explorer visibility/regions, decoration Z order, input-transparent style,
+preserved desktop positions/selection, and adoption/release rules against
+isolated layout data. `--position-test` explicitly enables moving and restoring
+the dedicated disposable test folder; other icon positions are compared.
 
-Passed: untouched native region at launch; accepted desktop drop; excluded
-target region; native window still visible; other regions and all other icon
-positions unchanged; reverse drag removes the mask; original file attributes;
-normal exit restores the original native region.
+These tests passed on the development machine. They do not substitute for a
+manual visual pass across Windows releases, wallpaper applications, Explorer
+restart and mixed-DPI monitors. Screenshot automation was unavailable during
+this migration because its runtime could not initialize.
 
-Forced termination via --crash-test followed by --verify-native passed recovery.
-Render regression checks confirm outside pixels are alpha zero, title opacity
-is independent of background, and Shell/legacy icon alpha is preserved.
-
-## Limitations
-
-The Windows UI inspection tool did not expose the desktop as a capture target.
-These checks validate live window regions, coordinates and render pixels, not
-an end-to-end visual comparison of the entire desktop.
-
-Tile bounds use the Shell icon origin, spacing and icon size. This is experimental
-for uncommon desktop view modes, custom icon spacing and mixed-DPI monitors.
-The native Shell still knows about masked items for keyboard selection/search.
-Shell changes are refreshed asynchronously; there can be a brief interval
-before masks follow a native refresh or re-sort.
-
-The older desktop replacement session report is historical and is not the
-acceptance specification for the corrected build.
+References: [LVM_SETITEMPOSITION](https://learn.microsoft.com/en-us/windows/win32/controls/lvm-setitemposition),
+[layered windows](https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features).

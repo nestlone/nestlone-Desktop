@@ -53,7 +53,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     if(wcsncmp(arguments,L"--restore-desktop ",18)==0)return nestlone::DesktopRecovery(arguments);
     g_mutex = CreateMutexW(nullptr, TRUE, kMutex);
     if (!g_mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND existing = FindWindowExW(HWND_MESSAGE,nullptr,kControlClass,nullptr);
+        HWND existing = FindWindowW(kControlClass,L"nestlone-D");
+        if(!existing)existing=FindWindowExW(HWND_MESSAGE,nullptr,kControlClass,L"nestlone-D");
         if (existing) PostMessageW(existing, WM_COMMAND, nestlone::ID_TRAY_TOGGLE, 0);
         if (g_mutex) CloseHandle(g_mutex);
         return 0;
@@ -66,7 +67,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
         CopyFileW(layoutFile.c_str(),(layoutFile+L".pre-hosting").c_str(),TRUE);
     g_layout = nestlone::LoadLayout();
     if (g_layout.boxes.empty()) { nestlone::Box box; box.id = L"default"; box.title = L"我的盒子"; g_layout.boxes.push_back(box); }
-    // Hosting affects only presentation; file paths and attributes are unchanged.
+    // Explorer owns every desktop icon; our windows only decorate the desktop.
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -78,7 +79,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     if (!wc.hIcon) wc.hIcon = nestlone::CreateNestloneIcon(GetSystemMetrics(SM_CXICON));
     if (!wc.hIconSm) wc.hIconSm = nestlone::CreateNestloneIcon(GetSystemMetrics(SM_CXSMICON));
     RegisterClassExW(&wc);
-    g_control = CreateWindowExW(0, kControlClass, L"nestlone-D", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, instance, nullptr);
+    // Hidden top-level window receives TaskbarCreated after Explorer restarts.
+    // Message-only windows do not receive that broadcast.
+    g_control = CreateWindowExW(WS_EX_TOOLWINDOW, kControlClass, L"nestlone-D", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     if (!g_control) return 1;
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     // Always expose an exit/settings route before any desktop discovery.
@@ -92,7 +95,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     HWND canvasParent = host.wallpaperWorker ? host.wallpaperWorker : GetDesktopWindow();
     if (!nestlone::CreateCanvas(instance, canvasParent, &g_layout)) {
         db::LogF("CreateCanvas failed: %lu", GetLastError());
-        MessageBoxW(nullptr,L"桌面接管未能启动，原生桌面保持不变。请查看日志。",L"nestlone-D",MB_OK|MB_ICONWARNING);
+        MessageBoxW(nullptr,L"桌面背景层未能启动，请查看日志。",L"nestlone-D",MB_OK|MB_ICONWARNING);
         DestroyWindow(g_control);
     }
 

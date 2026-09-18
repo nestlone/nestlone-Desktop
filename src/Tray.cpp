@@ -28,7 +28,7 @@ void TrayRemove(HWND) {
 
 void TrayShowMenu(HWND owner) {
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"显示 / 隐藏盒子（恢复桌面图标）");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_TOGGLE, L"显示 / 隐藏盒子背景");
     AppendMenuW(menu, MF_STRING, ID_TRAY_NEW_BOX, L"新建盒子");
     AppendMenuW(menu, MF_STRING, ID_TRAY_RELOAD, L"重新加载布局");
     AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"设置中心");

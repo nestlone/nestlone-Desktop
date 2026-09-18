@@ -4,204 +4,153 @@
 #include <shlwapi.h>
 #include <exdisp.h>
 #include <shlguid.h>
+#include <commctrl.h>
 #include <wrl/client.h>
-#include <cstdio>
-#include <thread>
-#include <mutex>
-#include <memory>
 #include <atomic>
+#include <mutex>
+#include <thread>
+#include <memory>
 #include <algorithm>
+#include <cstdio>
 #pragma comment(lib,"uuid.lib")
 using Microsoft::WRL::ComPtr;
 namespace nestlone {
 namespace {
-HWND nativeIcons=nullptr;
-DWORD explorerPid=0;
-HWND watchedIcons=nullptr;
-DWORD watchedExplorer=0;
 constexpr wchar_t lease[]=L"nestlone-D.DesktopOwner";
-bool Valid(HWND hwnd,DWORD pid) {
-    DWORD actual=0;GetWindowThreadProcessId(hwnd,&actual);
-    wchar_t cls[64]{};GetClassNameW(hwnd,cls,64);
-    return actual==pid && wcscmp(cls,L"SysListView32")==0;
-}
 bool View(ComPtr<IFolderView2>& view) {
     ComPtr<IShellWindows> windows;
     if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_LOCAL_SERVER,IID_PPV_ARGS(&windows))))return false;
     VARIANT empty{};long handle=0;ComPtr<IDispatch> dispatch;
     if(FAILED(windows->FindWindowSW(&empty,&empty,SWC_DESKTOP,&handle,SWFO_NEEDDISPATCH,&dispatch))||!dispatch)return false;
     ComPtr<IServiceProvider> provider;ComPtr<IShellBrowser> browser;ComPtr<IShellView> shellView;
-    return SUCCEEDED(dispatch.As(&provider)) &&
-        SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&browser))) &&
+    return SUCCEEDED(dispatch.As(&provider)) && SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&browser))) &&
         SUCCEEDED(browser->QueryActiveShellView(&shellView)) && SUCCEEDED(shellView.As(&view));
 }
-struct Snapshot {
-    std::atomic<bool> running{false};
+struct Worker {
     std::mutex mutex;
-    bool ready=false;
-    std::vector<DesktopEntry> entries;
+    bool running=false,ready=false;
+    uint64_t requested=0,applied=0;
+    std::vector<DesktopMove> moves;
+    DesktopSnapshot result;
 };
-auto snapshot=std::make_shared<Snapshot>();
+auto state=std::make_shared<Worker>();
 }
-bool ReadDesktop(std::vector<DesktopEntry>& entries) {
-    ComPtr<IFolderView2> view;if(!View(view))return false;
+bool ReadDesktop(DesktopSnapshot& result) {
+    result={};
     auto host=db::DiscoverDesktopHost();
-    if(!host.listview)return false;
-    const int virtualLeft=GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int virtualTop=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    ComPtr<IShellFolder> folder;ComPtr<IEnumIDList> items;
-    if(FAILED(view->GetFolder(IID_PPV_ARGS(&folder)))||FAILED(view->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items))))return false;
-    POINT spacing{76,91};view->GetSpacing(&spacing);
-    FOLDERVIEWMODE mode{};int iconSize=32;view->GetViewModeAndIconSize(&mode,&iconSize);
-    std::vector<DesktopEntry> found;
-    PITEMID_CHILD item=nullptr;
-    while(items->Next(1,&item,nullptr)==S_OK) {
-        STRRET parsed{},display{};wchar_t path[32768]{},name[1024]{};
+    if(!host.listview){result.error=L"等待 Windows 桌面恢复";return false;}
+    result.listview=host.listview;GetWindowThreadProcessId(host.listview,&result.process);
+    ComPtr<IFolderView2> view;
+    if(!View(view)){result.error=L"无法读取桌面 Shell 视图";return false;}
+    ComPtr<IShellFolder> folder;
+    if(FAILED(view->GetFolder(IID_PPV_ARGS(&folder))))return false;
+    DWORD flags=0;view->GetCurrentFolderFlags(&flags);
+    result.autoArrange=(flags&FWF_AUTOARRANGE)!=0 || (GetWindowLongPtrW(host.listview,GWL_STYLE)&LVS_AUTOARRANGE)!=0;
+    FOLDERVIEWMODE mode{};
+    view->GetViewModeAndIconSize(&mode,&result.iconSize);
+    result.iconMode=mode==FVM_ICON || mode==FVM_SMALLICON;
+    view->GetSpacing(&result.spacing);
+    result.spacing.x=max(result.spacing.x,result.iconSize+24L);
+    result.spacing.y=max(result.spacing.y,result.iconSize+40L);
+    POINT origin{};ClientToScreen(host.listview,&origin);
+    origin.x-=GetSystemMetrics(SM_XVIRTUALSCREEN);origin.y-=GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int count=0;if(FAILED(view->ItemCount(SVGIO_ALLVIEW,&count)))return false;
+    for(int i=0;i<count;++i) {
+        PITEMID_CHILD item=nullptr;
+        if(FAILED(view->Item(i,&item))||!item)continue;
+        STRRET parsed{};wchar_t path[32768]{};POINT position{};
         if(SUCCEEDED(folder->GetDisplayNameOf(item,SHGDN_FORPARSING,&parsed)) &&
-           SUCCEEDED(StrRetToBufW(&parsed,item,path,32768))) {
-            folder->GetDisplayNameOf(item,SHGDN_NORMAL,&display);StrRetToBufW(&display,item,name,1024);
-            DesktopEntry entry;entry.path=path;entry.name=name;
-            view->GetItemPosition(item,&entry.position);
-            // IFolderView positions are in the native list-view client space;
-            // the canvas is positioned at the virtual-desktop origin.
-            POINT screen=entry.position;
-            ClientToScreen(host.listview,&screen);
-            entry.position={screen.x-virtualLeft,screen.y-virtualTop};
-            // Shell item positions are icon origins; include their centered labels.
-            const LONG padding=max(0L,(spacing.x-iconSize)/2);
-            entry.bounds={entry.position.x-padding,entry.position.y,entry.position.x-padding+spacing.x,entry.position.y+spacing.y};
-            for(int size:{16,32}) {
-                SHFILEINFOW fi{};
-                if(SHGetFileInfoW(path,0,&fi,sizeof(fi),SHGFI_ICON|(size==16?SHGFI_SMALLICON:SHGFI_LARGEICON))) {
-                    auto pixels=IconPixels(fi.hIcon,size);DestroyIcon(fi.hIcon);
-                    if(size==16)entry.smallIcon=std::move(pixels);else entry.largeIcon=std::move(pixels);
-                }
-            }
-            found.push_back(std::move(entry));
+           SUCCEEDED(StrRetToBufW(&parsed,item,path,32768)) && SUCCEEDED(view->GetItemPosition(item,&position))) {
+            DesktopEntry entry;entry.path=path;entry.index=i;
+            entry.position={position.x+origin.x,position.y+origin.y};
+            LONG padding=max(0L,(result.spacing.x-result.iconSize)/2);
+            entry.bounds={entry.position.x-padding,entry.position.y,entry.position.x-padding+result.spacing.x,entry.position.y+result.spacing.y};
+            result.entries.push_back(std::move(entry));
         }
         CoTaskMemFree(item);
     }
-    entries=std::move(found);return true;
+    result.readable=true;return true;
 }
-bool PollDesktop(std::vector<DesktopEntry>& entries) {
-    auto state=snapshot;bool updated=false;
+uint64_t QueueDesktopMoves(const std::vector<DesktopMove>& moves) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->moves=moves;return ++state->requested;
+}
+void CancelDesktopMoves() {QueueDesktopMoves({});}
+bool PollDesktop(DesktopSnapshot& output) {
+    auto worker=state;bool updated=false;
     {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if(state->ready){entries=std::move(state->entries);state->ready=false;updated=true;}
+        std::lock_guard<std::mutex> lock(worker->mutex);
+        if(worker->ready){output=std::move(worker->result);worker->ready=false;updated=true;}
+        if(worker->running)return updated;
+        worker->running=true;
     }
-    bool expected=false;
-    if(state->running.compare_exchange_strong(expected,true)) {
-        std::thread([state] {
-            CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
-            std::vector<DesktopEntry> entries;
-            if(ReadDesktop(entries)) {std::lock_guard<std::mutex> lock(state->mutex);state->entries=std::move(entries);state->ready=true;}
-            CoUninitialize();state->running=false;
-        }).detach();
-    }
+    std::thread([worker] {
+        HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+        DesktopSnapshot next;
+        if(SUCCEEDED(com)) {
+            uint64_t generation=0,previous=0;std::vector<DesktopMove> moves;
+            {std::lock_guard<std::mutex> lock(worker->mutex);generation=worker->requested;previous=worker->applied;moves=worker->moves;}
+            if(ReadDesktop(next) && generation!=previous && !moves.empty()) {
+                if(next.autoArrange)next.error=L"请在桌面右键 → 查看中关闭“自动排列图标”，才能整理位置";
+                else if(!next.iconMode)next.error=L"当前桌面视图不支持自由定位";
+                else {
+                    ComPtr<IFolderView2> view;ComPtr<IShellFolder> folder;
+                    if(View(view))view->GetFolder(IID_PPV_ARGS(&folder));
+                    for(const auto& move:moves) {
+                        {std::lock_guard<std::mutex> lock(worker->mutex);if(worker->requested!=generation)break;}
+                        auto found=std::find_if(next.entries.begin(),next.entries.end(),[&](const auto& e){return _wcsicmp(e.path.c_str(),move.path.c_str())==0;});
+                        if(found==next.entries.end() || !view || !folder)continue;
+                        // Verify the index still refers to the same Shell item immediately
+                        // before posting a scalar-only cross-process list-view message.
+                        PITEMID_CHILD pidl=nullptr;STRRET parsed{};wchar_t path[32768]{};
+                        if(FAILED(view->Item(found->index,&pidl))||!pidl)continue;
+                        bool same=SUCCEEDED(folder->GetDisplayNameOf(pidl,SHGDN_FORPARSING,&parsed)) &&
+                            SUCCEEDED(StrRetToBufW(&parsed,pidl,path,32768)) && _wcsicmp(path,move.path.c_str())==0;
+                        DWORD process=0;GetWindowThreadProcessId(next.listview,&process);
+                        POINT point{move.position.x+GetSystemMetrics(SM_XVIRTUALSCREEN),move.position.y+GetSystemMetrics(SM_YVIRTUALSCREEN)};
+                        ScreenToClient(next.listview,&point);
+                        if(point.x<0 || point.x>32767 || point.y<0 || point.y>32767)next.error=L"目标超出原生图标定位范围，图标保留原位";
+                        else if(same && process==next.process) {
+                            DWORD_PTR reply=0;
+                            if(!SendMessageTimeoutW(next.listview,LVM_SETITEMPOSITION,found->index,MAKELPARAM(point.x,point.y),SMTO_ABORTIFHUNG,300,&reply)||!reply)
+                                next.error=L"图标定位被拒绝：请确认程序与 Explorer 权限一致";
+                            else {
+                                POINT actual{};
+                                if(FAILED(view->GetItemPosition(pidl,&actual)) || abs(actual.x-point.x)>2 || abs(actual.y-point.y)>2)
+                                    next.error=L"Windows 调整了图标位置，请检查对齐网格和显示器边界";
+                            }
+                        }
+                        CoTaskMemFree(pidl);
+                    }
+                }
+                std::wstring error=next.error;
+                ReadDesktop(next);next.error=error;
+            }
+            next.applied=generation;
+            {std::lock_guard<std::mutex> lock(worker->mutex);worker->applied=generation;}
+            CoUninitialize();
+        } else next.error=L"无法初始化桌面 Shell 服务";
+        {std::lock_guard<std::mutex> lock(worker->mutex);worker->result=std::move(next);worker->ready=true;worker->running=false;}
+    }).detach();
     return updated;
 }
-bool BeginDesktopSession() {
-    if(nativeIcons)return DesktopSessionAlive();
-    auto host=db::DiscoverDesktopHost();
-    if(!host.listview || !IsWindowVisible(host.listview))return false;
-    const DWORD previousOwner=static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(GetPropW(host.listview,lease)));
-    if(previousOwner) {
-        HANDLE previous=OpenProcess(SYNCHRONIZE,FALSE,previousOwner);
-        const bool dead=previous ? WaitForSingleObject(previous,0)==WAIT_OBJECT_0 : GetLastError()==ERROR_INVALID_PARAMETER;
-        if(previous)CloseHandle(previous);
-        if(dead) {SetWindowRgn(host.listview,nullptr,TRUE);RemovePropW(host.listview,lease);}
-    }
-    HRGN existing=CreateRectRgn(0,0,0,0);
-    int kind=GetWindowRgn(host.listview,existing);DeleteObject(existing);
-    if(kind!=ERROR)return false; // Do not overwrite another application's region.
-    nativeIcons=host.listview;GetWindowThreadProcessId(nativeIcons,&explorerPid);
-    const DWORD pid=GetCurrentProcessId();
-    if(!SetPropW(nativeIcons,lease,reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)))){nativeIcons=nullptr;return false;}
-    if(watchedIcons==nativeIcons && watchedExplorer==explorerPid)return true;
-    wchar_t exe[32768]{};GetModuleFileNameW(nullptr,exe,32768);
-    std::wstring readyName=L"Local\\nestlone-recovery-ready-"+std::to_wstring(pid);
-    HANDLE ready=CreateEventW(nullptr,TRUE,FALSE,readyName.c_str());
-    if(ready)ResetEvent(ready);
-    std::wstring command=L"\""+std::wstring(exe)+L"\" --restore-desktop "+std::to_wstring(pid)+L" "+
-        std::to_wstring(reinterpret_cast<ULONG_PTR>(nativeIcons))+L" "+std::to_wstring(explorerPid);
-    STARTUPINFOW startup{};startup.cb=sizeof(startup);PROCESS_INFORMATION process{};
-    bool launched=ready && CreateProcessW(exe,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&process);
-    bool armed=launched && WaitForSingleObject(ready,5000)==WAIT_OBJECT_0;
-    if(launched){CloseHandle(process.hThread);CloseHandle(process.hProcess);}if(ready)CloseHandle(ready);
-    if(!armed){RemovePropW(nativeIcons,lease);nativeIcons=nullptr;return false;}
-    watchedIcons=nativeIcons;watchedExplorer=explorerPid;return true;
+void RestoreLegacyMask(HWND listview) {
+    DWORD owner=static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(GetPropW(listview,lease)));
+    if(!owner)return;
+    HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,owner);
+    bool dead=process?WaitForSingleObject(process,0)==WAIT_OBJECT_0:GetLastError()==ERROR_INVALID_PARAMETER;
+    if(process)CloseHandle(process);
+    if(dead){SetWindowRgn(listview,nullptr,TRUE);RemovePropW(listview,lease);}
 }
-bool MaskDesktopItems(const std::vector<DesktopEntry>& entries,const std::vector<std::wstring>& paths) {
-    if(paths.empty()){EndDesktopSession();return true;}
-    if(!BeginDesktopSession())return false;
-    RECT bounds{};GetWindowRect(nativeIcons,&bounds);
-    HRGN region=CreateRectRgn(0,0,bounds.right-bounds.left,bounds.bottom-bounds.top);
-    const int virtualLeft=GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int virtualTop=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    for(const auto& path:paths) {
-        auto entry=std::find_if(entries.begin(),entries.end(),[&](const DesktopEntry& candidate) {
-            return _wcsicmp(candidate.path.c_str(),path.c_str())==0;
-        });
-        // Do not silently report success when the Shell cannot resolve a saved
-        // desktop entry; callers keep the native desktop untouched instead.
-        if(entry==entries.end()){DeleteObject(region);EndDesktopSession();return false;}
-        POINT topLeft{entry->bounds.left+virtualLeft,entry->bounds.top+virtualTop};
-        POINT bottomRight{entry->bounds.right+virtualLeft,entry->bounds.bottom+virtualTop};
-        ScreenToClient(nativeIcons,&topLeft);ScreenToClient(nativeIcons,&bottomRight);
-        HRGN hole=CreateRectRgn(topLeft.x,topLeft.y,bottomRight.x,bottomRight.y);
-        CombineRgn(region,region,hole,RGN_DIFF);DeleteObject(hole);
-    }
-    if(!SetWindowRgn(nativeIcons,region,TRUE)){DeleteObject(region);EndDesktopSession();return false;}
-    return true;
-}
-void EndDesktopSession() {
-    if(nativeIcons && Valid(nativeIcons,explorerPid) &&
-       GetPropW(nativeIcons,lease)==reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(GetCurrentProcessId()))) {
-        SetWindowRgn(nativeIcons,nullptr,TRUE);RemovePropW(nativeIcons,lease);
-    }
-    nativeIcons=nullptr;
-}
-bool DesktopSessionAlive() {
-    return nativeIcons && Valid(nativeIcons,explorerPid) && IsWindowVisible(nativeIcons);
-}
-void PlaceDesktopItem(const std::wstring& path,POINT point) {
-    const int virtualLeft=GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int virtualTop=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    auto host=db::DiscoverDesktopHost();
-    if(!host.listview)return;
-    POINT nativePoint{point.x+virtualLeft,point.y+virtualTop};
-    ScreenToClient(host.listview,&nativePoint);
-    std::thread([path,nativePoint]() mutable {
-        CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
-        {
-        ComPtr<IFolderView2> view;
-        if(View(view)) {
-            ComPtr<IShellFolder> folder;view->GetFolder(IID_PPV_ARGS(&folder));
-            ComPtr<IEnumIDList> items;view->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items));
-            PITEMID_CHILD item=nullptr;
-            while(items && items->Next(1,&item,nullptr)==S_OK) {
-                STRRET parsed{};wchar_t name[32768]{};
-                folder->GetDisplayNameOf(item,SHGDN_FORPARSING,&parsed);StrRetToBufW(&parsed,item,name,32768);
-                bool match=_wcsicmp(name,path.c_str())==0;
-                if(match){PCUITEMID_CHILD array[]={item};view->SelectAndPositionItems(1,array,&nativePoint,SVSI_POSITIONITEM);}
-                CoTaskMemFree(item);if(match)break;
-            }
-        }
-        }
-        CoUninitialize();
-    }).detach();
-}
-int DesktopRecovery(const wchar_t* arguments) {
-    DWORD owner=0,explorer=0;unsigned long long raw=0;
-    if(swscanf_s(arguments,L"--restore-desktop %lu %llu %lu",&owner,&raw,&explorer)!=3)return 2;
+int DesktopRecovery(const wchar_t* args) {
+    DWORD owner=0,pid=0;unsigned long long raw=0;
+    if(swscanf_s(args,L"--restore-desktop %lu %llu %lu",&owner,&raw,&pid)!=3)return 2;
     HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,owner);if(!process)return 3;
     std::wstring name=L"Local\\nestlone-recovery-ready-"+std::to_wstring(owner);
     HANDLE ready=OpenEventW(EVENT_MODIFY_STATE,FALSE,name.c_str());if(ready){SetEvent(ready);CloseHandle(ready);}
     WaitForSingleObject(process,INFINITE);CloseHandle(process);
-    HWND hwnd=reinterpret_cast<HWND>(static_cast<ULONG_PTR>(raw));
-    if(Valid(hwnd,explorer) && GetPropW(hwnd,lease)==reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(owner))) {
-        SetWindowRgn(hwnd,nullptr,TRUE);RemovePropW(hwnd,lease);
-    }
+    HWND hwnd=reinterpret_cast<HWND>(static_cast<ULONG_PTR>(raw));DWORD actual=0;GetWindowThreadProcessId(hwnd,&actual);
+    if(actual==pid)RestoreLegacyMask(hwnd);
     return 0;
 }
 }
