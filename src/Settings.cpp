@@ -4,6 +4,7 @@
 #include "Theme.h"
 #include <commctrl.h>
 #include <vector>
+#include <filesystem>
 
 namespace nestlone {
 namespace {
@@ -14,6 +15,11 @@ constexpr int kBoxSelect = 2100;
 constexpr int kColorBase = 2110;
 constexpr int kSidebarTheme = 2201;
 constexpr int kSidebarAuto = 2202;
+constexpr int kSidebarBackup = 2203;
+constexpr int kBackupList = 2401;
+constexpr int kBackupCreate = 2402;
+constexpr int kBackupApply = 2403;
+constexpr int kBackupDelete = 2404;
 constexpr int kAutoEnable = 2301;
 constexpr int kAutoFolders = 2302;
 constexpr int kAutoExtensions = 2303;
@@ -29,12 +35,17 @@ HWND g_boxSelect = nullptr;
 HWND g_autoBox = nullptr;
 HWND g_autoExtensions = nullptr;
 HWND g_autoRules = nullptr;
+HWND g_backupList = nullptr;
 Layout* g_layout = nullptr;
-std::vector<HWND> g_themePage,g_autoPage;
-void SelectPage(bool automatic) {
-    for(HWND control:g_themePage)ShowWindow(control,automatic?SW_HIDE:SW_SHOW);
-    for(HWND control:g_autoPage)ShowWindow(control,automatic?SW_SHOW:SW_HIDE);
+std::vector<HWND> g_themePage,g_autoPage,g_backupPage;
+void SelectPage(int page) {
+    for(HWND control:g_themePage)ShowWindow(control,page==0?SW_SHOW:SW_HIDE);
+    for(HWND control:g_autoPage)ShowWindow(control,page==1?SW_SHOW:SW_HIDE);
+    for(HWND control:g_backupPage)ShowWindow(control,page==2?SW_SHOW:SW_HIDE);
 }
+std::filesystem::path BackupDirectory(){auto path=std::filesystem::path(LayoutPath()).parent_path()/L"backups";std::error_code error;std::filesystem::create_directories(path,error);return path;}
+std::wstring BackupStamp(){SYSTEMTIME t{};GetLocalTime(&t);wchar_t value[32]{};swprintf_s(value,L"%04u%02u%02u%02u%02u%02u",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond);return value;}
+void RefreshBackups(){if(!g_backupList)return;SendMessageW(g_backupList,LB_RESETCONTENT,0,0);std::error_code error;for(const auto& entry:std::filesystem::directory_iterator(BackupDirectory(),error))if(entry.is_regular_file()&&entry.path().extension()==L".backup")SendMessageW(g_backupList,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(entry.path().filename().c_str()));}
 void AddAutoRuleRow(const Layout::AutoRule& rule) {
     if(!g_autoRules||!g_layout)return;
     std::wstring title=L"规则";for(const auto& box:g_layout->boxes)if(box.id==rule.boxId){title=box.title;break;}
@@ -67,6 +78,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         SendMessageW(theme, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         HWND automatic = CreateWindowW(L"BUTTON", L"自动分类", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 12, 100, 116, 34, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarAuto)), nullptr, nullptr);
         SendMessageW(automatic, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        HWND backup=CreateWindowW(L"BUTTON",L"备份与还原",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,12,140,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarBackup)),nullptr,nullptr);SendMessageW(backup,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND title = CreateWindowW(L"STATIC", L"主题设置", WS_CHILD | WS_VISIBLE, 170, 20, 250, 28, hwnd, nullptr, nullptr, nullptr);
         g_themePage.push_back(title);
         SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -125,7 +137,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         for(const Box& box:g_layout->boxes)SendMessageW(g_autoBox,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(box.title.c_str()));
         if(!g_layout->boxes.empty())SendMessageW(g_autoBox,CB_SETCURSEL,0,0);SendMessageW(g_autoBox,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND add=CreateWindowW(L"BUTTON",L"添加规则",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,370,124,90,26,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAutoAdd)),nullptr,nullptr);SendMessageW(add,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
-        g_autoPage.push_back(add);SelectPage(false);
+        g_autoPage.push_back(add);SelectPage(0);
         const wchar_t* defaults[]={L"目录",L"文档",L"图片",L"压缩包"};
         for(int i=0;i<4;++i){HWND preset=CreateWindowW(L"BUTTON",defaults[i],WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,170+(i%2)*100,160+(i/2)*26,92,22,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultBoxBase+i)),nullptr,nullptr);SendMessageW(preset,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_autoPage.push_back(preset);}
         HWND ruleLabel=CreateWindowW(L"STATIC",L"自定义规则",WS_CHILD|WS_VISIBLE,170,218,150,24,hwnd,nullptr,nullptr,nullptr);SendMessageW(ruleLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_autoPage.push_back(ruleLabel);
@@ -134,6 +146,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         const wchar_t* headers[]={L"标题",L"文件名",L"后缀",L"盒子"};const int widths[]={68,54,104,60};
         for(int i=0;i<4;++i){LVCOLUMNW column{};column.mask=LVCF_TEXT|LVCF_WIDTH;column.cx=widths[i];column.pszText=const_cast<wchar_t*>(headers[i]);ListView_InsertColumn(g_autoRules,i,&column);}
         for(const auto& rule:g_layout->autoRules)AddAutoRuleRow(rule);g_autoPage.push_back(g_autoRules);
+        HWND backupTitle=CreateWindowW(L"STATIC",L"桌面布局备份",WS_CHILD|WS_VISIBLE,170,20,180,24,hwnd,nullptr,nullptr,nullptr);SendMessageW(backupTitle,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(backupTitle);
+        HWND backupHint=CreateWindowW(L"STATIC",L"每份备份保存当前盒子、分组、规则与桌面位置。",WS_CHILD|WS_VISIBLE,170,52,290,22,hwnd,nullptr,nullptr,nullptr);SendMessageW(backupHint,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(backupHint);
+        g_backupList=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|LBS_NOTIFY|WS_VSCROLL,170,84,290,270,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBackupList)),nullptr,nullptr);SendMessageW(g_backupList,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(g_backupList);RefreshBackups();
+        const int backupIds[]={kBackupCreate,kBackupApply,kBackupDelete};const wchar_t* backupLabels[]={L"立即备份",L"应用备份",L"删除备份"};for(int i=0;i<3;++i){HWND action=CreateWindowW(L"BUTTON",backupLabels[i],WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170+i*98,370,90,28,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(backupIds[i])),nullptr,nullptr);SendMessageW(action,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(action);}
         return 0;
     }
     case WM_CTLCOLORSTATIC:
@@ -151,7 +167,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     case WM_DRAWITEM: {
         const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
-        if (draw && (draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kAutoAdd || draw->CtlID == IDCANCEL)) {
+        if (draw && (draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kSidebarBackup || draw->CtlID == kAutoAdd || (draw->CtlID>=kBackupCreate&&draw->CtlID<=kBackupDelete) || draw->CtlID == IDCANCEL)) {
             HBRUSH brush=CreateSolidBrush(RGB(217,242,245));
             HPEN pen=CreatePen(PS_SOLID,1,RGB(190,224,230));
             auto ob=SelectObject(draw->hDC,brush); auto op=SelectObject(draw->hDC,pen);
@@ -161,7 +177,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             DeleteObject(brush); DeleteObject(pen);
             auto of=SelectObject(draw->hDC,g_font);
             SetBkMode(draw->hDC,TRANSPARENT); SetTextColor(draw->hDC,theme::title);
-            const wchar_t* caption=draw->CtlID==IDCANCEL?L"完成":draw->CtlID==kSidebarAuto?L"自动分类":draw->CtlID==kAutoAdd?L"添加规则":L"主题设置";
+            const wchar_t* caption=draw->CtlID==IDCANCEL?L"完成":draw->CtlID==kSidebarAuto?L"自动分类":draw->CtlID==kSidebarBackup?L"备份与还原":draw->CtlID==kAutoAdd?L"添加规则":draw->CtlID==kBackupCreate?L"立即备份":draw->CtlID==kBackupApply?L"应用备份":draw->CtlID==kBackupDelete?L"删除备份":L"主题设置";
             RECT label=r; DrawTextW(draw->hDC,caption,-1,&label,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             if(draw->itemState & ODS_FOCUS) { InflateRect(&label,-3,-3); DrawFocusRect(draw->hDC,&label); }
             SelectObject(draw->hDC,of);
@@ -177,8 +193,11 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         return FALSE;
     }
     case WM_COMMAND:
-        if(LOWORD(wParam)==kSidebarTheme){SelectPage(false);return 0;}
-        if(LOWORD(wParam)==kSidebarAuto){SelectPage(true);return 0;}
+        if(LOWORD(wParam)==kSidebarTheme){SelectPage(0);return 0;}
+        if(LOWORD(wParam)==kSidebarAuto){SelectPage(1);return 0;}
+        if(LOWORD(wParam)==kSidebarBackup){SelectPage(2);return 0;}
+        if(LOWORD(wParam)==kBackupCreate&&g_layout){SaveLayout(*g_layout);auto target=BackupDirectory()/(BackupStamp()+L".backup");CopyFileW(LayoutPath().c_str(),target.c_str(),FALSE);RefreshBackups();return 0;}
+        if((LOWORD(wParam)==kBackupApply||LOWORD(wParam)==kBackupDelete)&&g_backupList){int index=static_cast<int>(SendMessageW(g_backupList,LB_GETCURSEL,0,0));if(index!=LB_ERR){wchar_t name[MAX_PATH]{};SendMessageW(g_backupList,LB_GETTEXT,index,reinterpret_cast<LPARAM>(name));auto path=BackupDirectory()/name;if(LOWORD(wParam)==kBackupApply){if(CopyFileW(path.c_str(),LayoutPath().c_str(),FALSE))HandleCanvasCommand(CanvasCommand::Reload);}else{DeleteFileW(path.c_str());RefreshBackups();}}return 0;}
         if(LOWORD(wParam)==kAutoEnable&&g_layout){g_layout->autoOrganize=SendMessageW(reinterpret_cast<HWND>(lParam),BM_GETCHECK,0,0)==BST_CHECKED;SaveLayout(*g_layout);return 0;}
         if(LOWORD(wParam)==kAutoAdd&&g_layout&&g_autoBox&&g_autoExtensions){int index=static_cast<int>(SendMessageW(g_autoBox,CB_GETCURSEL,0,0));if(index>=0&&index<static_cast<int>(g_layout->boxes.size())){wchar_t extensions[512]{};GetWindowTextW(g_autoExtensions,extensions,512);HWND folders=GetDlgItem(hwnd,kAutoFolders);g_layout->autoRules.push_back({g_layout->boxes[index].id,SendMessageW(folders,BM_GETCHECK,0,0)==BST_CHECKED,extensions});AddAutoRuleRow(g_layout->autoRules.back());SaveLayout(*g_layout);}return 0;}
         if(LOWORD(wParam)>=kDefaultBoxBase&&LOWORD(wParam)<kDefaultBoxBase+4&&g_layout){int choice=LOWORD(wParam)-kDefaultBoxBase;if(SendMessageW(reinterpret_cast<HWND>(lParam),BM_GETCHECK,0,0)==BST_CHECKED){const wchar_t* titles[]={L"目录",L"文档",L"图片",L"压缩包"};const wchar_t* suffixes[]={L"",L".doc;.docx;.pdf;.txt;.xls;.xlsx;.ppt;.pptx",L".png;.jpg;.jpeg;.gif;.bmp;.webp",L".zip;.rar;.7z;.tar;.gz"};auto found=std::find_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const Box& box){return box.title==titles[choice];});if(found==g_layout->boxes.end()){Box box;box.id=std::to_wstring(GetTickCount64())+L"-preset";box.title=titles[choice];box.rect={120+choice*35,120+choice*35,460+choice*35,420+choice*35};g_layout->boxes.push_back(std::move(box));found=std::prev(g_layout->boxes.end());}g_layout->autoRules.push_back({found->id,choice==0,suffixes[choice]});for(const auto& item:EnumerateDesktopItems())if((choice==0&&item.directory)||(choice>0&&!item.directory&&wcsstr(suffixes[choice],item.type.c_str())))AddItem(*found,item.path);SaveLayout(*g_layout);HandleCanvasCommand(CanvasCommand::Reload);}return 0;}
@@ -195,7 +214,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hwnd);
         return 0;
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_value = nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_themePage.clear();g_autoPage.clear();g_layout = nullptr; return 0;
+    case WM_DESTROY: if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_value = nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_backupList=nullptr;g_themePage.clear();g_autoPage.clear();g_backupPage.clear();g_layout = nullptr; return 0;
     default: return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }
