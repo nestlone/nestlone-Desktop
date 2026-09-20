@@ -7,6 +7,8 @@ namespace nestlone {
 struct Box {
     std::wstring id;
     std::wstring title;
+    // Only used by a group root.  `title` remains the root tab's title.
+    std::wstring groupTitle;
     RECT rect{80, 80, 380, 300};
     COLORREF color{RGB(184, 235, 238)};
     bool collapsed{false};

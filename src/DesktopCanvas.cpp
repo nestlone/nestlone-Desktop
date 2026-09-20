@@ -23,6 +23,11 @@ HWND g_manager=nullptr,g_background=nullptr,g_edit=nullptr;
 HINSTANCE g_instance=nullptr;
 ULONG_PTR g_token=0;
 bool g_visible=true,g_drag=false,g_resizing=false,g_tabPending=false,g_tabDetached=false,g_nativeHidden=false;
+bool g_interactivePaintQueued=false;
+bool g_visualGeometryDirty=false;
+HWND g_dragPreview=nullptr;
+std::wstring g_previewGroup,g_renderOnlyGroup;
+void EndDragPreview();
 HWND g_hiddenListview=nullptr;
 db::HostInfo g_host;
 DesktopSnapshot g_snapshot;
@@ -31,6 +36,7 @@ std::vector<DesktopMove> g_moves,g_dragStart;
 POINT g_mouseStart{};
 RECT g_boxStart{};
 std::wstring g_dragId,g_editId,g_status;
+bool g_editGroupTitle=false;
 std::vector<std::pair<std::wstring,RECT>> g_boxDragStart;
 HFONT g_editFont=nullptr;
 struct Decoration {std::wstring id;HWND header=nullptr,grip=nullptr;};
@@ -87,6 +93,35 @@ std::vector<Box*> GroupTabs(Box& root) {
     for(auto& box:g_layout->boxes)if(box.groupId==root.id)tabs.push_back(&box);
     return tabs;
 }
+bool HasGroupTabs(const Box& root) {
+    return g_layout&&std::any_of(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const Box& box){return box.groupId==root.id;});
+}
+void DetachTab(Box& tab) {
+    Box* root=GroupRoot(tab);
+    auto members=GroupTabs(*root);
+    if(root==&tab&&members.size()>1) {
+        Box* successor=members[1];
+        const auto active=root->activeTabId;
+        successor->groupId.clear();successor->groupTitle=root->groupTitle.empty()?root->title:root->groupTitle;
+        successor->collapsed=root->collapsed;
+        successor->activeTabId=(active.empty()||active==tab.id)?successor->id:active;
+        for(size_t i=2;i<members.size();++i)members[i]->groupId=successor->id;
+    } else if(root!=&tab&&root->activeTabId==tab.id)root->activeTabId.clear();
+    tab.groupId.clear();tab.activeTabId.clear();tab.collapsed=false;
+}
+int BoxHeaderHeight(const Box& box) {
+    const Box* root=GroupRoot(box);
+    return HeaderHeight()*(HasGroupTabs(*root)?2:1);
+}
+const std::wstring& GroupTitle(const Box& root) {
+    return root.groupTitle.empty()?root.title:root.groupTitle;
+}
+void SyncGroupRect(Box& box) {
+    Box* root=GroupRoot(box);
+    if(!HasGroupTabs(*root))return;
+    const RECT rect=box.rect;
+    for(auto& candidate:g_layout->boxes)if(GroupRoot(candidate)==root)candidate.rect=rect;
+}
 bool HasPath(const Box& box,const std::wstring& path) {
     return std::any_of(box.items.begin(),box.items.end(),[&](const auto& p){return _wcsicmp(p.c_str(),path.c_str())==0;});
 }
@@ -132,11 +167,11 @@ std::vector<std::pair<std::wstring,POINT>> SnapDesktopDrop(const std::vector<std
     }
     return result;
 }
-RECT DisplayRect(const Box& box) {RECT r=box.rect;if(box.collapsed)r.bottom=r.top+HeaderHeight();return r;}
+RECT DisplayRect(const Box& box) {RECT r=box.rect;if(box.collapsed)r.bottom=r.top+BoxHeaderHeight(box);return r;}
 int ContainingBox(const DesktopEntry& entry) {
     POINT center{entry.position.x+g_snapshot.iconSize/2,entry.position.y+g_snapshot.iconSize/2};
     for(int i=static_cast<int>(g_layout->boxes.size())-1;i>=0;--i) {
-        auto& b=g_layout->boxes[i];RECT r=b.rect;r.top+=HeaderHeight();
+        auto& b=g_layout->boxes[i];RECT r=b.rect;r.top+=BoxHeaderHeight(b);
         if(!b.collapsed && PtInRect(&r,center))return i;
     }
     return -1;
@@ -153,11 +188,25 @@ void Rounded(Gdiplus::Graphics& g,const RECT& r,Gdiplus::Color color) {
 Gdiplus::Color Background(COLORREF color,int opacity) {
     return Gdiplus::Color(static_cast<BYTE>(std::clamp(opacity,20,100)*255/100),GetRValue(color),GetGValue(color),GetBValue(color));
 }
+struct PaintBuffer {
+    HDC dc=nullptr;HBITMAP bitmap=nullptr;HGDIOBJ previous=nullptr;
+    void* pixels=nullptr;int width=0,height=0;std::wstring decorationKey;
+    ~PaintBuffer(){Reset();}
+    void Reset(){if(dc&&previous)SelectObject(dc,previous);if(bitmap)DeleteObject(bitmap);if(dc)DeleteDC(dc);dc=nullptr;bitmap=nullptr;previous=nullptr;pixels=nullptr;width=height=0;decorationKey.clear();}
+    bool Ensure(int w,int h){
+        if(bitmap&&width==w&&height==h)return true;
+        Reset();dc=CreateCompatibleDC(nullptr);if(!dc)return false;
+        BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=w;info.bmiHeader.biHeight=-h;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
+        bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
+        if(!bitmap){Reset();return false;}previous=SelectObject(dc,bitmap);width=w;height=h;return true;
+    }
+};
+std::unordered_map<HWND,std::unique_ptr<PaintBuffer>> g_paintBuffers;
 // Background rendering intentionally knows nothing about desktop items.
 bool RenderPixels(void* pixels,int width,int height,const Layout& layout) {
     Gdiplus::Bitmap bitmap(width,height,width*4,PixelFormat32bppPARGB,static_cast<BYTE*>(pixels));
     Gdiplus::Graphics g(&bitmap);g.Clear(Gdiplus::Color(0,0,0,0));g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    for(const auto& box:layout.boxes)if(IsGroupRoot(box))Rounded(g,DisplayRect(box),Background(box.color,layout.opacity));
+    for(const auto& box:layout.boxes)if(IsGroupRoot(box)&&(g_previewGroup.empty()||box.id!=g_previewGroup))Rounded(g,DisplayRect(box),Background(box.color,layout.opacity));
     g.Flush();return g.GetLastStatus()==Gdiplus::Ok;
 }
 void Label(Gdiplus::Graphics& g,const std::wstring& value,RECT r) {
@@ -172,12 +221,16 @@ void Label(Gdiplus::Graphics& g,const std::wstring& value,RECT r) {
 }
 bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false) {
     RECT r{};if(!GetClientRect(hwnd,&r)||r.right<=0||r.bottom<=0)return false;
-    HDC screen=GetDC(nullptr),dc=CreateCompatibleDC(screen);BITMAPINFO info{};
-    info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=r.right;info.bmiHeader.biHeight=-r.bottom;
-    info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;void* pixels=nullptr;
-    HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
-    if(!bitmap){DeleteDC(dc);ReleaseDC(nullptr,screen);return false;}
-    auto old=SelectObject(dc,bitmap);
+    auto& stored=g_paintBuffers[hwnd];if(!stored)stored=std::make_unique<PaintBuffer>();
+    auto& buffer=*stored;if(!buffer.Ensure(r.right,r.bottom))return false;
+    void* pixels=buffer.pixels;HDC dc=buffer.dc;
+    std::wstring key;
+    if(box){
+        key=std::to_wstring(g_layout->opacity)+L":"+std::to_wstring(box->selected)+L":"+std::to_wstring(box->collapsed)+L":"+std::to_wstring(grip)+L":"+std::to_wstring(HeaderHeight());
+        for(auto* tab:GroupTabs(*box))key+=L"|"+std::to_wstring(tab->title.size())+L":"+tab->title+L":"+std::to_wstring(IsActiveTab(*tab));
+        key+=L"|"+GroupTitle(*box);
+        if(buffer.decorationKey==key)return true;
+    }
     if(!box) {
         RenderPixels(pixels,r.right,r.bottom,*g_layout);
         Gdiplus::Bitmap surface(r.right,r.bottom,r.right*4,PixelFormat32bppPARGB,static_cast<BYTE*>(pixels));
@@ -187,18 +240,23 @@ bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false) {
     else {
         Gdiplus::Bitmap surface(r.right,r.bottom,r.right*4,PixelFormat32bppPARGB,static_cast<BYTE*>(pixels));
         Gdiplus::Graphics g(&surface);g.Clear(Gdiplus::Color(0,0,0,0));g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        Rounded(g,r,Background(box->color,g_layout->opacity));
+        // The canvas already paints the box background below this window.
+        // A second opaque colour layer would make the header much darker.
+        Rounded(g,r,Gdiplus::Color(7,255,255,255));
         if(box->selected) { Gdiplus::Pen outline(Gdiplus::Color(230,255,255,255),2.0f);g.DrawRectangle(&outline,1,1,r.right-3,r.bottom-3); }
         if(grip)Label(g,L"◢",r);
         else {
-            const int h=HeaderHeight();
+            const int h=HeaderHeight(),headerHeight=BoxHeaderHeight(*box);
             auto tabs=GroupTabs(*box);const int contentRight=r.right-3*h;
             if(tabs.size()==1) Label(g,box->title,{h,0,contentRight,h});
-            else for(size_t i=0;i<tabs.size();++i) {
-                const int left=static_cast<int>(i*contentRight/tabs.size());
-                const int right=static_cast<int>((i+1)*contentRight/tabs.size());
-                Label(g,tabs[i]->title,{left,0,right,h});
-                if(IsActiveTab(*tabs[i])) {Gdiplus::Pen line(Gdiplus::Color(220,255,255,255),1.0f);g.DrawLine(&line,left+8,h-3,right-8,h-3);}
+            else {
+                Label(g,GroupTitle(*box),{h,0,contentRight,h});
+                for(size_t i=0;i<tabs.size();++i) {
+                    const int left=static_cast<int>(i*r.right/tabs.size());
+                    const int right=static_cast<int>((i+1)*r.right/tabs.size());
+                    Label(g,tabs[i]->title,{left,h,right,headerHeight});
+                    if(IsActiveTab(*tabs[i])) {Gdiplus::Pen line(Gdiplus::Color(220,255,255,255),1.0f);g.DrawLine(&line,left+8,headerHeight-3,right-8,headerHeight-3);}
+                }
             }
             Label(g,L"▦",{r.right-3*h,0,r.right-2*h,h});
             Label(g,box->collapsed?L"+":L"−",{r.right-2*h,0,r.right-h,h});
@@ -207,19 +265,48 @@ bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false) {
         g.Flush();
     }
     POINT source{};SIZE size{r.right,r.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
-    bool ok=UpdateLayeredWindow(hwnd,screen,nullptr,&size,dc,&source,0,&blend,ULW_ALPHA)!=FALSE;
-    SelectObject(dc,old);DeleteObject(bitmap);DeleteDC(dc);ReleaseDC(nullptr,screen);return ok;
+    bool ok=UpdateLayeredWindow(hwnd,nullptr,nullptr,&size,dc,&source,0,&blend,ULW_ALPHA)!=FALSE;
+    if(ok&&box)buffer.decorationKey=key;
+    return ok;
 }
 POINT ParentPoint(POINT point) {
     point.x+=GetSystemMetrics(SM_XVIRTUALSCREEN);point.y+=GetSystemMetrics(SM_YVIRTUALSCREEN);
     ScreenToClient(g_host.defviewParent,&point);return point;
 }
+RECT ConstrainBoxToWorkArea(RECT rect,RECT work,int headerHeight) {
+    const LONG width=rect.right-rect.left,height=rect.bottom-rect.top;
+    // Only constrain the title strip. The content may extend below the work
+    // area, even when the whole box would fit at another position.
+    const LONG x=std::clamp(rect.left,work.left,max(work.left,work.right-width));
+    const LONG y=std::clamp(rect.top,work.top,max(work.top,work.bottom-min(height,static_cast<LONG>(headerHeight))));
+    OffsetRect(&rect,x-rect.left,y-rect.top);return rect;
+}
+RECT KeepBoxOnScreen(RECT rect,int headerHeight) {
+    const LONG vx=GetSystemMetrics(SM_XVIRTUALSCREEN),vy=GetSystemMetrics(SM_YVIRTUALSCREEN);
+    RECT screenRect=rect;screenRect.bottom=min(screenRect.bottom,screenRect.top+headerHeight);OffsetRect(&screenRect,vx,vy);
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    if(!GetMonitorInfoW(MonitorFromRect(&screenRect,MONITOR_DEFAULTTONEAREST),&monitor))return rect;
+    RECT work=monitor.rcWork;OffsetRect(&work,-vx,-vy);
+    return ConstrainBoxToWorkArea(rect,work,headerHeight);
+}
+void RecoverBoxPositions() {
+    for(auto& box:g_layout->boxes)if(IsGroupRoot(box)) {
+        box.rect=KeepBoxOnScreen(box.rect,BoxHeaderHeight(box));SyncGroupRect(box);
+    }
+}
+void RefreshVisualGeometry();
 void PaintAll() {
     if(!g_layout)return;
     if(g_visualDirty){RebuildVisualIcons();g_visualDirty=false;}
-    if(g_background)PaintWindow(g_background);
+    else if(g_visualGeometryDirty) {
+        RefreshVisualGeometry();g_visualGeometryDirty=false;
+        // Refresh can discover a newly collapsed/inactive owner and request a
+        // complete visual rebuild instead of leaving stale icons on screen.
+        if(g_visualDirty){RebuildVisualIcons();g_visualDirty=false;}
+    }
+    if(g_background&&!g_dragPreview)PaintWindow(g_background);
     for(auto& d:g_decorations)if(auto* box=FindBox(d->id)) {
-        POINT top=ParentPoint({box->rect.left,box->rect.top});int h=HeaderHeight();
+        POINT top=ParentPoint({box->rect.left,box->rect.top});int h=BoxHeaderHeight(*box);
         SetWindowPos(d->header,HWND_TOP,top.x,top.y,box->rect.right-box->rect.left,h,SWP_NOACTIVATE);
         PaintWindow(d->header,box);
         POINT corner=ParentPoint({box->rect.right-18,box->rect.bottom-18});
@@ -228,6 +315,18 @@ void PaintAll() {
         ShowWindow(d->header,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);
         ShowWindow(d->grip,g_visible&&!box->collapsed?SW_SHOWNOACTIVATE:SW_HIDE);
     }
+}
+// Mouse messages can arrive much faster than the compositor can redraw the
+// full layered desktop.  Keep only the latest geometry and present it at a
+// display-friendly cadence; mouse-up always flushes immediately.
+constexpr UINT_PTR kInteractivePaintTimer=2;
+void QueueInteractivePaint() {
+    if(!g_manager||g_interactivePaintQueued)return;
+    g_interactivePaintQueued=true;SetTimer(g_manager,kInteractivePaintTimer,16,nullptr);
+}
+void FlushInteractivePaint() {
+    if(g_interactivePaintQueued&&g_manager)KillTimer(g_manager,kInteractivePaintTimer);
+    g_interactivePaintQueued=false;PaintAll();
 }
 void QueueMoves(const std::vector<DesktopMove>& moves) {
     for(const auto& move:moves) {
@@ -257,7 +356,7 @@ RECT FitGrid(const Box& box,const DesktopSnapshot& snapshot) {
     RECT r=box.rect;
     if(!box.iconView){
         const LONG rowHeight=max(30,HeaderHeight());
-        r.bottom=max(r.bottom,r.top+HeaderHeight()+16+static_cast<LONG>(box.items.size())*rowHeight);
+        r.bottom=max(r.bottom,r.top+BoxHeaderHeight(box)+16+static_cast<LONG>(box.items.size())*rowHeight);
         return r;
     }
     const LONG sy=BoxGridCellHeight(snapshot);
@@ -266,7 +365,7 @@ RECT FitGrid(const Box& box,const DesktopSnapshot& snapshot) {
     const LONG columns=BoxGridColumns(fitted,snapshot);
     LONG count=0;for(const auto& path:box.items)if(FindEntry(snapshot,path))++count;
     const LONG rows=max(1L,(count+columns-1)/columns);
-    r.bottom=max(r.bottom,r.top+HeaderHeight()+12+rows*sy+24);
+    r.bottom=max(r.bottom,r.top+BoxHeaderHeight(box)+12+rows*sy+24);
     return r;
 }
 std::vector<DesktopMove> GridMoves(const Box& box,const DesktopSnapshot& snapshot) {
@@ -276,7 +375,7 @@ std::vector<DesktopMove> GridMoves(const Box& box,const DesktopSnapshot& snapsho
     std::vector<DesktopMove> moves;int slot=0;
     for(const auto& path:box.items)if(FindEntry(snapshot,path)) {
         LONG x=left+(slot%columns)*sx;
-        LONG y=box.rect.top+HeaderHeight()+12+(slot/columns)*sy;
+        LONG y=box.rect.top+BoxHeaderHeight(box)+12+(slot/columns)*sy;
         moves.push_back({path,{x+max(0L,(sx-snapshot.iconSize)/2),y}});++slot;
     }
     return moves;
@@ -327,7 +426,7 @@ std::shared_ptr<Gdiplus::Bitmap> DecodeIconWithMasks(HICON icon) {
     SelectObject(maskDc,oldMask);DeleteDC(maskDc);ReleaseDC(nullptr,screen);DeleteObject(info.hbmColor);DeleteObject(info.hbmMask);
     return locked?result:std::shared_ptr<Gdiplus::Bitmap>();
 }
-std::shared_ptr<Gdiplus::Bitmap> LoadIconImage(const std::wstring& path,int size) {
+std::shared_ptr<Gdiplus::Bitmap> DecodeIconImage(const std::wstring& path,int size) {
     SHFILEINFOW info{};
     if(!SHGetFileInfoW(path.c_str(),0,&info,sizeof(info),SHGFI_ICON|SHGFI_LARGEICON)||!info.hIcon)return {};
     HICON icon=info.hIcon;
@@ -346,15 +445,23 @@ std::shared_ptr<Gdiplus::Bitmap> LoadIconImage(const std::wstring& path,int size
     graphics.DrawImage(decoded.get(),0,0,size,size);
     return graphics.GetLastStatus()==Gdiplus::Ok?result:std::shared_ptr<Gdiplus::Bitmap>();
 }
+std::unordered_map<std::wstring,std::shared_ptr<Gdiplus::Bitmap>> g_iconCache;
+std::shared_ptr<Gdiplus::Bitmap> LoadIconImage(const std::wstring& path,int size) {
+    const auto key=std::to_wstring(size)+L":"+path;
+    auto found=g_iconCache.find(key);if(found!=g_iconCache.end())return found->second;
+    auto image=DecodeIconImage(path,size);
+    if(image){if(g_iconCache.size()>=1024)g_iconCache.clear();g_iconCache.emplace(key,image);}
+    return image;
+}
 int BoxRowHeight(const Box& box) { return max(30,HeaderHeight())+(box.iconView?0:0); }
 RECT BoxItemRect(const Box& box,int slot) {
-    const int h=HeaderHeight();
+    const int h=BoxHeaderHeight(box);
     if(!box.iconView){int rowHeight=BoxRowHeight(box);return {box.rect.left+8,box.rect.top+h+8+slot*rowHeight,box.rect.right-8,box.rect.top+h+8+(slot+1)*rowHeight};}
     const LONG sx=BoxGridCellWidth(box,g_snapshot),sy=BoxGridCellHeight(g_snapshot),columns=BoxGridColumns(box,g_snapshot),left=BoxGridLeft(box);
     return {left+(slot%columns)*sx,box.rect.top+h+12+(slot/columns)*sy,left+(slot%columns)*sx+sx,box.rect.top+h+12+(slot/columns)*sy+sy};
 }
 int BoxSlot(const Box& box,POINT point) {
-    const int h=HeaderHeight();
+    const int h=BoxHeaderHeight(box);
     if(!box.iconView)return max(0,(point.y-box.rect.top-h-8)/BoxRowHeight(box));
     const LONG sx=BoxGridCellWidth(box,g_snapshot),sy=BoxGridCellHeight(g_snapshot),columns=BoxGridColumns(box,g_snapshot),left=BoxGridLeft(box);
     LONG column=(point.x-left)/sx,row=(point.y-box.rect.top-h-12)/sy;return max(0L,row*columns+column);
@@ -418,11 +525,18 @@ void RefreshVisualGeometry() {
         SetVisualGeometry(visual,owner,slot);
     }
 }
+bool RenderIconInCurrentPass(const VisualIcon& icon) {
+    if(g_previewGroup.empty()&&g_renderOnlyGroup.empty())return true;
+    std::wstring owner;
+    for(const auto& box:g_layout->boxes)if(HasPath(box,icon.path)){owner=GroupRoot(box)->id;break;}
+    return g_renderOnlyGroup.empty()?owner!=g_previewGroup:owner==g_renderOnlyGroup;
+}
 void DrawVisualIcons(Gdiplus::Graphics& g) {
     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
     g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
     Gdiplus::FontFamily family(L"Microsoft YaHei UI");
     for(auto& item:g_visualIcons) {
+        if(!RenderIconInCurrentPass(item))continue;
         if(item.selected){Gdiplus::SolidBrush selected(Gdiplus::Color(72,55,133,190));Gdiplus::RectF r(static_cast<float>(item.hit.left),static_cast<float>(item.hit.top),static_cast<float>(item.hit.right-item.hit.left),static_cast<float>(item.hit.bottom-item.hit.top));g.FillRectangle(&selected,r);}
         if(item.image)g.DrawImage(item.image.get(),item.position.x,item.position.y,item.size,item.size);
         Gdiplus::StringFormat format;format.SetAlignment(item.list?Gdiplus::StringAlignmentNear:Gdiplus::StringAlignmentCenter);format.SetLineAlignment(item.list?Gdiplus::StringAlignmentCenter:Gdiplus::StringAlignmentNear);format.SetTrimming(Gdiplus::StringTrimmingEllipsisWord);if(item.list)format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);else format.SetFormatFlags(Gdiplus::StringFormatFlagsLineLimit);
@@ -432,7 +546,7 @@ void DrawVisualIcons(Gdiplus::Graphics& g) {
     // widening the grid. This mirrors the desktop's focus-only title affordance.
     if(g_focusIcon>=0&&g_focusIcon<static_cast<int>(g_visualIcons.size())) {
         const auto& item=g_visualIcons[g_focusIcon];
-        if(item.selected&&!item.list) {
+        if(item.selected&&!item.list&&RenderIconInCurrentPass(item)) {
             const int dpi=static_cast<int>(g_host.listview?GetDpiForWindow(g_host.listview):96);
             Gdiplus::Font font(&family,static_cast<Gdiplus::REAL>(MulDiv(12,dpi,96)),Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);
             Gdiplus::StringFormat format;format.SetAlignment(Gdiplus::StringAlignmentCenter);format.SetLineAlignment(Gdiplus::StringAlignmentNear);
@@ -446,6 +560,47 @@ void DrawVisualIcons(Gdiplus::Graphics& g) {
         }
     }
     if(g_marquee&&g_marqueeMoved){Gdiplus::SolidBrush fill(Gdiplus::Color(45,80,160,230));Gdiplus::Pen edge(Gdiplus::Color(190,130,190,255),1.0f);Gdiplus::RectF r(static_cast<float>(g_marqueeRect.left),static_cast<float>(g_marqueeRect.top),static_cast<float>(g_marqueeRect.right-g_marqueeRect.left),static_cast<float>(g_marqueeRect.bottom-g_marqueeRect.top));g.FillRectangle(&fill,r);g.DrawRectangle(&edge,r);}
+}
+void EndDragPreview() {
+    HWND preview=g_dragPreview;g_dragPreview=nullptr;g_previewGroup.clear();g_renderOnlyGroup.clear();
+    if(preview)DestroyWindow(preview);
+}
+bool BeginDragPreview(Box& box) {
+    if(g_dragPreview)return true;
+    if(!g_nativeHidden||g_resizing)return false;
+    // Multiple separately selected groups continue to use the normal path.
+    for(const auto& start:g_boxDragStart)if(auto* member=FindBox(start.first))if(GroupRoot(*member)!=&box)return false;
+    PaintAll();
+    RECT bounds=DisplayRect(box);const int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
+    PaintBuffer buffer;if(width<=0||height<=0||!buffer.Ensure(width,height))return false;
+    {
+        Gdiplus::Bitmap surface(width,height,width*4,PixelFormat32bppPARGB,static_cast<BYTE*>(buffer.pixels));
+        Gdiplus::Graphics graphics(&surface);graphics.Clear(Gdiplus::Color(0,0,0,0));
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.TranslateTransform(static_cast<float>(-bounds.left),static_cast<float>(-bounds.top));
+        Rounded(graphics,bounds,Background(box.color,g_layout->opacity));
+        g_renderOnlyGroup=box.id;DrawVisualIcons(graphics);g_renderOnlyGroup.clear();graphics.Flush();
+    }
+    WNDCLASSW wc{};wc.hInstance=g_instance;wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"nestlone-D.DragPreview";RegisterClassW(&wc);
+    POINT top=ParentPoint({bounds.left,bounds.top});
+    HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,wc.lpszClassName,L"",WS_CHILD,top.x,top.y,width,height,g_host.defviewParent,nullptr,g_instance,nullptr);
+    if(!preview)return false;
+    POINT source{};SIZE size{width,height};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+    if(!UpdateLayeredWindow(preview,nullptr,nullptr,&size,buffer.dc,&source,0,&blend,ULW_ALPHA)){DestroyWindow(preview);return false;}
+    g_dragPreview=preview;g_previewGroup=box.id;
+    // Remove only the moving group's pixels from the static desktop once.
+    PaintWindow(g_background);
+    SetWindowPos(preview,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    return true;
+}
+void MoveDragPreview(Box& box) {
+    POINT p=ParentPoint({box.rect.left,box.rect.top});
+    SetWindowPos(g_dragPreview,HWND_TOP,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+    for(auto& d:g_decorations)if(d->id==box.id){
+        SetWindowPos(d->header,HWND_TOP,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+        p=ParentPoint({box.rect.right-18,box.rect.bottom-18});
+        SetWindowPos(d->grip,HWND_TOP,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+    }
 }
 void Arrange(Box& box,const DesktopSnapshot& snapshot=g_snapshot) {
     if(!snapshot.readable || box.collapsed)return;
@@ -464,6 +619,7 @@ void Arrange(Box& box,const DesktopSnapshot& snapshot=g_snapshot) {
         if(occupied){g_status=L"目标位置有未收纳图标，请先移开或使用“收纳区域内图标”";return;}
     }
     box.rect=fitted.rect;
+    SyncGroupRect(box);
     if(g_nativeHidden){g_visualDirty=true;PaintAll();SaveLayout(*g_layout);return;}
     if(!moves.empty())QueueMoves(moves);
     PaintAll();SaveLayout(*g_layout);
@@ -491,9 +647,11 @@ void FinishRename(bool save) {
     wchar_t value[81]{};GetWindowTextW(edit,value,81);
     std::wstring text=value;auto first=text.find_first_not_of(L" \t\r\n");
     if(save&&first!=std::wstring::npos)if(auto* box=FindBox(g_editId)) {
-        box->title=text.substr(first,text.find_last_not_of(L" \t\r\n")-first+1);SaveLayout(*g_layout);
+        const std::wstring trimmed=text.substr(first,text.find_last_not_of(L" \t\r\n")-first+1);
+        if(g_editGroupTitle)box->groupTitle=trimmed;else box->title=trimmed;
+        SaveLayout(*g_layout);
     }
-    DestroyWindow(edit);g_editId.clear();PaintAll();
+    DestroyWindow(edit);g_editId.clear();g_editGroupTitle=false;PaintAll();
 }
 LRESULT CALLBACK EditProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
     if(msg==WM_KEYDOWN&&(wp==VK_RETURN||wp==VK_ESCAPE)){FinishRename(wp==VK_RETURN);return 0;}
@@ -501,11 +659,12 @@ LRESULT CALLBACK EditProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_
     if(msg==WM_NCDESTROY)RemoveWindowSubclass(hwnd,EditProc,1);
     return DefSubclassProc(hwnd,msg,wp,lp);
 }
-void BeginRename(Box& box) {
-    FinishRename(true);g_editId=box.id;
+void BeginRename(Box& box,bool groupTitle=false) {
+    FinishRename(true);g_editId=box.id;g_editGroupTitle=groupTitle;
     POINT p{box.rect.left+HeaderHeight(),box.rect.top+HeaderHeight()/4};
     p.x+=GetSystemMetrics(SM_XVIRTUALSCREEN);p.y+=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    g_edit=CreateWindowExW(WS_EX_TOOLWINDOW,L"EDIT",box.title.c_str(),WS_POPUP|ES_CENTER|ES_AUTOHSCROLL,p.x,p.y,
+    const std::wstring& value=groupTitle?GroupTitle(box):box.title;
+    g_edit=CreateWindowExW(WS_EX_TOOLWINDOW,L"EDIT",value.c_str(),WS_POPUP|ES_CENTER|ES_AUTOHSCROLL,p.x,p.y,
         max(40L,box.rect.right-box.rect.left-4*HeaderHeight()),HeaderHeight()*3/4,nullptr,nullptr,g_instance,nullptr);
     if(!g_edit)return;
     if(g_editFont)DeleteObject(g_editFont);
@@ -514,6 +673,7 @@ void BeginRename(Box& box) {
     SetWindowSubclass(g_edit,EditProc,1,0);ShowWindow(g_edit,SW_SHOW);SetForegroundWindow(g_edit);SetFocus(g_edit);SendMessageW(g_edit,EM_SETSEL,0,-1);
 }
 void DestroyDecorations() {
+    EndDragPreview();
     FinishRename(false);
     for(auto& d:g_decorations){if(IsWindow(d->header))DestroyWindow(d->header);if(IsWindow(d->grip))DestroyWindow(d->grip);}
     g_decorations.clear();if(IsWindow(g_background))DestroyWindow(g_background);g_background=nullptr;
@@ -557,7 +717,17 @@ void FinishVisualDrag() {
     const auto& anchor=g_visualIcons[g_iconDrag];
     POINT center{anchor.position.x+g_snapshot.iconSize/2,anchor.position.y+g_snapshot.iconSize/2};
     int target=-1;
-    for(int i=0;i<static_cast<int>(g_layout->boxes.size());++i){RECT r=g_layout->boxes[i].rect;r.top+=HeaderHeight();if(!g_layout->boxes[i].collapsed&&PtInRect(&r,center))target=i;}
+    // Group tabs share one rectangle.  A drop belongs to the tab currently
+    // visible in that rectangle, not to whichever grouped child is last in
+    // the layout vector.
+    for(auto& root:g_layout->boxes)if(IsGroupRoot(root)) {
+        RECT r=root.rect;r.top+=BoxHeaderHeight(root);
+        if(!root.collapsed&&PtInRect(&r,center)) {
+            Box* active=ActiveBox(root);
+            target=static_cast<int>(active-&g_layout->boxes.front());
+            break;
+        }
+    }
     std::vector<int> affected;std::vector<std::pair<std::wstring,POINT>> dragged;
     for(const auto& start:g_iconDragStart) {
         auto found=std::find_if(g_visualIcons.begin(),g_visualIcons.end(),[&](const auto& item){return _wcsicmp(item.path.c_str(),start.first.c_str())==0;});
@@ -588,7 +758,7 @@ void FinishVisualDrag() {
     std::vector<DesktopMove> moves;
     for(int index:affected) {
         auto& box=g_layout->boxes[index];if(box.collapsed)continue;
-        box.rect=FitGrid(box,g_snapshot);auto arranged=GridMoves(box,g_snapshot);moves.insert(moves.end(),arranged.begin(),arranged.end());
+        box.rect=FitGrid(box,g_snapshot);SyncGroupRect(box);auto arranged=GridMoves(box,g_snapshot);moves.insert(moves.end(),arranged.begin(),arranged.end());
     }
     if(target<0)for(const auto& item:dragged)moves.push_back({item.first,item.second});
     if(!moves.empty())QueueMoves(moves);
@@ -598,7 +768,7 @@ bool Attach() {
     auto host=db::DiscoverDesktopHost();
     if(!host.listview || !host.defviewParent)return false;
     if(g_background && IsWindow(g_background) && g_host.listview==host.listview)return true;
-    DestroyDecorations();g_host=host;RestoreLegacyMask(host.listview);
+    DestroyDecorations();g_host=host;RestoreLegacyMask(host.listview);RecoverBoxPositions();
     DesktopSnapshot initial;if(ReadDesktop(initial)){g_snapshot=std::move(initial);g_visualDirty=true;}
     g_hiddenListview=host.listview;ClaimHiddenDesktopListView(g_hiddenListview);ShowWindow(g_hiddenListview,SW_HIDE);g_nativeHidden=true;
     POINT origin=ParentPoint({0,0});
@@ -618,8 +788,28 @@ bool Attach() {
     if(!PaintWindow(g_background)){DestroyDecorations();return false;}
     ShowWindow(g_background,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);PaintAll();return true;
 }
-void Rebuild(){DestroyDecorations();Attach();SaveLayout(*g_layout);}
-void ToggleBoxView(Box& box) {box.iconView=!box.iconView;box.rect=FitGrid(box,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
+void Rebuild(){
+    RecoverBoxPositions();
+    if(!g_background||!IsWindow(g_background)){Attach();return;}
+    // Keep the desktop canvas, Explorer binding and unaffected group windows.
+    for(auto it=g_decorations.begin();it!=g_decorations.end();) {
+        auto* box=FindBox((*it)->id);
+        if(box&&IsGroupRoot(*box)){++it;continue;}
+        if(IsWindow((*it)->header))DestroyWindow((*it)->header);
+        if(IsWindow((*it)->grip))DestroyWindow((*it)->grip);
+        it=g_decorations.erase(it);
+    }
+    for(const auto& box:g_layout->boxes)if(IsGroupRoot(box)) {
+        if(std::any_of(g_decorations.begin(),g_decorations.end(),[&](const auto& d){return d->id==box.id;}))continue;
+        auto d=std::make_unique<Decoration>();d->id=box.id;
+        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,200,HeaderHeight(),g_host.defviewParent,nullptr,g_instance,d.get());
+        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,18,18,g_host.defviewParent,nullptr,g_instance,d.get());
+        if(!d->header||!d->grip){if(d->header)DestroyWindow(d->header);if(d->grip)DestroyWindow(d->grip);continue;}
+        g_decorations.push_back(std::move(d));
+    }
+    g_visualDirty=true;PaintAll();SaveLayout(*g_layout);
+}
+void ToggleBoxView(Box& box) {box.iconView=!box.iconView;box.rect=FitGrid(box,g_snapshot);SyncGroupRect(box);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
 void Menu(HWND hwnd,Box& box,POINT point) {
     Box* active=ActiveBox(box);
     HMENU menu=CreatePopupMenu();
@@ -629,19 +819,20 @@ void Menu(HWND hwnd,Box& box,POINT point) {
     AppendMenuW(menu,MF_STRING,5,L"删除盒子（保留图标与文件）");
     if(!g_status.empty())AppendMenuW(menu,MF_STRING|MF_DISABLED,0,g_status.c_str());
     int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,hwnd,nullptr);DestroyMenu(menu);
-    if(command==1)BeginRename(box);
+    if(command==1)BeginRename(box,HasGroupTabs(box));
     if(command==2){Arrange(box);if(!g_status.empty())MessageBoxW(hwnd,g_status.c_str(),L"图标位置",MB_OK|MB_ICONINFORMATION);}
     if(command==3) {
         int index=static_cast<int>(&box-g_layout->boxes.data());
         for(const auto& entry:g_snapshot.entries)if(ContainingBox(entry)==index)AssignDesktopItem(*g_layout,entry.path,index,entry.position);
         Arrange(box);SaveLayout(*g_layout);
     }
-    if(command==6){active->iconView=true;active->rect=FitGrid(*active,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
-    if(command==7){active->iconView=false;active->rect=FitGrid(*active,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
+    if(command==6){active->iconView=true;active->rect=FitGrid(*active,g_snapshot);SyncGroupRect(*active);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
+    if(command==7){active->iconView=false;active->rect=FitGrid(*active,g_snapshot);SyncGroupRect(*active);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
     if(command==4){box.collapsed=!box.collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}
     if(command==5){auto id=box.id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}
 }
 LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
+    if(message==WM_NCDESTROY)g_paintBuffers.erase(hwnd);
     if(message==WM_NCCREATE){auto c=reinterpret_cast<CREATESTRUCTW*>(lp);SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(c->lpCreateParams));}
     auto* d=reinterpret_cast<Decoration*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
     Box* box=d?FindBox(d->id):nullptr;
@@ -661,8 +852,8 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         }
         if(hwnd==g_background && message==WM_MOUSEMOVE && GetCapture()==hwnd) {
             POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
-            if(g_marquee){UpdateMarquee(point);PaintWindow(hwnd);return 0;}
-            if(g_iconDrag>=0){POINT cursor{};GetCursorPos(&cursor);LONG dx=cursor.x-g_iconMouseStart.x,dy=cursor.y-g_iconMouseStart.y;if(!g_iconMoved&&abs(dx)<4&&abs(dy)<4)return 0;g_iconMoved=true;for(auto& item:g_visualIcons)if(item.selected){auto start=std::find_if(g_iconDragStart.begin(),g_iconDragStart.end(),[&](const auto& value){return _wcsicmp(value.first.c_str(),item.path.c_str())==0;});if(start!=g_iconDragStart.end()){item.position=ClampDesktopPosition({start->second.x+dx,start->second.y+dy});RefreshIconHit(item);}}PaintWindow(hwnd);return 0;}
+            if(g_marquee){UpdateMarquee(point);QueueInteractivePaint();return 0;}
+            if(g_iconDrag>=0){POINT cursor{};GetCursorPos(&cursor);LONG dx=cursor.x-g_iconMouseStart.x,dy=cursor.y-g_iconMouseStart.y;if(!g_iconMoved&&abs(dx)<4&&abs(dy)<4)return 0;g_iconMoved=true;for(auto& item:g_visualIcons)if(item.selected){auto start=std::find_if(g_iconDragStart.begin(),g_iconDragStart.end(),[&](const auto& value){return _wcsicmp(value.first.c_str(),item.path.c_str())==0;});if(start!=g_iconDragStart.end()){item.position=ClampDesktopPosition({start->second.x+dx,start->second.y+dy});RefreshIconHit(item);}}QueueInteractivePaint();return 0;}
         }
         if(hwnd==g_background && message==WM_LBUTTONUP){if(g_marquee){ReleaseCapture();FinishMarquee();return 0;}if(g_iconDrag>=0){ReleaseCapture();if(g_iconMoved)FinishVisualDrag();else{g_iconDrag=-1;g_iconDragStart.clear();}return 0;}}
         if(hwnd==g_background && message==WM_LBUTTONDBLCLK){int hit=HitVisualIcon(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));if(hit>=0)ShellExecuteW(nullptr,L"open",g_visualIcons[hit].path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);return 0;}
@@ -683,20 +874,20 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     case WM_NCHITTEST:return HTCLIENT;
     case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
     case WM_PAINT:{PAINTSTRUCT ps{};BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);PaintWindow(hwnd,box,hwnd==d->grip);return 0;}
-    case WM_LBUTTONDBLCLK:if(hwnd==d->header && GET_X_LPARAM(lp)<box->rect.right-box->rect.left-3*HeaderHeight())BeginRename(*box);return 0;
+    case WM_LBUTTONDBLCLK:if(hwnd==d->header && GET_Y_LPARAM(lp)<HeaderHeight() && GET_X_LPARAM(lp)<box->rect.right-box->rect.left-3*HeaderHeight())BeginRename(*box,HasGroupTabs(*box));return 0;
     case WM_CONTEXTMENU:{POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};if(p.x==-1)GetCursorPos(&p);Menu(hwnd,*box,p);return 0;}
     case WM_LBUTTONDOWN: {
-        FinishRename(true);int h=HeaderHeight(),x=GET_X_LPARAM(lp),width=box->rect.right-box->rect.left;
-        if(hwnd==d->header && x>=width-3*h) {
+        FinishRename(true);int h=HeaderHeight(),x=GET_X_LPARAM(lp),y=GET_Y_LPARAM(lp),width=box->rect.right-box->rect.left;
+        if(hwnd==d->header && y<h && x>=width-3*h) {
             if(x>=width-h)g_boxButton=3;
             else if(x>=width-2*h)g_boxButton=2;
             else g_boxButton=1;
             SetCapture(hwnd);return 0;
         }
-        if(hwnd==d->header) {
+        if(hwnd==d->header && y>=h && HasGroupTabs(*box)) {
             auto tabs=GroupTabs(*box);
-            if(tabs.size()>1&&x<width-3*h) {
-                const size_t index=min(tabs.size()-1,static_cast<size_t>(max(0,x)*static_cast<int>(tabs.size())/max(1,width-3*h)));
+            if(tabs.size()>1) {
+                const size_t index=min(tabs.size()-1,static_cast<size_t>(max(0,x)*static_cast<int>(tabs.size())/max(1,width)));
                 g_tabPending=true;g_dragId=tabs[index]->id;g_boxStart=tabs[index]->rect;GetCursorPos(&g_mouseStart);SetCapture(hwnd);return 0;
             }
         }
@@ -705,7 +896,11 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         if(ctrl){box->selected=!box->selected;if(!box->selected){g_visualDirty=true;PaintAll();}return 0;}
         if(!box->selected)for(auto& candidate:g_layout->boxes)candidate.selected=false;
         box->selected=true;g_drag=true;g_resizing=hwnd==d->grip;g_dragId=box->id;g_boxStart=box->rect;GetCursorPos(&g_mouseStart);g_dragStart.clear();g_boxDragStart.clear();
-        for(const auto& candidate:g_layout->boxes)if(candidate.selected)g_boxDragStart.push_back({candidate.id,candidate.rect});
+        if(HasGroupTabs(*box)) {
+            for(const auto& candidate:g_layout->boxes)if(GroupRoot(candidate)==box)g_boxDragStart.push_back({candidate.id,candidate.rect});
+        } else {
+            for(const auto& candidate:g_layout->boxes)if(candidate.selected)g_boxDragStart.push_back({candidate.id,candidate.rect});
+        }
         for(const auto& e:g_snapshot.entries)if(HasPath(*box,e.path))g_dragStart.push_back({e.path,e.position});
         SetCapture(hwnd);return 0;
     }
@@ -714,37 +909,48 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             POINT p{};GetCursorPos(&p);LONG dx=p.x-g_mouseStart.x,dy=p.y-g_mouseStart.y;
             if(abs(dx)<4&&abs(dy)<4)return 0;
             if(auto* tab=FindBox(g_dragId)) {
-                Box* root=GroupRoot(*tab);tab->groupId.clear();tab->activeTabId.clear();
-                if(root!=tab&&root->activeTabId==tab->id)root->activeTabId.clear();
+                DetachTab(*tab);
                 tab->rect=g_boxStart;tab->selected=true;g_boxDragStart={{tab->id,g_boxStart}};g_drag=true;g_tabPending=false;g_tabDetached=true;g_resizing=false;g_visualDirty=true;box=tab;
+                Rebuild();
             }
         }
         if(g_drag && GetCapture()==hwnd) {
             if(auto* dragged=FindBox(g_dragId))box=dragged;
+            if(!g_resizing&&!g_dragPreview)BeginDragPreview(*box);
             POINT p{};GetCursorPos(&p);LONG dx=p.x-g_mouseStart.x,dy=p.y-g_mouseStart.y;box->rect=g_boxStart;
-            if(g_resizing){box->rect.right=max(box->rect.left+240,box->rect.right+dx);box->rect.bottom=max(box->rect.top+HeaderHeight()+100,box->rect.bottom+dy);box->rect=FitGrid(*box,g_snapshot);}
-            else {for(auto& start:g_boxDragStart)if(auto* selected=FindBox(start.first)){selected->rect=start.second;OffsetRect(&selected->rect,dx,dy);}if(g_nativeHidden){RefreshVisualGeometry();}else {std::vector<DesktopMove> moves=g_dragStart;for(auto& m:moves){m.position.x+=dx;m.position.y+=dy;}if(!moves.empty())QueueMoves(moves);}}
-            PaintAll();
+            if(g_resizing){box->rect.right=max(box->rect.left+240,box->rect.right+dx);box->rect.bottom=max(box->rect.top+BoxHeaderHeight(*box)+100,box->rect.bottom+dy);box->rect=FitGrid(*box,g_snapshot);if(HasGroupTabs(*box))for(auto& candidate:g_layout->boxes)if(GroupRoot(candidate)==box)candidate.rect=box->rect;g_visualGeometryDirty=true;}
+            else {
+                RECT desired=g_boxStart;OffsetRect(&desired,dx,dy);
+                const RECT constrained=KeepBoxOnScreen(desired,BoxHeaderHeight(*box));
+                dx=constrained.left-g_boxStart.left;dy=constrained.top-g_boxStart.top;
+                for(auto& start:g_boxDragStart)if(auto* selected=FindBox(start.first)){selected->rect=start.second;OffsetRect(&selected->rect,dx,dy);}
+                RecoverBoxPositions();
+                if(g_nativeHidden){g_visualGeometryDirty=true;}else {std::vector<DesktopMove> moves=g_dragStart;for(auto& m:moves){m.position.x+=dx;m.position.y+=dy;}if(!moves.empty())QueueMoves(moves);}
+            }
+            if(g_dragPreview)MoveDragPreview(*box);else QueueInteractivePaint();
         }
         return 0;
     case WM_CANCELMODE:
+        EndDragPreview();
         g_boxButton=0;g_drag=false;g_tabPending=false;g_tabDetached=false;g_resizing=false;g_boxDragStart.clear();CancelIconGesture();return 0;
     case WM_LBUTTONUP:
         if(g_tabPending){g_tabPending=false;ReleaseCapture();if(auto* tab=FindBox(g_dragId)){if(auto* root=GroupRoot(*tab)){root->activeTabId=tab->id;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}}return 0;}
         if(g_boxButton){int button=g_boxButton;g_boxButton=0;ReleaseCapture();if(button==1)ToggleBoxView(*ActiveBox(*box));else if(button==2){box->collapsed=!box->collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}else {auto id=box->id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}return 0;}
         if(g_drag){
             if(auto* dragged=FindBox(g_dragId))box=dragged;
-            g_drag=false;ReleaseCapture();
+            g_drag=false;ReleaseCapture();EndDragPreview();FlushInteractivePaint();
             if(g_resizing)Arrange(*box);
             else {
                 POINT cursor{};GetCursorPos(&cursor);cursor.x-=GetSystemMetrics(SM_XVIRTUALSCREEN);cursor.y-=GetSystemMetrics(SM_YVIRTUALSCREEN);
                 Box* source=GroupRoot(*box);Box* destination=nullptr;
                 for(auto& candidate:g_layout->boxes)if(IsGroupRoot(candidate)&&candidate.id!=source->id) {
-                    RECT header=DisplayRect(candidate);header.bottom=header.top+HeaderHeight();
+                    RECT header=DisplayRect(candidate);header.bottom=header.top+BoxHeaderHeight(candidate);
                     if(PtInRect(&header,cursor)){destination=&candidate;break;}
                 }
                 if(destination) {
-                    for(auto& candidate:g_layout->boxes)if(GroupRoot(candidate)->id==source->id) {candidate.groupId=destination->id;candidate.rect=destination->rect;candidate.color=destination->color;}
+                    if(destination->groupTitle.empty())destination->groupTitle=destination->title;
+                    const auto members=GroupTabs(*source);
+                    for(auto* candidate:members) {candidate->groupId=destination->id;candidate->rect=destination->rect;candidate->color=destination->color;}
                     destination->activeTabId=box->id;g_visualDirty=true;g_boxDragStart.clear();SaveLayout(*g_layout);PostMessageW(g_manager,WM_APP+11,0,0);return 0;
                 }
             }
@@ -752,14 +958,25 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             g_boxDragStart.clear();SaveLayout(*g_layout);
             if(rebuildDecorations)PostMessageW(g_manager,WM_APP+11,0,0);
         }return 0;
-    case WM_CAPTURECHANGED:if(g_drag){g_drag=false;if(g_resizing)Arrange(*box);g_boxDragStart.clear();SaveLayout(*g_layout);}return 0;
+    case WM_CAPTURECHANGED:if(g_drag){g_drag=false;EndDragPreview();if(g_resizing)Arrange(*box);g_boxDragStart.clear();SaveLayout(*g_layout);FlushInteractivePaint();}return 0;
     }
     return DefWindowProcW(hwnd,message,wp,lp);
 }
 LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     if(message==WM_APP+10){FinishRename(true);return 0;}
     if(message==WM_APP+11){Rebuild();return 0;}
+    if(message==WM_TIMER&&wp==kInteractivePaintTimer) {
+        KillTimer(hwnd,kInteractivePaintTimer);g_interactivePaintQueued=false;
+        if(g_visible){
+            if(g_drag)PaintAll();
+            else if((g_marquee||g_iconDrag>=0)&&g_background)PaintWindow(g_background);
+        }
+        return 0;
+    }
     if(message==WM_TIMER) {
+        // Host discovery enumerates Explorer windows and sends synchronous
+        // messages. Defer maintenance while the pointer gesture is active.
+        if(g_drag||g_tabPending||g_marquee||g_iconDrag>=0)return 0;
         Attach();
         if(!g_visible)return 0;
         DesktopSnapshot next;
@@ -773,7 +990,8 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                 if(!(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000)){
                     bool resourcesChanged=g_snapshot.entries.size()!=next.entries.size() || g_snapshot.iconSize!=next.iconSize || g_snapshot.spacing.x!=next.spacing.x || g_snapshot.spacing.y!=next.spacing.y || g_snapshot.iconMode!=next.iconMode;
                     if(!resourcesChanged)for(const auto& entry:next.entries)if(!FindEntry(g_snapshot,entry.path)){resourcesChanged=true;break;}
-                    g_snapshot=std::move(next);if(g_nativeHidden&&resourcesChanged)g_visualDirty=true;
+                    g_snapshot=std::move(next);
+                    if(g_nativeHidden&&resourcesChanged){g_visualDirty=true;PaintAll();}
                 }
             }
         }
@@ -794,6 +1012,7 @@ bool CreateCanvas(HINSTANCE instance,HWND,Layout* layout) {
 }
 void DestroyCanvas() {
     CancelDesktopMoves();DestroyDecorations();if(g_manager)DestroyWindow(g_manager);g_manager=nullptr;
+    g_interactivePaintQueued=false;g_paintBuffers.clear();g_iconCache.clear();
     if(g_editFont){DeleteObject(g_editFont);g_editFont=nullptr;}
     if(g_token){Gdiplus::GdiplusShutdown(g_token);g_token=0;}
 }
@@ -809,7 +1028,7 @@ void HandleCanvasCommand(CanvasCommand command) {
         PaintAll();
     }
     if(command==CanvasCommand::NewBox) {Box box;box.id=std::to_wstring(GetTickCount64());box.title=L"新盒子";box.rect={160,160,520,480};g_layout->boxes.push_back(box);Rebuild();}
-    if(command==CanvasCommand::Reload){*g_layout=LoadLayout();Rebuild();}
+    if(command==CanvasCommand::Reload){g_iconCache.clear();*g_layout=LoadLayout();Rebuild();}
     if(command==CanvasCommand::Exit)DestroyCanvas();
 }
 }

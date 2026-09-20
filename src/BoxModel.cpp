@@ -183,6 +183,7 @@ Layout LoadLayout() {
         long iconView = 0;
         if (ReadNumber(object, L"iconView", iconView)) box.iconView = iconView != 0;
         ReadString(object, L"groupId", box.groupId);
+        ReadString(object, L"groupTitle", box.groupTitle);
         ReadString(object, L"activeTabId", box.activeTabId);
         for (const auto& item : ReadItems(object)) AddItem(box, item);
         layout.boxes.push_back(std::move(box));
@@ -211,11 +212,11 @@ bool SaveLayout(const Layout& layout) {
     const std::wstring path = LayoutPath();
     if (path.empty()) return false;
     const int opacity = std::clamp(layout.opacity, 20, 100);
-    std::wstring json = L"{\"version\":5,\"opacity\":" + std::to_wstring(opacity) + L",\"autoOrganize\":" + std::to_wstring(layout.autoOrganize ? 1 : 0) + L",\"boxes\":[";
+    std::wstring json = L"{\"version\":6,\"opacity\":" + std::to_wstring(opacity) + L",\"autoOrganize\":" + std::to_wstring(layout.autoOrganize ? 1 : 0) + L",\"boxes\":[";
     for (size_t i = 0; i < layout.boxes.size(); ++i) {
         const Box& box = layout.boxes[i];
         if (i) json += L',';
-        json += L"{\"id\":\"" + Escape(box.id) + L"\",\"title\":\"" + Escape(box.title) + L"\",\"left\":" + std::to_wstring(box.rect.left) + L",\"top\":" + std::to_wstring(box.rect.top) + L",\"right\":" + std::to_wstring(box.rect.right) + L",\"bottom\":" + std::to_wstring(box.rect.bottom) + L",\"color\":" + std::to_wstring(static_cast<unsigned long>(box.color)) + L",\"collapsed\":" + std::to_wstring(box.collapsed ? 1 : 0) + L",\"iconView\":" + std::to_wstring(box.iconView ? 1 : 0) + L",\"groupId\":\"" + Escape(box.groupId) + L"\",\"activeTabId\":\"" + Escape(box.activeTabId) + L"\",\"items\":[";
+        json += L"{\"id\":\"" + Escape(box.id) + L"\",\"title\":\"" + Escape(box.title) + L"\",\"groupTitle\":\"" + Escape(box.groupTitle) + L"\",\"left\":" + std::to_wstring(box.rect.left) + L",\"top\":" + std::to_wstring(box.rect.top) + L",\"right\":" + std::to_wstring(box.rect.right) + L",\"bottom\":" + std::to_wstring(box.rect.bottom) + L",\"color\":" + std::to_wstring(static_cast<unsigned long>(box.color)) + L",\"collapsed\":" + std::to_wstring(box.collapsed ? 1 : 0) + L",\"iconView\":" + std::to_wstring(box.iconView ? 1 : 0) + L",\"groupId\":\"" + Escape(box.groupId) + L"\",\"activeTabId\":\"" + Escape(box.activeTabId) + L"\",\"items\":[";
         for (size_t j = 0; j < box.items.size(); ++j) { if (j) json += L','; json += L"\"" + Escape(box.items[j]) + L"\""; }
         json += L"]}";
     }
