@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <memory>
+#include <vector>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -75,6 +76,11 @@ bool IsGroupRoot(const Box& box) { return box.groupId.empty() || !FindBox(box.gr
 bool IsActiveTab(const Box& box) {
     const Box* root=GroupRoot(box);
     return root->activeTabId.empty()?box.id==root->id:box.id==root->activeTabId;
+}
+Box* ActiveBox(Box& root) {
+    if(root.activeTabId.empty())return &root;
+    if(auto* active=FindBox(root.activeTabId))return active;
+    root.activeTabId.clear();return &root;
 }
 std::vector<Box*> GroupTabs(Box& root) {
     std::vector<Box*> tabs;tabs.push_back(&root);
@@ -275,23 +281,69 @@ std::vector<DesktopMove> GridMoves(const Box& box,const DesktopSnapshot& snapsho
     }
     return moves;
 }
+std::shared_ptr<Gdiplus::Bitmap> DecodeIconWithMasks(HICON icon) {
+    // Do not let GDI/GDI+ choose the HICON conversion.  Read the colour DIB
+    // and the icon's AND mask ourselves, then write a standard premultiplied
+    // 32-bit bitmap for UpdateLayeredWindow.
+    ICONINFO info{};
+    if(!GetIconInfo(icon,&info)||!info.hbmColor||!info.hbmMask) {
+        if(info.hbmColor)DeleteObject(info.hbmColor);
+        if(info.hbmMask)DeleteObject(info.hbmMask);
+        return {};
+    }
+    BITMAP color{},mask{};
+    if(!GetObjectW(info.hbmColor,sizeof(color),&color)||!GetObjectW(info.hbmMask,sizeof(mask),&mask)) {
+        DeleteObject(info.hbmColor);DeleteObject(info.hbmMask);return {};
+    }
+    const int width=color.bmWidth,height=abs(color.bmHeight);
+    if(width<=0||height<=0) {DeleteObject(info.hbmColor);DeleteObject(info.hbmMask);return {};}
+    std::vector<DWORD> source(static_cast<size_t>(width)*height);
+    BITMAPINFO bmi{};bmi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);bmi.bmiHeader.biWidth=width;bmi.bmiHeader.biHeight=-height;bmi.bmiHeader.biPlanes=1;bmi.bmiHeader.biBitCount=32;bmi.bmiHeader.biCompression=BI_RGB;
+    HDC screen=GetDC(nullptr);
+    if(!screen) {DeleteObject(info.hbmColor);DeleteObject(info.hbmMask);return {};}
+    const int lines=GetDIBits(screen,info.hbmColor,0,height,source.data(),&bmi,DIB_RGB_COLORS);
+    if(lines!=height) {ReleaseDC(nullptr,screen);DeleteObject(info.hbmColor);DeleteObject(info.hbmMask);return {};}
+    HDC maskDc=CreateCompatibleDC(screen);HGDIOBJ oldMask=SelectObject(maskDc,info.hbmMask);
+    const int andHeight=mask.bmHeight;
+    bool hasZero=false,hasFull=false,hasPartial=false;
+    for(DWORD pixel:source) {const BYTE alpha=static_cast<BYTE>(pixel>>24);hasZero|=alpha==0;hasFull|=alpha==255;hasPartial|=alpha!=0&&alpha!=255;}
+    const bool sourceHasAlpha=hasPartial||(hasZero&&hasFull);
+    auto result=std::make_shared<Gdiplus::Bitmap>(width,height,PixelFormat32bppPARGB);
+    Gdiplus::Rect area(0,0,width,height);Gdiplus::BitmapData output{};
+    const bool locked=result->GetLastStatus()==Gdiplus::Ok&&result->LockBits(&area,Gdiplus::ImageLockModeWrite,PixelFormat32bppPARGB,&output)==Gdiplus::Ok;
+    if(locked)for(int y=0;y<height;++y) {
+        auto* row=reinterpret_cast<DWORD*>(static_cast<BYTE*>(output.Scan0)+y*output.Stride);
+        const int my=min(andHeight-1,y*andHeight/max(1,height));
+        for(int x=0;x<width;++x) {
+            const DWORD pixel=source[static_cast<size_t>(y)*width+x];
+            BYTE alpha=sourceHasAlpha?static_cast<BYTE>(pixel>>24):255;
+            if(GetPixel(maskDc,min(mask.bmWidth-1,x*mask.bmWidth/max(1,width)),my)!=RGB(0,0,0))alpha=0;
+            const BYTE blue=static_cast<BYTE>(pixel),green=static_cast<BYTE>(pixel>>8),red=static_cast<BYTE>(pixel>>16);
+            const DWORD premultiplied=alpha==255?(0xff000000u|(pixel&0x00ffffffu)):alpha?((alpha<<24)|((red*alpha+127)/255<<16)|((green*alpha+127)/255<<8)|((blue*alpha+127)/255)):0;
+            row[x]=premultiplied;
+        }
+    }
+    if(locked)result->UnlockBits(&output);
+    SelectObject(maskDc,oldMask);DeleteDC(maskDc);ReleaseDC(nullptr,screen);DeleteObject(info.hbmColor);DeleteObject(info.hbmMask);
+    return locked?result:std::shared_ptr<Gdiplus::Bitmap>();
+}
 std::shared_ptr<Gdiplus::Bitmap> LoadIconImage(const std::wstring& path,int size) {
     SHFILEINFOW info{};
     if(!SHGetFileInfoW(path.c_str(),0,&info,sizeof(info),SHGFI_ICON|SHGFI_LARGEICON)||!info.hIcon)return {};
     HICON icon=info.hIcon;
-    auto source=std::make_unique<Gdiplus::Bitmap>(icon);
+    auto decoded=DecodeIconWithMasks(icon);
+    if(!decoded) {
+        auto source=std::make_unique<Gdiplus::Bitmap>(icon);
+        if(source->GetLastStatus()==Gdiplus::Ok)decoded.reset(source->Clone(0,0,source->GetWidth(),source->GetHeight(),PixelFormat32bppPARGB));
+    }
     DestroyIcon(icon);
-    if(source->GetLastStatus()!=Gdiplus::Ok)return {};
-    auto* copy=source->Clone(0,0,source->GetWidth(),source->GetHeight(),PixelFormat32bppPARGB);
-    if(!copy||copy->GetLastStatus()!=Gdiplus::Ok){delete copy;return {};}
-    if(static_cast<int>(source->GetWidth())==size&&static_cast<int>(source->GetHeight())==size)
-        return std::shared_ptr<Gdiplus::Bitmap>(copy);
+    if(!decoded||decoded->GetLastStatus()!=Gdiplus::Ok)return {};
+    if(static_cast<int>(decoded->GetWidth())==size&&static_cast<int>(decoded->GetHeight())==size)return decoded;
     auto result=std::make_shared<Gdiplus::Bitmap>(size,size,PixelFormat32bppPARGB);
-    if(result->GetLastStatus()!=Gdiplus::Ok){delete copy;return {};}
+    if(result->GetLastStatus()!=Gdiplus::Ok)return {};
     Gdiplus::Graphics graphics(result.get());
     graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    graphics.DrawImage(copy,0,0,size,size);
-    delete copy;
+    graphics.DrawImage(decoded.get(),0,0,size,size);
     return graphics.GetLastStatus()==Gdiplus::Ok?result:std::shared_ptr<Gdiplus::Bitmap>();
 }
 int BoxRowHeight(const Box& box) { return max(30,HeaderHeight())+(box.iconView?0:0); }
@@ -569,9 +621,10 @@ bool Attach() {
 void Rebuild(){DestroyDecorations();Attach();SaveLayout(*g_layout);}
 void ToggleBoxView(Box& box) {box.iconView=!box.iconView;box.rect=FitGrid(box,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
 void Menu(HWND hwnd,Box& box,POINT point) {
+    Box* active=ActiveBox(box);
     HMENU menu=CreatePopupMenu();
     AppendMenuW(menu,MF_STRING,1,L"重命名盒子");AppendMenuW(menu,MF_STRING,2,L"整理盒内图标位置");
-    AppendMenuW(menu,MF_STRING|(box.iconView?MF_CHECKED:0),6,L"图标显示");AppendMenuW(menu,MF_STRING|(!box.iconView?MF_CHECKED:0),7,L"列表显示");
+    AppendMenuW(menu,MF_STRING|(active->iconView?MF_CHECKED:0),6,L"图标显示");AppendMenuW(menu,MF_STRING|(!active->iconView?MF_CHECKED:0),7,L"列表显示");
     AppendMenuW(menu,MF_STRING,3,L"收纳区域内图标");AppendMenuW(menu,MF_STRING,4,box.collapsed?L"展开盒子":L"折叠盒子（隐藏图标）");
     AppendMenuW(menu,MF_STRING,5,L"删除盒子（保留图标与文件）");
     if(!g_status.empty())AppendMenuW(menu,MF_STRING|MF_DISABLED,0,g_status.c_str());
@@ -583,8 +636,8 @@ void Menu(HWND hwnd,Box& box,POINT point) {
         for(const auto& entry:g_snapshot.entries)if(ContainingBox(entry)==index)AssignDesktopItem(*g_layout,entry.path,index,entry.position);
         Arrange(box);SaveLayout(*g_layout);
     }
-    if(command==6){box.iconView=true;box.rect=FitGrid(box,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
-    if(command==7){box.iconView=false;box.rect=FitGrid(box,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
+    if(command==6){active->iconView=true;active->rect=FitGrid(*active,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
+    if(command==7){active->iconView=false;active->rect=FitGrid(*active,g_snapshot);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
     if(command==4){box.collapsed=!box.collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}
     if(command==5){auto id=box.id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}
 }
@@ -678,7 +731,7 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         g_boxButton=0;g_drag=false;g_tabPending=false;g_tabDetached=false;g_resizing=false;g_boxDragStart.clear();CancelIconGesture();return 0;
     case WM_LBUTTONUP:
         if(g_tabPending){g_tabPending=false;ReleaseCapture();if(auto* tab=FindBox(g_dragId)){if(auto* root=GroupRoot(*tab)){root->activeTabId=tab->id;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}}return 0;}
-        if(g_boxButton){int button=g_boxButton;g_boxButton=0;ReleaseCapture();if(button==1)ToggleBoxView(*box);else if(button==2){box->collapsed=!box->collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}else {auto id=box->id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}return 0;}
+        if(g_boxButton){int button=g_boxButton;g_boxButton=0;ReleaseCapture();if(button==1)ToggleBoxView(*ActiveBox(*box));else if(button==2){box->collapsed=!box->collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}else {auto id=box->id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}return 0;}
         if(g_drag){
             if(auto* dragged=FindBox(g_dragId))box=dragged;
             g_drag=false;ReleaseCapture();
