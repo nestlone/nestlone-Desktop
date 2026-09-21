@@ -11,6 +11,7 @@ namespace {
 constexpr wchar_t kClassName[] = L"nestlone-D.Settings";
 constexpr int kSlider = 2001;
 constexpr int kValue = 2002;
+constexpr int kStartup = 2003;
 constexpr int kBoxSelect = 2100;
 constexpr int kColorBase = 2110;
 constexpr int kSidebarTheme = 2201;
@@ -38,6 +39,31 @@ HWND g_autoRules = nullptr;
 HWND g_backupList = nullptr;
 Layout* g_layout = nullptr;
 std::vector<HWND> g_themePage,g_autoPage,g_backupPage;
+constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kRunValue[] = L"nestlone-D";
+std::wstring StartupCommand() {
+    wchar_t path[MAX_PATH]{};
+    const DWORD length=GetModuleFileNameW(nullptr,path,MAX_PATH);
+    if(!length||length>=MAX_PATH)return {};
+    return L"\""+std::wstring(path,length)+L"\"";
+}
+bool StartupEnabled() {
+    HKEY key=nullptr;if(RegOpenKeyExW(HKEY_CURRENT_USER,kRunKey,0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)return false;
+    wchar_t value[32768]{};DWORD type=0,size=sizeof(value);
+    const bool enabled=RegQueryValueExW(key,kRunValue,nullptr,&type,reinterpret_cast<BYTE*>(value),&size)==ERROR_SUCCESS&&type==REG_SZ;
+    RegCloseKey(key);return enabled;
+}
+bool SetStartupEnabled(bool enabled) {
+    HKEY key=nullptr;if(RegCreateKeyExW(HKEY_CURRENT_USER,kRunKey,0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS)return false;
+    LONG result=ERROR_SUCCESS;
+    if(enabled) {
+        const std::wstring command=StartupCommand();
+        result=command.empty()?ERROR_FILE_NOT_FOUND:RegSetValueExW(key,kRunValue,0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),static_cast<DWORD>((command.size()+1)*sizeof(wchar_t)));
+    } else {
+        result=RegDeleteValueW(key,kRunValue);if(result==ERROR_FILE_NOT_FOUND)result=ERROR_SUCCESS;
+    }
+    RegCloseKey(key);return result==ERROR_SUCCESS;
+}
 void SelectPage(int page) {
     for(HWND control:g_themePage)ShowWindow(control,page==0?SW_SHOW:SW_HIDE);
     for(HWND control:g_autoPage)ShowWindow(control,page==1?SW_SHOW:SW_HIDE);
@@ -120,6 +146,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             WS_CHILD|WS_VISIBLE,170,270,330,24,hwnd,nullptr,nullptr,nullptr);
         g_themePage.push_back(note);
         SendMessageW(note,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND startup=CreateWindowW(L"BUTTON",L"开机后自动启动 nestlone-D",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,170,310,250,26,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStartup)),nullptr,nullptr);
+        g_themePage.push_back(startup);
+        SendMessageW(startup,BM_SETCHECK,StartupEnabled()?BST_CHECKED:BST_UNCHECKED,0);
+        SendMessageW(startup,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND autoTitle=CreateWindowW(L"STATIC",L"自动分类",WS_CHILD|WS_VISIBLE,170,20,180,24,hwnd,nullptr,nullptr,nullptr);
         g_autoPage.push_back(autoTitle);
         SendMessageW(autoTitle,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
@@ -137,7 +167,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         for(const Box& box:g_layout->boxes)SendMessageW(g_autoBox,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(box.title.c_str()));
         if(!g_layout->boxes.empty())SendMessageW(g_autoBox,CB_SETCURSEL,0,0);SendMessageW(g_autoBox,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND add=CreateWindowW(L"BUTTON",L"添加规则",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,370,124,90,26,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAutoAdd)),nullptr,nullptr);SendMessageW(add,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
-        g_autoPage.push_back(add);SelectPage(0);
+        g_autoPage.push_back(add);
         const wchar_t* defaults[]={L"目录",L"文档",L"图片",L"压缩包"};
         for(int i=0;i<4;++i){HWND preset=CreateWindowW(L"BUTTON",defaults[i],WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,170+(i%2)*100,160+(i/2)*26,92,22,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultBoxBase+i)),nullptr,nullptr);SendMessageW(preset,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_autoPage.push_back(preset);}
         HWND ruleLabel=CreateWindowW(L"STATIC",L"自定义规则",WS_CHILD|WS_VISIBLE,170,218,150,24,hwnd,nullptr,nullptr,nullptr);SendMessageW(ruleLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_autoPage.push_back(ruleLabel);
@@ -150,6 +180,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         HWND backupHint=CreateWindowW(L"STATIC",L"每份备份保存当前盒子、分组、规则与桌面位置。",WS_CHILD|WS_VISIBLE,170,52,290,22,hwnd,nullptr,nullptr,nullptr);SendMessageW(backupHint,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(backupHint);
         g_backupList=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|LBS_NOTIFY|WS_VSCROLL,170,84,290,270,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBackupList)),nullptr,nullptr);SendMessageW(g_backupList,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(g_backupList);RefreshBackups();
         const int backupIds[]={kBackupCreate,kBackupApply,kBackupDelete};const wchar_t* backupLabels[]={L"立即备份",L"应用备份",L"删除备份"};for(int i=0;i<3;++i){HWND action=CreateWindowW(L"BUTTON",backupLabels[i],WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170+i*98,370,90,28,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(backupIds[i])),nullptr,nullptr);SendMessageW(action,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(action);}
+        // All page controls must exist before the first visibility pass.
+        SelectPage(0);
         return 0;
     }
     case WM_CTLCOLORSTATIC:
@@ -196,6 +228,14 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         if(LOWORD(wParam)==kSidebarTheme){SelectPage(0);return 0;}
         if(LOWORD(wParam)==kSidebarAuto){SelectPage(1);return 0;}
         if(LOWORD(wParam)==kSidebarBackup){SelectPage(2);return 0;}
+        if(LOWORD(wParam)==kStartup) {
+            const bool enabled=SendMessageW(reinterpret_cast<HWND>(lParam),BM_GETCHECK,0,0)==BST_CHECKED;
+            if(!SetStartupEnabled(enabled)) {
+                SendMessageW(reinterpret_cast<HWND>(lParam),BM_SETCHECK,StartupEnabled()?BST_CHECKED:BST_UNCHECKED,0);
+                MessageBoxW(hwnd,L"无法更新开机自启动设置。",L"nestlone-D",MB_OK|MB_ICONWARNING);
+            }
+            return 0;
+        }
         if(LOWORD(wParam)==kBackupCreate&&g_layout){SaveLayout(*g_layout);auto target=BackupDirectory()/(BackupStamp()+L".backup");CopyFileW(LayoutPath().c_str(),target.c_str(),FALSE);RefreshBackups();return 0;}
         if((LOWORD(wParam)==kBackupApply||LOWORD(wParam)==kBackupDelete)&&g_backupList){int index=static_cast<int>(SendMessageW(g_backupList,LB_GETCURSEL,0,0));if(index!=LB_ERR){wchar_t name[MAX_PATH]{};SendMessageW(g_backupList,LB_GETTEXT,index,reinterpret_cast<LPARAM>(name));auto path=BackupDirectory()/name;if(LOWORD(wParam)==kBackupApply){if(CopyFileW(path.c_str(),LayoutPath().c_str(),FALSE))HandleCanvasCommand(CanvasCommand::Reload);}else{DeleteFileW(path.c_str());RefreshBackups();}}return 0;}
         if(LOWORD(wParam)==kAutoEnable&&g_layout){g_layout->autoOrganize=SendMessageW(reinterpret_cast<HWND>(lParam),BM_GETCHECK,0,0)==BST_CHECKED;SaveLayout(*g_layout);return 0;}
