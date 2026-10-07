@@ -13,6 +13,7 @@ struct Box {
     COLORREF color{RGB(184, 235, 238)};
     bool collapsed{false};
     bool iconView{false};
+    int listScroll{0}; // transient vertical offset for overflowing list content
     bool selected{false}; // transient owned-view selection, not persisted
     // Empty means a standalone box. A member stores the id of its group root.
     std::wstring groupId;
@@ -23,7 +24,8 @@ struct Box {
 
 struct Layout {
     std::vector<Box> boxes;
-    int opacity{88}; // 20..100, shared canvas opacity
+    int opacity{88}; // 0..100, shared canvas background opacity
+    int cornerRadius{12}; // 0..48, shared box corner diameter at 96 DPI
     struct Placement { std::wstring path; POINT point; };
     std::vector<Placement> desktop;
     struct AutoRule { std::wstring boxId; bool folders{false}; std::wstring extensions; };

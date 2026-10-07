@@ -2,7 +2,12 @@
 #include "DesktopCanvas.h"
 #include "DesktopItems.h"
 #include "Theme.h"
+#include "resource.h"
 #include <commctrl.h>
+#include <shellapi.h>
+#include <shlwapi.h>
+#include <gdiplus.h>
+#include <memory>
 #include <vector>
 #include <filesystem>
 
@@ -12,11 +17,15 @@ constexpr wchar_t kClassName[] = L"nestlone-D.Settings";
 constexpr int kSlider = 2001;
 constexpr int kValue = 2002;
 constexpr int kStartup = 2003;
+constexpr int kCornerSlider = 2004;
+constexpr int kCornerValue = 2005;
 constexpr int kBoxSelect = 2100;
 constexpr int kColorBase = 2110;
 constexpr int kSidebarTheme = 2201;
 constexpr int kSidebarAuto = 2202;
 constexpr int kSidebarBackup = 2203;
+constexpr int kSidebarAbout = 2204;
+constexpr int kAboutRepository = 2501;
 constexpr int kBackupList = 2401;
 constexpr int kBackupCreate = 2402;
 constexpr int kBackupApply = 2403;
@@ -32,13 +41,15 @@ HFONT g_font = nullptr;
 HBRUSH g_surface = nullptr;
 HWND g_window = nullptr;
 HWND g_value = nullptr;
+HWND g_cornerValue = nullptr;
 HWND g_boxSelect = nullptr;
 HWND g_autoBox = nullptr;
 HWND g_autoExtensions = nullptr;
 HWND g_autoRules = nullptr;
 HWND g_backupList = nullptr;
 Layout* g_layout = nullptr;
-std::vector<HWND> g_themePage,g_autoPage,g_backupPage;
+std::vector<HWND> g_themePage,g_autoPage,g_backupPage,g_aboutPage;
+std::unique_ptr<Gdiplus::Bitmap> g_githubLogo;
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"nestlone-D";
 std::wstring StartupCommand() {
@@ -64,10 +75,24 @@ bool SetStartupEnabled(bool enabled) {
     }
     RegCloseKey(key);return result==ERROR_SUCCESS;
 }
+Gdiplus::Bitmap* GitHubLogo() {
+    if(g_githubLogo)return g_githubLogo.get();
+    HRSRC resource=FindResourceW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDB_GITHUB_LOGO),RT_RCDATA);
+    if(!resource)return nullptr;
+    const DWORD size=SizeofResource(GetModuleHandleW(nullptr),resource);
+    const void* data=LockResource(LoadResource(GetModuleHandleW(nullptr),resource));
+    if(!data||!size)return nullptr;
+    IStream* stream=SHCreateMemStream(static_cast<const BYTE*>(data),size);
+    if(!stream)return nullptr;
+    auto logo=std::make_unique<Gdiplus::Bitmap>(stream);stream->Release();
+    if(logo->GetLastStatus()!=Gdiplus::Ok)return nullptr;
+    g_githubLogo=std::move(logo);return g_githubLogo.get();
+}
 void SelectPage(int page) {
     for(HWND control:g_themePage)ShowWindow(control,page==0?SW_SHOW:SW_HIDE);
     for(HWND control:g_autoPage)ShowWindow(control,page==1?SW_SHOW:SW_HIDE);
     for(HWND control:g_backupPage)ShowWindow(control,page==2?SW_SHOW:SW_HIDE);
+    for(HWND control:g_aboutPage)ShowWindow(control,page==3?SW_SHOW:SW_HIDE);
 }
 std::filesystem::path BackupDirectory(){auto path=std::filesystem::path(LayoutPath()).parent_path()/L"backups";std::error_code error;std::filesystem::create_directories(path,error);return path;}
 std::wstring BackupStamp(){SYSTEMTIME t{};GetLocalTime(&t);wchar_t value[32]{};swprintf_s(value,L"%04u%02u%02u%02u%02u%02u",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond);return value;}
@@ -93,6 +118,13 @@ void UpdateValue() {
     CanvasSetOpacity(g_layout->opacity);
     SaveLayout(*g_layout);
 }
+void UpdateCornerValue() {
+    if(!g_layout||!g_cornerValue)return;
+    wchar_t text[32]{};swprintf_s(text,L"%d",g_layout->cornerRadius);
+    SetWindowTextW(g_cornerValue,text);
+    SaveLayout(*g_layout);
+    CanvasSetOpacity(g_layout->opacity);
+}
 
 LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
@@ -105,6 +137,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         HWND automatic = CreateWindowW(L"BUTTON", L"自动分类", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 12, 100, 116, 34, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarAuto)), nullptr, nullptr);
         SendMessageW(automatic, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         HWND backup=CreateWindowW(L"BUTTON",L"备份与还原",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,12,140,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarBackup)),nullptr,nullptr);SendMessageW(backup,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND about=CreateWindowW(L"BUTTON",L"关于",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,12,180,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarAbout)),nullptr,nullptr);SendMessageW(about,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND title = CreateWindowW(L"STATIC", L"主题设置", WS_CHILD | WS_VISIBLE, 170, 20, 250, 28, hwnd, nullptr, nullptr, nullptr);
         g_themePage.push_back(title);
         SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -116,22 +149,28 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         SendMessageW(g_value, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         HWND slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS, 170, 98, 290, 40, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSlider)), nullptr, nullptr);
         g_themePage.push_back(slider);
-        SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELONG(20, 100));
+        SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
         SendMessageW(slider, TBM_SETPOS, TRUE, g_layout ? g_layout->opacity : 88);
         SendMessageW(slider, TBM_SETPAGESIZE, 0, 5);
         SendMessageW(slider, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-        HWND boxLabel = CreateWindowW(L"STATIC", L"当前盒子", WS_CHILD | WS_VISIBLE, 170, 150, 90, 24, hwnd, nullptr, nullptr, nullptr);
+        HWND cornerHint=CreateWindowW(L"STATIC",L"圆角程度",WS_CHILD|WS_VISIBLE,170,148,100,24,hwnd,nullptr,nullptr,nullptr);
+        g_themePage.push_back(cornerHint);SendMessageW(cornerHint,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        g_cornerValue=CreateWindowW(L"STATIC",L"12",WS_CHILD|WS_VISIBLE|SS_RIGHT,390,148,70,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCornerValue)),nullptr,nullptr);
+        g_themePage.push_back(g_cornerValue);SendMessageW(g_cornerValue,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND cornerSlider=CreateWindowExW(0,TRACKBAR_CLASSW,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|TBS_NOTICKS,170,180,290,40,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCornerSlider)),nullptr,nullptr);
+        g_themePage.push_back(cornerSlider);SendMessageW(cornerSlider,TBM_SETRANGE,TRUE,MAKELONG(0,48));SendMessageW(cornerSlider,TBM_SETPOS,TRUE,g_layout?g_layout->cornerRadius:12);SendMessageW(cornerSlider,TBM_SETPAGESIZE,0,4);SendMessageW(cornerSlider,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND boxLabel = CreateWindowW(L"STATIC", L"当前盒子", WS_CHILD | WS_VISIBLE, 170, 228, 90, 24, hwnd, nullptr, nullptr, nullptr);
         g_themePage.push_back(boxLabel);
         SendMessageW(boxLabel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-        g_boxSelect = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 260, 146, 200, 180, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBoxSelect)), nullptr, nullptr);
+        g_boxSelect = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 260, 224, 200, 180, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBoxSelect)), nullptr, nullptr);
         g_themePage.push_back(g_boxSelect);
         for (const Box& box : g_layout->boxes) SendMessageW(g_boxSelect, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(box.title.c_str()));
         if (!g_layout->boxes.empty()) SendMessageW(g_boxSelect, CB_SETCURSEL, 0, 0);
-        HWND colorLabel = CreateWindowW(L"STATIC", L"盒子背景色", WS_CHILD | WS_VISIBLE, 170, 188, 100, 24, hwnd, nullptr, nullptr, nullptr);
+        HWND colorLabel = CreateWindowW(L"STATIC", L"盒子背景色", WS_CHILD | WS_VISIBLE, 170, 266, 100, 24, hwnd, nullptr, nullptr, nullptr);
         g_themePage.push_back(colorLabel);
         SendMessageW(colorLabel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         for (int i = 0; i < 6; ++i) {
-            HWND swatch = CreateWindowW(L"BUTTON", L"  ", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 280 + i * 30, 184, 24, 24, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kColorBase + i)), nullptr, nullptr);
+            HWND swatch = CreateWindowW(L"BUTTON", L"  ", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 280 + i * 30, 262, 24, 24, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kColorBase + i)), nullptr, nullptr);
             g_themePage.push_back(swatch);
             SendMessageW(swatch, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         }
@@ -142,11 +181,12 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         wchar_t value[32]{};
         swprintf_s(value,L"%d%%",g_layout->opacity);
         SetWindowTextW(g_value,value);
+        UpdateCornerValue();
         HWND note=CreateWindowW(L"STATIC",L"即时预览 · 自动保存 · 图标与文字保持清晰",
-            WS_CHILD|WS_VISIBLE,170,270,330,24,hwnd,nullptr,nullptr,nullptr);
+            WS_CHILD|WS_VISIBLE,170,308,330,24,hwnd,nullptr,nullptr,nullptr);
         g_themePage.push_back(note);
         SendMessageW(note,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
-        HWND startup=CreateWindowW(L"BUTTON",L"开机后自动启动 nestlone-D",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,170,310,250,26,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStartup)),nullptr,nullptr);
+        HWND startup=CreateWindowW(L"BUTTON",L"开机后自动启动 nestlone-D",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,170,344,250,26,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStartup)),nullptr,nullptr);
         g_themePage.push_back(startup);
         SendMessageW(startup,BM_SETCHECK,StartupEnabled()?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(startup,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
@@ -180,6 +220,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         HWND backupHint=CreateWindowW(L"STATIC",L"每份备份保存当前盒子、分组、规则与桌面位置。",WS_CHILD|WS_VISIBLE,170,52,290,22,hwnd,nullptr,nullptr,nullptr);SendMessageW(backupHint,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(backupHint);
         g_backupList=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|LBS_NOTIFY|WS_VSCROLL,170,84,290,270,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBackupList)),nullptr,nullptr);SendMessageW(g_backupList,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(g_backupList);RefreshBackups();
         const int backupIds[]={kBackupCreate,kBackupApply,kBackupDelete};const wchar_t* backupLabels[]={L"立即备份",L"应用备份",L"删除备份"};for(int i=0;i<3;++i){HWND action=CreateWindowW(L"BUTTON",backupLabels[i],WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170+i*98,370,90,28,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(backupIds[i])),nullptr,nullptr);SendMessageW(action,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_backupPage.push_back(action);}
+        HWND aboutTitle=CreateWindowW(L"STATIC",L"关于 nestlone-D",WS_CHILD|WS_VISIBLE,170,20,260,30,hwnd,nullptr,nullptr,nullptr);SendMessageW(aboutTitle,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_aboutPage.push_back(aboutTitle);
+        HWND aboutVersion=CreateWindowW(L"STATIC",L"nestlone-D · Windows 桌面整理工具",WS_CHILD|WS_VISIBLE,170,62,290,24,hwnd,nullptr,nullptr,nullptr);SendMessageW(aboutVersion,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_aboutPage.push_back(aboutVersion);
+        HWND aboutDescription=CreateWindowW(L"STATIC",L"将桌面图标按盒子、分组与规则进行收纳。\r\n保留原生文件、快捷方式与桌面操作体验。",WS_CHILD|WS_VISIBLE,170,102,300,56,hwnd,nullptr,nullptr,nullptr);SendMessageW(aboutDescription,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_aboutPage.push_back(aboutDescription);
+        HWND repository=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170,188,180,48,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAboutRepository)),nullptr,nullptr);SendMessageW(repository,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_aboutPage.push_back(repository);
         // All page controls must exist before the first visibility pass.
         SelectPage(0);
         return 0;
@@ -196,10 +240,22 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             g_layout->opacity = static_cast<int>(SendMessageW(reinterpret_cast<HWND>(lParam), TBM_GETPOS, 0, 0));
             UpdateValue();
         }
+        if (reinterpret_cast<HWND>(lParam) && GetDlgCtrlID(reinterpret_cast<HWND>(lParam)) == kCornerSlider) {
+            g_layout->cornerRadius=static_cast<int>(SendMessageW(reinterpret_cast<HWND>(lParam),TBM_GETPOS,0,0));
+            UpdateCornerValue();
+        }
         return 0;
     case WM_DRAWITEM: {
         const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
-        if (draw && (draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kSidebarBackup || draw->CtlID == kAutoAdd || (draw->CtlID>=kBackupCreate&&draw->CtlID<=kBackupDelete) || draw->CtlID == IDCANCEL)) {
+        if(draw&&draw->CtlID==kAboutRepository) {
+            if(auto* logo=GitHubLogo()) {
+                Gdiplus::Graphics graphics(draw->hDC);graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                const int width=168,height=39,left=draw->rcItem.left+(draw->rcItem.right-draw->rcItem.left-width)/2,top=draw->rcItem.top+(draw->rcItem.bottom-draw->rcItem.top-height)/2;
+                graphics.DrawImage(logo,left,top,width,height);
+            }
+            return TRUE;
+        }
+        if (draw && (draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kSidebarBackup || draw->CtlID == kSidebarAbout || draw->CtlID == kAutoAdd || (draw->CtlID>=kBackupCreate&&draw->CtlID<=kBackupDelete) || draw->CtlID == IDCANCEL)) {
             HBRUSH brush=CreateSolidBrush(RGB(217,242,245));
             HPEN pen=CreatePen(PS_SOLID,1,RGB(190,224,230));
             auto ob=SelectObject(draw->hDC,brush); auto op=SelectObject(draw->hDC,pen);
@@ -209,7 +265,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             DeleteObject(brush); DeleteObject(pen);
             auto of=SelectObject(draw->hDC,g_font);
             SetBkMode(draw->hDC,TRANSPARENT); SetTextColor(draw->hDC,theme::title);
-            const wchar_t* caption=draw->CtlID==IDCANCEL?L"完成":draw->CtlID==kSidebarAuto?L"自动分类":draw->CtlID==kSidebarBackup?L"备份与还原":draw->CtlID==kAutoAdd?L"添加规则":draw->CtlID==kBackupCreate?L"立即备份":draw->CtlID==kBackupApply?L"应用备份":draw->CtlID==kBackupDelete?L"删除备份":L"主题设置";
+            const wchar_t* caption=draw->CtlID==IDCANCEL?L"完成":draw->CtlID==kSidebarAuto?L"自动分类":draw->CtlID==kSidebarBackup?L"备份与还原":draw->CtlID==kSidebarAbout?L"关于":draw->CtlID==kAutoAdd?L"添加规则":draw->CtlID==kBackupCreate?L"立即备份":draw->CtlID==kBackupApply?L"应用备份":draw->CtlID==kBackupDelete?L"删除备份":L"主题设置";
             RECT label=r; DrawTextW(draw->hDC,caption,-1,&label,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             if(draw->itemState & ODS_FOCUS) { InflateRect(&label,-3,-3); DrawFocusRect(draw->hDC,&label); }
             SelectObject(draw->hDC,of);
@@ -228,6 +284,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         if(LOWORD(wParam)==kSidebarTheme){SelectPage(0);return 0;}
         if(LOWORD(wParam)==kSidebarAuto){SelectPage(1);return 0;}
         if(LOWORD(wParam)==kSidebarBackup){SelectPage(2);return 0;}
+        if(LOWORD(wParam)==kSidebarAbout){SelectPage(3);return 0;}
+        if(LOWORD(wParam)==kAboutRepository){ShellExecuteW(hwnd,L"open",L"https://github.com/nestlone/nestlone-Desktop",nullptr,nullptr,SW_SHOWNORMAL);return 0;}
         if(LOWORD(wParam)==kStartup) {
             const bool enabled=SendMessageW(reinterpret_cast<HWND>(lParam),BM_GETCHECK,0,0)==BST_CHECKED;
             if(!SetStartupEnabled(enabled)) {
@@ -254,7 +312,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hwnd);
         return 0;
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_value = nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_backupList=nullptr;g_themePage.clear();g_autoPage.clear();g_backupPage.clear();g_layout = nullptr; return 0;
+    case WM_DESTROY: if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_value = nullptr; g_cornerValue=nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_backupList=nullptr;g_themePage.clear();g_autoPage.clear();g_backupPage.clear();g_aboutPage.clear();g_layout = nullptr; return 0;
     default: return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }

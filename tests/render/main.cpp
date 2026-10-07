@@ -9,6 +9,12 @@ int main() {
     layout.opacity=20;check(nestlone::RenderPixels(low.data(),320,240,layout),"render background at 20%");
     layout.opacity=100;check(nestlone::RenderPixels(high.data(),320,240,layout),"render background at 100%");
     check((low[150*320+100]>>24)==51 && (high[150*320+100]>>24)==255,"only background opacity is rendered");
+    layout.opacity=0;check(nestlone::RenderPixels(low.data(),320,240,layout),"render background at 0%");
+    check((low[150*320+100]>>24)==0,"zero opacity removes only the box background");
+    layout.opacity=100;layout.cornerRadius=0;check(nestlone::RenderPixels(low.data(),320,240,layout),"render square corners");
+    // GDI+ uses edge coverage at the exact rectangle boundary; test one pixel inside it.
+    check((low[21*320+21]>>24)==255,"zero corner setting fills the box corner");
+    layout.cornerRadius=12;
     layout.boxes[0].items={L"C:\\anything.lnk",L"::virtual-item"};
     nestlone::RenderPixels(withItems.data(),320,240,layout);
     check(withItems==high,"adding icons to a box never draws their pixels or labels");

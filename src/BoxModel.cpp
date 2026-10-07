@@ -163,7 +163,9 @@ Layout LoadLayout() {
     const std::wstring json = ToWide(bytes);
     if (json.empty()) return layout;
     long savedOpacity = layout.opacity;
-    if (ReadNumber(json, L"opacity", savedOpacity)) layout.opacity = static_cast<int>(std::clamp(savedOpacity, 20L, 100L));
+    if (ReadNumber(json, L"opacity", savedOpacity)) layout.opacity = static_cast<int>(std::clamp(savedOpacity, 0L, 100L));
+    long savedCornerRadius = layout.cornerRadius;
+    if (ReadNumber(json, L"cornerRadius", savedCornerRadius)) layout.cornerRadius = static_cast<int>(std::clamp(savedCornerRadius, 0L, 48L));
     long automatic = 0;
     if (ReadNumber(json, L"autoOrganize", automatic)) layout.autoOrganize = automatic != 0;
     size_t at = 0;
@@ -211,8 +213,9 @@ Layout LoadLayout() {
 bool SaveLayout(const Layout& layout) {
     const std::wstring path = LayoutPath();
     if (path.empty()) return false;
-    const int opacity = std::clamp(layout.opacity, 20, 100);
-    std::wstring json = L"{\"version\":6,\"opacity\":" + std::to_wstring(opacity) + L",\"autoOrganize\":" + std::to_wstring(layout.autoOrganize ? 1 : 0) + L",\"boxes\":[";
+    const int opacity = std::clamp(layout.opacity, 0, 100);
+    const int cornerRadius = std::clamp(layout.cornerRadius, 0, 48);
+    std::wstring json = L"{\"version\":7,\"opacity\":" + std::to_wstring(opacity) + L",\"cornerRadius\":" + std::to_wstring(cornerRadius) + L",\"autoOrganize\":" + std::to_wstring(layout.autoOrganize ? 1 : 0) + L",\"boxes\":[";
     for (size_t i = 0; i < layout.boxes.size(); ++i) {
         const Box& box = layout.boxes[i];
         if (i) json += L',';
