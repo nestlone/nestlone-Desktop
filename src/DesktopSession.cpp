@@ -39,6 +39,8 @@ struct Worker {
     DesktopSnapshot result;
 };
 auto state=std::make_shared<Worker>();
+ComPtr<IContextMenu2> backgroundMenu2;
+ComPtr<IContextMenu3> backgroundMenu3;
 }
 bool ShellBackgroundMenuAvailable() {
     ComPtr<IShellView> view;ComPtr<IContextMenu> menu;
@@ -55,7 +57,14 @@ bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint) {
     constexpr UINT first=1,last=0x7fff;
     bool shown=false;
     if(SUCCEEDED(menu->QueryContextMenu(popup,0,first,last,CMF_NORMAL))) {
+        // Explorer populates several desktop submenus only when they receive
+        // their WM_INITMENUPOPUP / owner-draw messages.  Our layered canvas is
+        // the menu owner, therefore retain the interfaces for the duration of
+        // TrackPopupMenuEx and forward those messages from DecorationProc.
+        backgroundMenu2.Reset();backgroundMenu3.Reset();
+        if(FAILED(menu.As(&backgroundMenu3)))menu.As(&backgroundMenu2);
         int command=TrackPopupMenuEx(popup,TPM_RETURNCMD|TPM_RIGHTBUTTON,screenPoint.x,screenPoint.y,owner,nullptr);
+        backgroundMenu3.Reset();backgroundMenu2.Reset();
         if(command>=static_cast<int>(first)) {
             CMINVOKECOMMANDINFOEX invoke{};invoke.cbSize=sizeof(invoke);invoke.fMask=CMIC_MASK_UNICODE;
             invoke.hwnd=owner;invoke.lpVerb=MAKEINTRESOURCEA(command-first);invoke.lpVerbW=MAKEINTRESOURCEW(command-first);invoke.nShow=SW_SHOWNORMAL;
@@ -63,6 +72,19 @@ bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint) {
         } else shown=true;
     }
     DestroyMenu(popup);return shown;
+}
+bool ForwardShellContextMenuMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT* result) {
+    if(message!=WM_INITMENUPOPUP&&message!=WM_DRAWITEM&&message!=WM_MEASUREITEM&&message!=WM_MENUCHAR)return false;
+    if(backgroundMenu3) {
+        LRESULT value=0;
+        if(SUCCEEDED(backgroundMenu3->HandleMenuMsg2(message,wParam,lParam,&value))) {
+            if(result)*result=value;return true;
+        }
+    }
+    if(backgroundMenu2&&SUCCEEDED(backgroundMenu2->HandleMenuMsg(message,wParam,lParam))) {
+        if(result)*result=0;return true;
+    }
+    return false;
 }
 
 bool ReadDesktop(DesktopSnapshot& result) {

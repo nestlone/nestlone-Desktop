@@ -22,9 +22,11 @@ Layout* g_layout=nullptr;
 HWND g_manager=nullptr,g_background=nullptr,g_edit=nullptr;
 HINSTANCE g_instance=nullptr;
 ULONG_PTR g_token=0;
+HHOOK g_keyboardHook=nullptr;
 bool g_visible=true,g_drag=false,g_resizing=false,g_resizeFromLeft=false,g_tabPending=false,g_tabDetached=false,g_nativeHidden=false;
 bool g_interactivePaintQueued=false;
 bool g_visualGeometryDirty=false;
+int g_shellRefreshAttempts=0;
 HWND g_dragPreview=nullptr;
 std::wstring g_previewGroup,g_renderOnlyGroup;
 void EndDragPreview();
@@ -57,11 +59,13 @@ bool g_marquee=false,g_marqueeMoved=false,g_marqueeCtrl=false,g_marqueeShift=fal
 POINT g_marqueeStart{};
 RECT g_marqueeRect{};
 std::vector<std::wstring> g_selectionStart;
+std::vector<std::wstring> g_pendingDelete;
 bool g_visualDirty=true;
 void CancelIconGesture();
 void RebuildVisualIcons();
 void RefreshVisualGeometry();
 void DrawVisualIcons(Gdiplus::Graphics&);
+LRESULT CALLBACK KeyboardProc(int code,WPARAM wParam,LPARAM lParam);
 constexpr int kHeader=32;
 int HeaderHeight(){return MulDiv(kHeader,static_cast<int>(g_host.listview?GetDpiForWindow(g_host.listview):96),96);}
 Box* FindBox(const std::wstring& id) {
@@ -331,9 +335,17 @@ void PaintAll() {
 // full layered desktop.  Keep only the latest geometry and present it at a
 // display-friendly cadence; mouse-up always flushes immediately.
 constexpr UINT_PTR kInteractivePaintTimer=2;
+constexpr UINT_PTR kShellRefreshTimer=3;
 void QueueInteractivePaint() {
     if(!g_manager||g_interactivePaintQueued)return;
     g_interactivePaintQueued=true;SetTimer(g_manager,kInteractivePaintTimer,16,nullptr);
+}
+bool SnapshotVisualsChanged(const DesktopSnapshot& before,const DesktopSnapshot& after) {
+    if(before.entries.size()!=after.entries.size() || before.iconSize!=after.iconSize ||
+       before.spacing.x!=after.spacing.x || before.spacing.y!=after.spacing.y ||
+       before.iconMode!=after.iconMode)return true;
+    for(const auto& entry:after.entries)if(!FindEntry(before,entry.path))return true;
+    return false;
 }
 void FlushInteractivePaint() {
     if(g_interactivePaintQueued&&g_manager)KillTimer(g_manager,kInteractivePaintTimer);
@@ -716,6 +728,36 @@ void ClearSelections() {
     for(auto& box:g_layout->boxes)box.selected=false;
     g_focusIcon=-1;
 }
+bool DesktopPointerActive() {
+    if(!g_background||!IsWindowVisible(g_background))return false;
+    POINT cursor{};GetCursorPos(&cursor);
+    HWND underCursor=WindowFromPoint(cursor);
+    return underCursor==g_background||IsChild(g_background,underCursor);
+}
+void RequestDeleteSelection() {
+    if(!g_pendingDelete.empty())return;
+    for(const auto& item:g_visualIcons)if(item.selected&&GetFileAttributesW(item.path.c_str())!=INVALID_FILE_ATTRIBUTES)g_pendingDelete.push_back(item.path);
+    if(!g_pendingDelete.empty())PostMessageW(g_manager,WM_APP+13,0,0);
+}
+void DeleteSelection() {
+    std::vector<std::wstring> paths=std::move(g_pendingDelete);g_pendingDelete.clear();
+    if(paths.empty())return;
+    std::wstring source;for(const auto& path:paths){source+=path;source.push_back(L'\0');}source.push_back(L'\0');
+    SHFILEOPSTRUCTW operation{};operation.hwnd=g_background;operation.wFunc=FO_DELETE;operation.pFrom=source.c_str();operation.fFlags=FOF_ALLOWUNDO|FOF_WANTNUKEWARNING;
+    if(SHFileOperationW(&operation)==0&&!operation.fAnyOperationsAborted)PostMessageW(g_manager,WM_APP+12,0,0);
+}
+LRESULT CALLBACK KeyboardProc(int code,WPARAM wParam,LPARAM lParam) {
+    if(code==HC_ACTION&&(wParam==WM_KEYDOWN||wParam==WM_SYSKEYDOWN)&&!g_edit&&g_visible&&DesktopPointerActive()) {
+        const auto* key=reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        const bool deleteKey=key->vkCode==VK_DELETE;
+        const bool ctrlD=key->vkCode=='D'&&(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
+        if(deleteKey||ctrlD) {
+            RequestDeleteSelection();
+            if(!g_pendingDelete.empty())return 1;
+        }
+    }
+    return CallNextHookEx(g_keyboardHook,code,wParam,lParam);
+}
 void UpdateMarquee(POINT point) {
     g_marqueeRect={min(g_marqueeStart.x,point.x),min(g_marqueeStart.y,point.y),max(g_marqueeStart.x,point.x),max(g_marqueeStart.y,point.y)};
     g_marqueeMoved=abs(point.x-g_marqueeStart.x)>=4||abs(point.y-g_marqueeStart.y)>=4;
@@ -860,6 +902,8 @@ void Menu(HWND hwnd,Box& box,POINT point) {
     if(command==5){auto id=box.id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}
 }
 LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
+    LRESULT shellResult=0;
+    if(ForwardShellContextMenuMessage(message,wp,lp,&shellResult))return shellResult;
     if(message==WM_NCDESTROY)g_paintBuffers.erase(hwnd);
     if(message==WM_NCCREATE){auto c=reinterpret_cast<CREATESTRUCTW*>(lp);SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(c->lpCreateParams));}
     auto* d=reinterpret_cast<Decoration*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
@@ -892,7 +936,7 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             else {
                 POINT virtualPoint{screen.x-GetSystemMetrics(SM_XVIRTUALSCREEN),screen.y-GetSystemMetrics(SM_YVIRTUALSCREEN)};bool boxHit=false;
                 for(auto& candidate:g_layout->boxes){RECT bounds=DisplayRect(candidate);if(PtInRect(&bounds,virtualPoint)){Menu(hwnd,candidate,screen);boxHit=true;break;}}
-                if(!boxHit)ShowShellBackgroundMenu(hwnd,screen);
+                if(!boxHit&&ShowShellBackgroundMenu(hwnd,screen))PostMessageW(g_manager,WM_APP+12,0,0);
             }
             return 0;
         }
@@ -1011,11 +1055,32 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
 LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     if(message==WM_APP+10){FinishRename(true);return 0;}
     if(message==WM_APP+11){Rebuild();return 0;}
+    if(message==WM_APP+13){DeleteSelection();return 0;}
+    if(message==WM_APP+12){
+        // Explorer may commit a background-menu command (New, View size,
+        // Refresh) after the menu closes. Poll briefly so the owned canvas
+        // receives the same change notification it would have received from
+        // Explorer's visible ListView.
+        g_shellRefreshAttempts=10;SetTimer(hwnd,kShellRefreshTimer,120,nullptr);return 0;
+    }
     if(message==WM_TIMER&&wp==kInteractivePaintTimer) {
         KillTimer(hwnd,kInteractivePaintTimer);g_interactivePaintQueued=false;
         if(g_visible){
             if(g_drag)PaintAll();
             else if((g_marquee||g_iconDrag>=0)&&g_background)PaintWindow(g_background);
+        }
+        return 0;
+    }
+    if(message==WM_TIMER&&wp==kShellRefreshTimer) {
+        if(!g_visible||g_shellRefreshAttempts--<=0){KillTimer(hwnd,kShellRefreshTimer);return 0;}
+        DesktopSnapshot next;
+        if(PollDesktop(next)&&next.readable) {
+            const bool changed=SnapshotVisualsChanged(g_snapshot,next);
+            g_snapshot=std::move(next);
+            if(changed)g_iconCache.clear();
+            // Force an owned-canvas redraw even for a shell command whose
+            // result has the same item count, such as a view-size change.
+            g_visualDirty=true;PaintAll();
         }
         return 0;
     }
@@ -1034,10 +1099,9 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                 if(!g_nativeHidden && !settling && !g_drag && !(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000))Observe(g_snapshot,next);
                 // Keep the pre-drag baseline until Explorer has finished native drag/drop.
                 if(!(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000)){
-                    bool resourcesChanged=g_snapshot.entries.size()!=next.entries.size() || g_snapshot.iconSize!=next.iconSize || g_snapshot.spacing.x!=next.spacing.x || g_snapshot.spacing.y!=next.spacing.y || g_snapshot.iconMode!=next.iconMode;
-                    if(!resourcesChanged)for(const auto& entry:next.entries)if(!FindEntry(g_snapshot,entry.path)){resourcesChanged=true;break;}
+                    bool resourcesChanged=SnapshotVisualsChanged(g_snapshot,next);
                     g_snapshot=std::move(next);
-                    if(g_nativeHidden&&resourcesChanged){g_visualDirty=true;PaintAll();}
+                    if(g_nativeHidden&&resourcesChanged){g_iconCache.clear();g_visualDirty=true;PaintAll();}
                 }
             }
         }
@@ -1054,10 +1118,12 @@ bool CreateCanvas(HINSTANCE instance,HWND,Layout* layout) {
     wc.lpfnWndProc=ManagerProc;wc.lpszClassName=L"nestlone-D.PositionRules";RegisterClassW(&wc);
     g_manager=CreateWindowExW(WS_EX_TOOLWINDOW,wc.lpszClassName,L"",WS_POPUP,0,0,0,0,nullptr,nullptr,instance,nullptr);
     if(!g_manager)return false;
+    g_keyboardHook=SetWindowsHookExW(WH_KEYBOARD_LL,KeyboardProc,instance,0);
     SetTimer(g_manager,1,350,nullptr);Attach();PollDesktop(g_snapshot);return true;
 }
 void DestroyCanvas() {
     CancelDesktopMoves();DestroyDecorations();if(g_manager)DestroyWindow(g_manager);g_manager=nullptr;
+    if(g_keyboardHook){UnhookWindowsHookEx(g_keyboardHook);g_keyboardHook=nullptr;}
     g_interactivePaintQueued=false;g_paintBuffers.clear();g_iconCache.clear();
     if(g_editFont){DeleteObject(g_editFont);g_editFont=nullptr;}
     if(g_token){Gdiplus::GdiplusShutdown(g_token);g_token=0;}

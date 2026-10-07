@@ -28,6 +28,9 @@ struct DesktopMove {std::wstring path; POINT position;};
 bool ReadDesktop(DesktopSnapshot& result);
 bool ShellBackgroundMenuAvailable();
 bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint);
+// The custom canvas owns the popup, so it must forward Shell's lazy submenu
+// messages (notably the desktop "New" menu) while the popup is active.
+bool ForwardShellContextMenuMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT* result);
 // Coalesced requests are handled on a COM worker, never on the painting thread.
 uint64_t QueueDesktopMoves(const std::vector<DesktopMove>& moves);
 bool PollDesktop(DesktopSnapshot& result);
