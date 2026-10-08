@@ -26,8 +26,24 @@ struct Layout {
     std::vector<Box> boxes;
     int opacity{88}; // 0..100, shared canvas background opacity
     int cornerRadius{12}; // 0..48, shared box corner diameter at 96 DPI
+    int defaultBoxWidth{360};
+    int defaultBoxHeight{320};
+    COLORREF defaultBoxColor{RGB(184, 235, 238)};
+    std::wstring fontFamily{L"Microsoft YaHei UI"};
     struct Placement { std::wstring path; POINT point; };
     std::vector<Placement> desktop;
+    struct Widget {
+        std::wstring id;
+        std::wstring type; // note | weather
+        RECT rect{120, 120, 380, 300};
+        std::wstring text;
+        std::wstring city{L"北京"};
+        std::wstring weather;
+        std::wstring weatherIcon{L"999"};
+        int temperature{0};
+        bool locked{false};
+    };
+    std::vector<Widget> widgets;
     struct AutoRule { std::wstring boxId; bool folders{false}; std::wstring extensions; };
     bool autoOrganize{false};
     std::vector<AutoRule> autoRules;

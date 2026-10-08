@@ -2,3 +2,5 @@
 
 IDI_NESTLONE ICON "..\\assets\\nestlone.ico"
 IDB_GITHUB_LOGO RCDATA "..\\assets\\github-logo.png"
+IDR_QWEATHER_FONT RCDATA "..\\assets\\qweather-icons.ttf"
+IDR_QWEATHER_CSS RCDATA "..\\assets\\qweather-icons.css"

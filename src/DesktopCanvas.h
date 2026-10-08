@@ -3,7 +3,7 @@
 #include "BoxModel.h"
 
 namespace nestlone {
-enum class CanvasCommand { Toggle, NewBox, Reload, Exit };
+enum class CanvasCommand { Toggle, NewBox, NewNote, NewWeather, ClearWidgets, Reload, Exit };
 bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout);
 void DestroyCanvas();
 void HandleCanvasCommand(CanvasCommand command);

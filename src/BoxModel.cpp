@@ -166,6 +166,11 @@ Layout LoadLayout() {
     if (ReadNumber(json, L"opacity", savedOpacity)) layout.opacity = static_cast<int>(std::clamp(savedOpacity, 0L, 100L));
     long savedCornerRadius = layout.cornerRadius;
     if (ReadNumber(json, L"cornerRadius", savedCornerRadius)) layout.cornerRadius = static_cast<int>(std::clamp(savedCornerRadius, 0L, 48L));
+    long savedWidth = layout.defaultBoxWidth, savedHeight = layout.defaultBoxHeight, savedColor = static_cast<long>(layout.defaultBoxColor);
+    if (ReadNumber(json, L"defaultBoxWidth", savedWidth)) layout.defaultBoxWidth = static_cast<int>(std::clamp(savedWidth, 240L, 800L));
+    if (ReadNumber(json, L"defaultBoxHeight", savedHeight)) layout.defaultBoxHeight = static_cast<int>(std::clamp(savedHeight, 160L, 800L));
+    if (ReadNumber(json, L"defaultBoxColor", savedColor)) layout.defaultBoxColor = static_cast<COLORREF>(savedColor);
+    ReadString(json, L"fontFamily", layout.fontFamily);
     long automatic = 0;
     if (ReadNumber(json, L"autoOrganize", automatic)) layout.autoOrganize = automatic != 0;
     size_t at = 0;
@@ -207,6 +212,17 @@ Layout LoadLayout() {
             layout.autoRules.push_back(std::move(rule));
         }
     }
+    at=0;
+    while((at=json.find(L"{\"widgetId\":",at))!=std::wstring::npos) {
+        size_t next=at;const auto object=ObjectAt(json,at,next);at=next;
+        Layout::Widget widget;long left=0,top=0,right=0,bottom=0,temperature=0,locked=0;
+        if(!ReadString(object,L"widgetId",widget.id)||!ReadString(object,L"type",widget.type)||
+           !ReadNumber(object,L"left",left)||!ReadNumber(object,L"top",top)||!ReadNumber(object,L"right",right)||!ReadNumber(object,L"bottom",bottom)||right-left<120||bottom-top<80)continue;
+        widget.rect={left,top,right,bottom};ReadString(object,L"text",widget.text);ReadString(object,L"city",widget.city);ReadString(object,L"weather",widget.weather);ReadString(object,L"weatherIcon",widget.weatherIcon);
+        if(ReadNumber(object,L"temperature",temperature))widget.temperature=static_cast<int>(temperature);
+        if(ReadNumber(object,L"locked",locked))widget.locked=locked!=0;
+        if(widget.type==L"note"||widget.type==L"weather")layout.widgets.push_back(std::move(widget));
+    }
     return layout;
 }
 
@@ -215,7 +231,8 @@ bool SaveLayout(const Layout& layout) {
     if (path.empty()) return false;
     const int opacity = std::clamp(layout.opacity, 0, 100);
     const int cornerRadius = std::clamp(layout.cornerRadius, 0, 48);
-    std::wstring json = L"{\"version\":7,\"opacity\":" + std::to_wstring(opacity) + L",\"cornerRadius\":" + std::to_wstring(cornerRadius) + L",\"autoOrganize\":" + std::to_wstring(layout.autoOrganize ? 1 : 0) + L",\"boxes\":[";
+    const int defaultWidth = std::clamp(layout.defaultBoxWidth, 240, 800), defaultHeight = std::clamp(layout.defaultBoxHeight, 160, 800);
+    std::wstring json = L"{\"version\":9,\"opacity\":" + std::to_wstring(opacity) + L",\"cornerRadius\":" + std::to_wstring(cornerRadius) + L",\"defaultBoxWidth\":" + std::to_wstring(defaultWidth) + L",\"defaultBoxHeight\":" + std::to_wstring(defaultHeight) + L",\"defaultBoxColor\":" + std::to_wstring(static_cast<unsigned long>(layout.defaultBoxColor)) + L",\"fontFamily\":\"" + Escape(layout.fontFamily) + L"\",\"autoOrganize\":" + std::to_wstring(layout.autoOrganize ? 1 : 0) + L",\"boxes\":[";
     for (size_t i = 0; i < layout.boxes.size(); ++i) {
         const Box& box = layout.boxes[i];
         if (i) json += L',';
@@ -231,6 +248,8 @@ bool SaveLayout(const Layout& layout) {
     }
     json += L"],\"autoRules\":[";
     for(size_t i=0;i<layout.autoRules.size();++i) { if(i)json+=L',';const auto& rule=layout.autoRules[i];json+=L"{\"ruleBox\":\""+Escape(rule.boxId)+L"\",\"folders\":"+std::to_wstring(rule.folders?1:0)+L",\"extensions\":\""+Escape(rule.extensions)+L"\"}"; }
+    json += L"],\"widgets\":[";
+    for(size_t i=0;i<layout.widgets.size();++i) {if(i)json+=L',';const auto& widget=layout.widgets[i];json+=L"{\"widgetId\":\""+Escape(widget.id)+L"\",\"type\":\""+Escape(widget.type)+L"\",\"left\":"+std::to_wstring(widget.rect.left)+L",\"top\":"+std::to_wstring(widget.rect.top)+L",\"right\":"+std::to_wstring(widget.rect.right)+L",\"bottom\":"+std::to_wstring(widget.rect.bottom)+L",\"text\":\""+Escape(widget.text)+L"\",\"city\":\""+Escape(widget.city)+L"\",\"weather\":\""+Escape(widget.weather)+L"\",\"weatherIcon\":\""+Escape(widget.weatherIcon)+L"\",\"temperature\":"+std::to_wstring(widget.temperature)+L",\"locked\":"+std::to_wstring(widget.locked?1:0)+L"}";}
     json += L"]}";
     const std::wstring temporary = path + L".tmp";
     if (!WriteUtf8(temporary, ToUtf8(json))) return false;

@@ -50,3 +50,5 @@ nestlone-D 不移动文件、不改写隐藏属性、不修改壁纸或全局桌
 ## Credit
 
 First introduced on the [LINUX DO](https://linux.do/) community — thanks to everyone there for the first round of discussion.
+
+Weather icons: [QWeather Icons](https://icons.qweather.com/), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

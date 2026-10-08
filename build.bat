@@ -36,7 +36,7 @@ if errorlevel 1 (echo [BUILD] resource compilation failed & popd & exit /b 1)
 cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W4 /DUNICODE /D_UNICODE %EXTRA% ^
    /Fo"%OBJDIR%\\" /Fe"%OUTDIR%\%OUTNAME%" "%SRCDIR%\*.cpp" ^
    "%OBJDIR%\DeskBox.res" /link /SUBSYSTEM:WINDOWS /INCREMENTAL:NO /MANIFEST:EMBED /MANIFESTINPUT:"%~dp0src\compatibility.xml" ^
-   user32.lib shell32.lib shlwapi.lib gdiplus.lib gdi32.lib ole32.lib oleaut32.lib comctl32.lib advapi32.lib
+   user32.lib shell32.lib shlwapi.lib gdiplus.lib gdi32.lib ole32.lib oleaut32.lib comctl32.lib advapi32.lib winhttp.lib locationapi.lib
 set RC=%errorlevel%
 popd
 if not "%RC%"=="0" (echo [BUILD] FAILED rc=%RC% & exit /b %RC%)

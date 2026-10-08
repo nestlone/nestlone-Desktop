@@ -19,13 +19,20 @@ constexpr int kValue = 2002;
 constexpr int kStartup = 2003;
 constexpr int kCornerSlider = 2004;
 constexpr int kCornerValue = 2005;
+constexpr int kDefaultWidth = 2006;
+constexpr int kDefaultHeight = 2007;
+constexpr int kFontFamily = 2008;
 constexpr int kBoxSelect = 2100;
 constexpr int kColorBase = 2110;
 constexpr int kSidebarTheme = 2201;
 constexpr int kSidebarAuto = 2202;
 constexpr int kSidebarBackup = 2203;
 constexpr int kSidebarAbout = 2204;
+constexpr int kSidebarWidgets = 2205;
 constexpr int kAboutRepository = 2501;
+constexpr int kWidgetNote = 2601;
+constexpr int kWidgetWeather = 2602;
+constexpr int kWidgetClear = 2603;
 constexpr int kBackupList = 2401;
 constexpr int kBackupCreate = 2402;
 constexpr int kBackupApply = 2403;
@@ -37,18 +44,24 @@ constexpr int kAutoBox = 2304;
 constexpr int kAutoAdd = 2305;
 constexpr int kAutoRules = 2306;
 constexpr int kDefaultBoxBase = 2310;
+constexpr int kDefaultColorBase = 2130;
 HFONT g_font = nullptr;
 HBRUSH g_surface = nullptr;
 HWND g_window = nullptr;
 HWND g_value = nullptr;
 HWND g_cornerValue = nullptr;
+HWND g_defaultWidth = nullptr;
+HWND g_defaultHeight = nullptr;
+HWND g_fontFamily = nullptr;
 HWND g_boxSelect = nullptr;
 HWND g_autoBox = nullptr;
 HWND g_autoExtensions = nullptr;
 HWND g_autoRules = nullptr;
 HWND g_backupList = nullptr;
+HWND g_close = nullptr;
+HWND g_sidebarAbout = nullptr;
 Layout* g_layout = nullptr;
-std::vector<HWND> g_themePage,g_autoPage,g_backupPage,g_aboutPage;
+std::vector<HWND> g_themePage,g_autoPage,g_backupPage,g_aboutPage,g_widgetsPage;
 std::unique_ptr<Gdiplus::Bitmap> g_githubLogo;
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"nestlone-D";
@@ -93,6 +106,8 @@ void SelectPage(int page) {
     for(HWND control:g_autoPage)ShowWindow(control,page==1?SW_SHOW:SW_HIDE);
     for(HWND control:g_backupPage)ShowWindow(control,page==2?SW_SHOW:SW_HIDE);
     for(HWND control:g_aboutPage)ShowWindow(control,page==3?SW_SHOW:SW_HIDE);
+    for(HWND control:g_widgetsPage)ShowWindow(control,page==4?SW_SHOW:SW_HIDE);
+    if(g_window)InvalidateRect(g_window,nullptr,TRUE);
 }
 std::filesystem::path BackupDirectory(){auto path=std::filesystem::path(LayoutPath()).parent_path()/L"backups";std::error_code error;std::filesystem::create_directories(path,error);return path;}
 std::wstring BackupStamp(){SYSTEMTIME t{};GetLocalTime(&t);wchar_t value[32]{};swprintf_s(value,L"%04u%02u%02u%02u%02u%02u",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond);return value;}
@@ -125,9 +140,36 @@ void UpdateCornerValue() {
     SaveLayout(*g_layout);
     CanvasSetOpacity(g_layout->opacity);
 }
+void UpdateDefaultBoxMetrics() {
+    if(!g_layout||!g_defaultWidth||!g_defaultHeight)return;
+    wchar_t value[32]{};GetWindowTextW(g_defaultWidth,value,32);g_layout->defaultBoxWidth=std::clamp(_wtoi(value),240,800);
+    swprintf_s(value,L"%d",g_layout->defaultBoxWidth);SetWindowTextW(g_defaultWidth,value);
+    GetWindowTextW(g_defaultHeight,value,32);g_layout->defaultBoxHeight=std::clamp(_wtoi(value),160,800);
+    swprintf_s(value,L"%d",g_layout->defaultBoxHeight);SetWindowTextW(g_defaultHeight,value);
+    SaveLayout(*g_layout);
+}
 
 LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_GETMINMAXINFO: {
+        auto* info=reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize={540,590};
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};HDC dc=BeginPaint(hwnd,&paint);RECT client{};GetClientRect(hwnd,&client);
+        HBRUSH base=CreateSolidBrush(RGB(247,250,252));FillRect(dc,&client,base);DeleteObject(base);
+        RECT navigation{0,0,144,client.bottom};HBRUSH nav=CreateSolidBrush(RGB(230,242,247));FillRect(dc,&navigation,nav);DeleteObject(nav);
+        RECT content{156,12,client.right-14,client.bottom-14};HBRUSH card=CreateSolidBrush(RGB(255,255,255));FillRect(dc,&content,card);DeleteObject(card);
+        HPEN pen=CreatePen(PS_SOLID,1,RGB(211,226,232));HGDIOBJ old=SelectObject(dc,pen);MoveToEx(dc,144,16,nullptr);LineTo(dc,144,client.bottom-16);SelectObject(dc,old);DeleteObject(pen);
+        EndPaint(hwnd,&paint);return 0;
+    }
+    case WM_SIZE: {
+        if(g_close)SetWindowPos(g_close,nullptr,max(156,LOWORD(lParam)-172),max(20,HIWORD(lParam)-70),92,30,SWP_NOZORDER|SWP_NOACTIVATE);
+        if(g_sidebarAbout)SetWindowPos(g_sidebarAbout,nullptr,12,max(264,HIWORD(lParam)-54),116,34,SWP_NOZORDER|SWP_NOACTIVATE);
+        InvalidateRect(hwnd,nullptr,TRUE);
+        return 0;
+    }
     case WM_CREATE: {
         HFONT font = g_font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
         HWND sidebar = CreateWindowW(L"STATIC", L"nestlone-D", WS_CHILD | WS_VISIBLE, 20, 24, 120, 28, hwnd, nullptr, nullptr, nullptr);
@@ -137,7 +179,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         HWND automatic = CreateWindowW(L"BUTTON", L"自动分类", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 12, 100, 116, 34, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarAuto)), nullptr, nullptr);
         SendMessageW(automatic, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         HWND backup=CreateWindowW(L"BUTTON",L"备份与还原",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,12,140,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarBackup)),nullptr,nullptr);SendMessageW(backup,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
-        HWND about=CreateWindowW(L"BUTTON",L"关于",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,12,180,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarAbout)),nullptr,nullptr);SendMessageW(about,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND widgets=CreateWindowW(L"BUTTON",L"组件",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,12,180,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarWidgets)),nullptr,nullptr);SendMessageW(widgets,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        g_sidebarAbout=CreateWindowW(L"BUTTON",L"关于",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,12,536,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarAbout)),nullptr,nullptr);SendMessageW(g_sidebarAbout,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND title = CreateWindowW(L"STATIC", L"主题设置", WS_CHILD | WS_VISIBLE, 170, 20, 250, 28, hwnd, nullptr, nullptr, nullptr);
         g_themePage.push_back(title);
         SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -174,8 +217,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             g_themePage.push_back(swatch);
             SendMessageW(swatch, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         }
-        HWND close = CreateWindowW(L"BUTTON", L"完成", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 368, 430, 92, 30, hwnd, reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
-        SendMessageW(close, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        g_close = CreateWindowW(L"BUTTON", L"完成", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 368, 510, 92, 30, hwnd, reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
+        SendMessageW(g_close, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         SendMessageW(g_boxSelect, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         g_selectedBox = 0;
         wchar_t value[32]{};
@@ -190,6 +233,14 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         g_themePage.push_back(startup);
         SendMessageW(startup,BM_SETCHECK,StartupEnabled()?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(startup,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND defaultSize=CreateWindowW(L"STATIC",L"新建盒子默认尺寸",WS_CHILD|WS_VISIBLE,170,382,140,24,hwnd,nullptr,nullptr,nullptr);g_themePage.push_back(defaultSize);SendMessageW(defaultSize,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        g_defaultWidth=CreateWindowW(L"EDIT",std::to_wstring(g_layout->defaultBoxWidth).c_str(),WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL,310,378,64,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultWidth)),nullptr,nullptr);g_themePage.push_back(g_defaultWidth);SendMessageW(g_defaultWidth,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND by=CreateWindowW(L"STATIC",L"×",WS_CHILD|WS_VISIBLE,380,382,18,24,hwnd,nullptr,nullptr,nullptr);g_themePage.push_back(by);SendMessageW(by,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        g_defaultHeight=CreateWindowW(L"EDIT",std::to_wstring(g_layout->defaultBoxHeight).c_str(),WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL,400,378,64,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultHeight)),nullptr,nullptr);g_themePage.push_back(g_defaultHeight);SendMessageW(g_defaultHeight,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        HWND defaultColor=CreateWindowW(L"STATIC",L"默认配色",WS_CHILD|WS_VISIBLE,170,418,90,24,hwnd,nullptr,nullptr,nullptr);g_themePage.push_back(defaultColor);SendMessageW(defaultColor,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        for(int i=0;i<6;++i){HWND swatch=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,260+i*30,414,24,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDefaultColorBase+i)),nullptr,nullptr);g_themePage.push_back(swatch);}
+        HWND fontLabel=CreateWindowW(L"STATIC",L"图标与标题字体",WS_CHILD|WS_VISIBLE,170,456,120,24,hwnd,nullptr,nullptr,nullptr);g_themePage.push_back(fontLabel);SendMessageW(fontLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
+        g_fontFamily=CreateWindowW(L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,300,452,164,120,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontFamily)),nullptr,nullptr);g_themePage.push_back(g_fontFamily);for(const wchar_t* face:{L"Microsoft YaHei UI",L"Segoe UI",L"SimSun"})SendMessageW(g_fontFamily,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(face));int faceIndex=0;if(g_layout->fontFamily==L"Segoe UI")faceIndex=1;else if(g_layout->fontFamily==L"SimSun")faceIndex=2;SendMessageW(g_fontFamily,CB_SETCURSEL,faceIndex,0);SendMessageW(g_fontFamily,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND autoTitle=CreateWindowW(L"STATIC",L"自动分类",WS_CHILD|WS_VISIBLE,170,20,180,24,hwnd,nullptr,nullptr,nullptr);
         g_autoPage.push_back(autoTitle);
         SendMessageW(autoTitle,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
@@ -224,6 +275,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         HWND aboutVersion=CreateWindowW(L"STATIC",L"nestlone-D · Windows 桌面整理工具",WS_CHILD|WS_VISIBLE,170,62,290,24,hwnd,nullptr,nullptr,nullptr);SendMessageW(aboutVersion,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_aboutPage.push_back(aboutVersion);
         HWND aboutDescription=CreateWindowW(L"STATIC",L"将桌面图标按盒子、分组与规则进行收纳。\r\n保留原生文件、快捷方式与桌面操作体验。",WS_CHILD|WS_VISIBLE,170,102,300,56,hwnd,nullptr,nullptr,nullptr);SendMessageW(aboutDescription,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_aboutPage.push_back(aboutDescription);
         HWND repository=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170,188,180,48,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAboutRepository)),nullptr,nullptr);SendMessageW(repository,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_aboutPage.push_back(repository);
+        HWND widgetsTitle=CreateWindowW(L"STATIC",L"组件",WS_CHILD|WS_VISIBLE,170,20,180,28,hwnd,nullptr,nullptr,nullptr);SendMessageW(widgetsTitle,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_widgetsPage.push_back(widgetsTitle);
+        HWND noteWidget=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170,66,132,170,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kWidgetNote)),nullptr,nullptr);SendMessageW(noteWidget,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_widgetsPage.push_back(noteWidget);
+        HWND weatherWidget=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,316,66,132,170,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kWidgetWeather)),nullptr,nullptr);SendMessageW(weatherWidget,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_widgetsPage.push_back(weatherWidget);
+        HWND clearWidgets=CreateWindowW(L"BUTTON",L"清除全部组件",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170,252,278,30,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kWidgetClear)),nullptr,nullptr);SendMessageW(clearWidgets,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_widgetsPage.push_back(clearWidgets);
         // All page controls must exist before the first visibility pass.
         SelectPage(0);
         return 0;
@@ -232,8 +287,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     case WM_CTLCOLORBTN: {
         HDC dc=reinterpret_cast<HDC>(wParam);
         SetTextColor(dc,theme::title);
-        SetBkColor(dc,RGB(246,250,252));
-        return reinterpret_cast<LRESULT>(g_surface);
+        SetBkMode(dc,TRANSPARENT);
+        return reinterpret_cast<LRESULT>(GetStockObject(HOLLOW_BRUSH));
     }
     case WM_HSCROLL:
         if (reinterpret_cast<HWND>(lParam) && GetDlgCtrlID(reinterpret_cast<HWND>(lParam)) == kSlider) {
@@ -247,6 +302,14 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     case WM_DRAWITEM: {
         const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if(draw&&(draw->CtlID==kWidgetNote||draw->CtlID==kWidgetWeather)) {
+            const RECT r=draw->rcItem;const bool note=draw->CtlID==kWidgetNote;
+            const COLORREF body=note?RGB(255,247,190):RGB(215,241,248),header=note?RGB(246,220,122):RGB(157,216,231),border=note?RGB(227,193,82):RGB(111,193,213);
+            HBRUSH brush=CreateSolidBrush(body);HPEN pen=CreatePen(PS_SOLID,1,border);HGDIOBJ oldBrush=SelectObject(draw->hDC,brush),oldPen=SelectObject(draw->hDC,pen);RoundRect(draw->hDC,r.left,r.top,r.right,r.bottom,16,16);SelectObject(draw->hDC,oldBrush);SelectObject(draw->hDC,oldPen);DeleteObject(brush);DeleteObject(pen);
+            HBRUSH head=CreateSolidBrush(header);RECT top{r.left+1,r.top+1,r.right-1,r.top+32};FillRect(draw->hDC,&top,head);DeleteObject(head);SetBkMode(draw->hDC,TRANSPARENT);SetTextColor(draw->hDC,RGB(25,49,60));HFONT old=static_cast<HFONT>(SelectObject(draw->hDC,g_font));
+            if(note){HPEN line=CreatePen(PS_SOLID,2,RGB(182,139,50));HGDIOBJ oldLine=SelectObject(draw->hDC,line);for(int y=r.top+56;y<r.top+112;y+=18){MoveToEx(draw->hDC,r.left+24,y,nullptr);LineTo(draw->hDC,r.right-24,y);}SelectObject(draw->hDC,oldLine);DeleteObject(line);}else{HBRUSH sun=CreateSolidBrush(RGB(255,201,78));Ellipse(draw->hDC,r.left+40,r.top+55,r.left+80,r.top+95);DeleteObject(sun);HBRUSH cloud=CreateSolidBrush(RGB(255,255,255));Ellipse(draw->hDC,r.left+58,r.top+75,r.left+101,r.top+105);Ellipse(draw->hDC,r.left+40,r.top+80,r.left+82,r.top+108);DeleteObject(cloud);}
+            RECT caption{r.left+8,r.bottom-38,r.right-8,r.bottom-10};DrawTextW(draw->hDC,note?L"便签":L"天气",-1,&caption,DT_CENTER|DT_VCENTER|DT_SINGLELINE);SelectObject(draw->hDC,old);return TRUE;
+        }
         if(draw&&draw->CtlID==kAboutRepository) {
             if(auto* logo=GitHubLogo()) {
                 Gdiplus::Graphics graphics(draw->hDC);graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
@@ -255,9 +318,11 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             }
             return TRUE;
         }
-        if (draw && (draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kSidebarBackup || draw->CtlID == kSidebarAbout || draw->CtlID == kAutoAdd || (draw->CtlID>=kBackupCreate&&draw->CtlID<=kBackupDelete) || draw->CtlID == IDCANCEL)) {
-            HBRUSH brush=CreateSolidBrush(RGB(217,242,245));
-            HPEN pen=CreatePen(PS_SOLID,1,RGB(190,224,230));
+        if (draw && (draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kSidebarBackup || draw->CtlID == kSidebarAbout || draw->CtlID == kSidebarWidgets || draw->CtlID == kWidgetClear || draw->CtlID == kAutoAdd || (draw->CtlID>=kBackupCreate&&draw->CtlID<=kBackupDelete) || draw->CtlID == IDCANCEL)) {
+            const COLORREF fill=RGB(219,242,246);
+            const COLORREF border=RGB(190,224,230);
+            HBRUSH brush=CreateSolidBrush(fill);
+            HPEN pen=CreatePen(PS_SOLID,1,border);
             auto ob=SelectObject(draw->hDC,brush); auto op=SelectObject(draw->hDC,pen);
             const RECT& r=draw->rcItem;
             RoundRect(draw->hDC,r.left,r.top,r.right,r.bottom,12,12);
@@ -265,14 +330,15 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             DeleteObject(brush); DeleteObject(pen);
             auto of=SelectObject(draw->hDC,g_font);
             SetBkMode(draw->hDC,TRANSPARENT); SetTextColor(draw->hDC,theme::title);
-            const wchar_t* caption=draw->CtlID==IDCANCEL?L"完成":draw->CtlID==kSidebarAuto?L"自动分类":draw->CtlID==kSidebarBackup?L"备份与还原":draw->CtlID==kSidebarAbout?L"关于":draw->CtlID==kAutoAdd?L"添加规则":draw->CtlID==kBackupCreate?L"立即备份":draw->CtlID==kBackupApply?L"应用备份":draw->CtlID==kBackupDelete?L"删除备份":L"主题设置";
+            const wchar_t* caption=draw->CtlID==IDCANCEL?L"完成":draw->CtlID==kSidebarAuto?L"自动分类":draw->CtlID==kSidebarBackup?L"备份与还原":draw->CtlID==kSidebarAbout?L"关于":draw->CtlID==kSidebarWidgets?L"组件":draw->CtlID==kWidgetClear?L"清除全部组件":draw->CtlID==kAutoAdd?L"添加规则":draw->CtlID==kBackupCreate?L"立即备份":draw->CtlID==kBackupApply?L"应用备份":draw->CtlID==kBackupDelete?L"删除备份":L"主题设置";
             RECT label=r; DrawTextW(draw->hDC,caption,-1,&label,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             if(draw->itemState & ODS_FOCUS) { InflateRect(&label,-3,-3); DrawFocusRect(draw->hDC,&label); }
             SelectObject(draw->hDC,of);
             return TRUE;
         }
-        if (draw && draw->CtlID >= kColorBase && draw->CtlID < kColorBase + 6) {
-            HBRUSH brush = CreateSolidBrush(kColors[draw->CtlID - kColorBase]);
+        if (draw && ((draw->CtlID >= kColorBase && draw->CtlID < kColorBase + 6) || (draw->CtlID >= kDefaultColorBase && draw->CtlID < kDefaultColorBase + 6))) {
+            const int colorIndex=draw->CtlID>=kDefaultColorBase?draw->CtlID-kDefaultColorBase:draw->CtlID-kColorBase;
+            HBRUSH brush = CreateSolidBrush(kColors[colorIndex]);
             FillRect(draw->hDC, &draw->rcItem, brush);
             DeleteObject(brush);
             FrameRect(draw->hDC, &draw->rcItem, reinterpret_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
@@ -285,6 +351,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         if(LOWORD(wParam)==kSidebarAuto){SelectPage(1);return 0;}
         if(LOWORD(wParam)==kSidebarBackup){SelectPage(2);return 0;}
         if(LOWORD(wParam)==kSidebarAbout){SelectPage(3);return 0;}
+        if(LOWORD(wParam)==kSidebarWidgets){SelectPage(4);return 0;}
+        if(LOWORD(wParam)==kWidgetNote){HandleCanvasCommand(CanvasCommand::NewNote);return 0;}
+        if(LOWORD(wParam)==kWidgetWeather){HandleCanvasCommand(CanvasCommand::NewWeather);return 0;}
+        if(LOWORD(wParam)==kWidgetClear){HandleCanvasCommand(CanvasCommand::ClearWidgets);return 0;}
         if(LOWORD(wParam)==kAboutRepository){ShellExecuteW(hwnd,L"open",L"https://github.com/nestlone/nestlone-Desktop",nullptr,nullptr,SW_SHOWNORMAL);return 0;}
         if(LOWORD(wParam)==kStartup) {
             const bool enabled=SendMessageW(reinterpret_cast<HWND>(lParam),BM_GETCHECK,0,0)==BST_CHECKED;
@@ -303,6 +373,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             g_selectedBox = static_cast<int>(SendMessageW(reinterpret_cast<HWND>(lParam), CB_GETCURSEL, 0, 0));
             return 0;
         }
+        if(LOWORD(wParam)==kFontFamily&&HIWORD(wParam)==CBN_SELCHANGE&&g_layout){wchar_t family[64]{};const int index=static_cast<int>(SendMessageW(g_fontFamily,CB_GETCURSEL,0,0));SendMessageW(g_fontFamily,CB_GETLBTEXT,index,reinterpret_cast<LPARAM>(family));g_layout->fontFamily=family;SaveLayout(*g_layout);CanvasSetOpacity(g_layout->opacity);return 0;}
+        if((LOWORD(wParam)==kDefaultWidth||LOWORD(wParam)==kDefaultHeight)&&HIWORD(wParam)==EN_KILLFOCUS){UpdateDefaultBoxMetrics();return 0;}
+        if(LOWORD(wParam)>=kDefaultColorBase&&LOWORD(wParam)<kDefaultColorBase+6&&g_layout){g_layout->defaultBoxColor=kColors[LOWORD(wParam)-kDefaultColorBase];SaveLayout(*g_layout);return 0;}
         if (LOWORD(wParam) >= kColorBase && LOWORD(wParam) < kColorBase + 6 && g_layout && g_selectedBox >= 0 && g_selectedBox < static_cast<int>(g_layout->boxes.size())) {
             g_layout->boxes[g_selectedBox].color = kColors[LOWORD(wParam) - kColorBase];
             SaveLayout(*g_layout);
@@ -312,7 +385,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hwnd);
         return 0;
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_value = nullptr; g_cornerValue=nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_backupList=nullptr;g_themePage.clear();g_autoPage.clear();g_backupPage.clear();g_aboutPage.clear();g_layout = nullptr; return 0;
+    case WM_DESTROY: if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_close=nullptr;g_sidebarAbout=nullptr; g_value = nullptr; g_cornerValue=nullptr;g_defaultWidth=nullptr;g_defaultHeight=nullptr;g_fontFamily=nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_backupList=nullptr;g_themePage.clear();g_autoPage.clear();g_backupPage.clear();g_aboutPage.clear();g_widgetsPage.clear();g_layout = nullptr; return 0;
     default: return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }
@@ -331,7 +404,7 @@ void ShowSettings(HINSTANCE instance, Layout* layout) {
     if (!g_surface) g_surface=CreateSolidBrush(RGB(246,250,252));
     wc.hbrBackground = g_surface;
     RegisterClassW(&wc);
-    g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kClassName, L"nestlone-D 设置中心", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 540, 500, nullptr, nullptr, instance, nullptr);
+    g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kClassName, L"nestlone-D 设置中心", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 540, 590, nullptr, nullptr, instance, nullptr);
     if (!g_window) return;
     ShowWindow(g_window, SW_SHOWNORMAL);
     UpdateWindow(g_window);

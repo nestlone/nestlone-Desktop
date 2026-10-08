@@ -80,5 +80,42 @@ int main() {
     check(bounded.top==300&&bounded.bottom==1300,"near-screen-height box can move vertically without body clamping");
     bounded=nestlone::ConstrainBoxToWorkArea({-200,1100,2300,2600},work,64);
     check(bounded.left==0&&bounded.top==976,"oversized box retains accessible title");
+    // Exercise real widget HWND creation without attaching to Explorer or
+    // starting weather requests, and without writing the user's layout.
+    nestlone::Layout widgets;
+    nestlone::Layout::Widget weather;weather.id=L"weather-test";weather.type=L"weather";weather.rect={20,20,280,170};
+    widgets.widgets.push_back(weather);nestlone::g_layout=&widgets;
+    nestlone::g_instance=GetModuleHandleW(nullptr);nestlone::g_visible=false;
+    HWND host=CreateWindowExW(0,L"STATIC",L"test",WS_POPUP,0,0,800,600,nullptr,nullptr,nestlone::g_instance,nullptr);
+    nestlone::g_host.defviewParent=host;
+    HWND background=CreateWindowExW(0,L"STATIC",L"background",WS_CHILD,0,0,800,600,host,nullptr,nestlone::g_instance,nullptr);
+    WNDCLASSW wc{};wc.hInstance=nestlone::g_instance;wc.lpfnWndProc=nestlone::WidgetProc;wc.lpszClassName=L"nestlone-D.Widget";RegisterClassW(&wc);
+    nestlone::SyncWidgets();
+    check(nestlone::g_widgets.size()==1,"first widget creates without another component");
+    HWND firstWidget=nestlone::g_widgets.front()->window;
+    check(GetWindow(host,GW_CHILD)==firstWidget,"first widget starts above desktop background as a sibling");
+    check((GetWindowLongPtrW(firstWidget,GWL_STYLE)&WS_VISIBLE)==0,"creating while hidden does not reveal widget");
+    check(nestlone::PaintWeatherWidget(firstWidget,widgets.widgets[0]),"weather layered presentation succeeds");
+    auto& weatherBuffer=*nestlone::g_paintBuffers[firstWidget];
+    const auto* weatherPixels=static_cast<const DWORD*>(weatherBuffer.pixels);
+    bool validAlpha=true;for(int i=0;i<weatherBuffer.width*weatherBuffer.height;++i){const DWORD p=weatherPixels[i],alpha=p>>24;if((p&255)>alpha||((p>>8)&255)>alpha||((p>>16)&255)>alpha)validAlpha=false;}
+    check(validAlpha&&((weatherPixels[20*260+240]>>24)==255),"weather lock retains premultiplied alpha and input coverage");
+    SendMessageW(firstWidget,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(30,15));
+    check(nestlone::g_widgets[0]->dragging&&GetCapture()==firstWidget,"first component title captures drag immediately");
+    // Simulate cursor displacement without moving the user's physical pointer.
+    nestlone::g_widgets[0]->mouse.x-=40;nestlone::g_widgets[0]->mouse.y-=30;
+    SendMessageW(firstWidget,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(70,45));
+    check(widgets.widgets[0].rect.left==60&&widgets.widgets[0].rect.top==50,"first component drag moves in both axes");
+    nestlone::g_widgets[0]->dragging=false;ReleaseCapture();
+    widgets.widgets[0].locked=true;SendMessageW(firstWidget,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(30,15));
+    check(!nestlone::g_widgets[0]->dragging,"locked component rejects title drag");widgets.widgets[0].locked=false;
+    nestlone::Layout::Widget note;note.id=L"note-test";note.type=L"note";note.rect={300,20,560,250};widgets.widgets.push_back(note);
+    nestlone::SyncWidgets();check(nestlone::g_widgets.size()==2,"second widget does not replace first");
+    RECT editor{};GetClientRect(nestlone::g_widgets[1]->edit,&editor);check(editor.right>200&&editor.bottom>150,"note editor is sized on first creation");
+    check(GetParent(firstWidget)==GetParent(nestlone::g_widgets[1]->window),"components remain same-level desktop siblings");
+    nestlone::g_visible=true;nestlone::SyncWidgets();check((GetWindowLongPtrW(firstWidget,GWL_STYLE)&WS_VISIBLE)!=0,"hidden widget can be shown again");
+    widgets.widgets.clear();nestlone::SyncWidgets();check(nestlone::g_widgets.empty()&&!IsWindow(firstWidget)&&nestlone::g_paintBuffers.empty(),"clear removes component HWNDs and cached buffers");
+    DestroyWindow(background);DestroyWindow(host);nestlone::g_host={};nestlone::g_layout=nullptr;
+    nestlone::g_weatherIconFamily.reset();nestlone::g_weatherIconFonts.reset();
     Gdiplus::GdiplusShutdown(token);return failures?1:0;
 }
