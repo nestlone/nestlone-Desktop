@@ -23,7 +23,11 @@ UINT g_taskbarCreated = 0;
 void DispatchCanvas(nestlone::CanvasCommand command) { nestlone::HandleCanvasCommand(command); }
 
 LRESULT CALLBACK ControlProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == g_taskbarCreated) { nestlone::TrayInstall(hwnd, GetModuleHandleW(nullptr)); return 0; }
+    if (message == g_taskbarCreated) {
+        nestlone::TrayInstall(hwnd, GetModuleHandleW(nullptr));
+        nestlone::CanvasNotifyDesktopHostChanged();
+        return 0;
+    }
     switch (message) {
     case nestlone::WM_TRAY:
         if (lParam == WM_RBUTTONUP) nestlone::TrayShowMenu(hwnd);

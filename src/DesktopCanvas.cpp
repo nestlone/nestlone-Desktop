@@ -40,6 +40,10 @@ HINSTANCE g_instance=nullptr;
 ULONG_PTR g_token=0;
 HHOOK g_keyboardHook=nullptr;
 bool g_visible=true,g_drag=false,g_resizing=false,g_resizeFromLeft=false,g_tabPending=false,g_tabDetached=false,g_nativeHidden=false;
+// Recent Windows builds can host SHELLDLL_DefView directly in Progman instead
+// of a paintable WorkerW.  In that topology child layered windows may exist but
+// never composite.  Use owned popup surfaces only for that fallback.
+bool g_popupSurface=false;
 bool g_interactivePaintQueued=false;
 std::atomic_bool g_weatherRequestInFlight=false;
 std::unique_ptr<Gdiplus::PrivateFontCollection> g_weatherIconFonts;
@@ -316,8 +320,12 @@ bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false,bool leftGrip=false)
 }
 POINT ParentPoint(POINT point) {
     point.x+=GetSystemMetrics(SM_XVIRTUALSCREEN);point.y+=GetSystemMetrics(SM_YVIRTUALSCREEN);
+    if(g_popupSurface)return point;
     ScreenToClient(g_host.defviewParent,&point);return point;
 }
+DWORD SurfaceWindowStyle() { return g_popupSurface ? WS_POPUP : WS_CHILD; }
+HWND SurfaceBackgroundInsertAfter() { return g_popupSurface ? HWND_BOTTOM : HWND_TOP; }
+HWND SurfaceControlInsertAfter() { return g_popupSurface && IsWindow(g_background) ? g_background : HWND_TOP; }
 struct WeatherReply {std::wstring summary,icon;int temperature=0;};
 bool ReadResourceBytes(int id,const BYTE*& data,DWORD& size) {
     HINSTANCE module=GetModuleHandleW(nullptr);HRSRC resource=FindResourceW(module,MAKEINTRESOURCEW(id),RT_RCDATA);
@@ -419,12 +427,12 @@ void SyncWidgets() {
         if(found==g_widgets.end()) {
             auto widget=std::make_unique<WidgetWindow>();widget->id=model.id;POINT p=ParentPoint({model.rect.left,model.rect.top});
             const DWORD extended=model.type==L"weather"?(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW):WS_EX_TOOLWINDOW;
-            widget->window=CreateWindowExW(extended,L"nestlone-D.Widget",L"",WS_CHILD|WS_CLIPCHILDREN,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,g_host.defviewParent,nullptr,g_instance,widget.get());
+            widget->window=CreateWindowExW(extended,L"nestlone-D.Widget",L"",SurfaceWindowStyle()|WS_CLIPCHILDREN,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,g_host.defviewParent,nullptr,g_instance,widget.get());
             if(!widget->window)continue;
             if(model.type==L"note")widget->edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",model.text.c_str(),WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL,10,34,100,100,widget->window,reinterpret_cast<HMENU>(1),g_instance,nullptr);
             if(widget->edit)SendMessageW(widget->edit,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),TRUE);
             if(widget->edit)MoveWindow(widget->edit,8,34,max(1L,model.rect.right-model.rect.left-16),max(1L,model.rect.bottom-model.rect.top-42),TRUE);
-            SetWindowPos(widget->window,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            SetWindowPos(widget->window,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
             ShowWindow(widget->window,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);
             g_widgets.push_back(std::move(widget));
         } else {POINT p=ParentPoint({model.rect.left,model.rect.top});SetWindowPos((*found)->window,nullptr,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,SWP_NOACTIVATE|SWP_NOZORDER);ShowWindow((*found)->window,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);}
@@ -764,25 +772,25 @@ bool BeginDragPreview(Box& box) {
     }
     WNDCLASSW wc{};wc.hInstance=g_instance;wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"nestlone-D.DragPreview";RegisterClassW(&wc);
     POINT top=ParentPoint({bounds.left,bounds.top});
-    HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,wc.lpszClassName,L"",WS_CHILD,top.x,top.y,width,height,g_host.defviewParent,nullptr,g_instance,nullptr);
+    HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,wc.lpszClassName,L"",SurfaceWindowStyle(),top.x,top.y,width,height,g_host.defviewParent,nullptr,g_instance,nullptr);
     if(!preview)return false;
     POINT source{};SIZE size{width,height};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
     if(!UpdateLayeredWindow(preview,nullptr,nullptr,&size,buffer.dc,&source,0,&blend,ULW_ALPHA)){DestroyWindow(preview);return false;}
     g_dragPreview=preview;g_previewGroup=box.id;
     // Remove only the moving group's pixels from the static desktop once.
     PaintWindow(g_background);
-    SetWindowPos(preview,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    SetWindowPos(preview,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
     return true;
 }
 void MoveDragPreview(Box& box) {
     POINT p=ParentPoint({box.rect.left,box.rect.top});
-    SetWindowPos(g_dragPreview,HWND_TOP,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+    SetWindowPos(g_dragPreview,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
     for(auto& d:g_decorations)if(d->id==box.id){
-        SetWindowPos(d->header,HWND_TOP,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(d->header,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
         p=ParentPoint({box.rect.right-18,box.rect.bottom-18});
-        SetWindowPos(d->grip,HWND_TOP,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(d->grip,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
         p=ParentPoint({box.rect.left,box.rect.bottom-18});
-        SetWindowPos(d->gripLeft,HWND_TOP,p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(d->gripLeft,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
     }
 }
 void Arrange(Box& box,const DesktopSnapshot& snapshot=g_snapshot) {
@@ -863,6 +871,7 @@ void DestroyDecorations() {
     for(auto& d:g_decorations){if(IsWindow(d->header))DestroyWindow(d->header);if(IsWindow(d->gripLeft))DestroyWindow(d->gripLeft);if(IsWindow(d->grip))DestroyWindow(d->grip);}
     g_decorations.clear();if(IsWindow(g_background))DestroyWindow(g_background);g_background=nullptr;
     ReleaseVisualIcons();if(IsWindow(g_hiddenListview))ReleaseHiddenDesktopListView(g_hiddenListview);g_hiddenListview=nullptr;g_nativeHidden=false;
+    g_popupSurface=false;
 }
 LRESULT CALLBACK DecorationProc(HWND,UINT,WPARAM,LPARAM);
 void DrawWidgetLockGlyph(HDC dc,const RECT& bounds,bool locked,COLORREF background) {
@@ -909,7 +918,7 @@ LRESULT CALLBACK WidgetProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     case WM_PAINT:{PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);if(widget->type==L"weather"){EndPaint(hwnd,&ps);PaintWeatherWidget(hwnd,*widget);}else {RECT r{};GetClientRect(hwnd,&r);const COLORREF headerColor=RGB(246,220,122);HBRUSH body=CreateSolidBrush(RGB(255,247,190));FillRect(dc,&r,body);DeleteObject(body);HBRUSH header=CreateSolidBrush(headerColor);RECT top=r;top.bottom=30;FillRect(dc,&top,header);DeleteObject(header);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(25,49,60));HFONT old=static_cast<HFONT>(SelectObject(dc,GetStockObject(DEFAULT_GUI_FONT)));RECT title=top;title.right-=36;DrawTextW(dc,L"便签",-1,&title,DT_SINGLELINE|DT_VCENTER|DT_CENTER);RECT lock=top;lock.left=lock.right-34;DrawWidgetLockGlyph(dc,lock,widget->locked,headerColor);SelectObject(dc,old);EndPaint(hwnd,&ps);}return 0;}
     case WM_SIZE:{const int width=max(1,LOWORD(lp)),height=max(1,HIWORD(lp));if(widget->type==L"weather")PaintWeatherWidget(hwnd,*widget);else {HRGN region=CreateRoundRectRgn(0,0,width+1,height+1,16,16);SetWindowRgn(hwnd,region,TRUE);if(state->edit)MoveWindow(state->edit,8,34,max(1,width-16),max(1,height-42),TRUE);}return 0;}
     case WM_COMMAND:if(state->edit&&reinterpret_cast<HWND>(lp)==state->edit){if(HIWORD(wp)==EN_CHANGE){wchar_t text[4096]{};GetWindowTextW(state->edit,text,4096);widget->text=text;state->pendingSave=true;SetTimer(hwnd,1,450,nullptr);}else if(HIWORD(wp)==EN_KILLFOCUS&&state->pendingSave){KillTimer(hwnd,1);state->pendingSave=false;SaveLayout(*g_layout);}}return 0;
-    case WM_LBUTTONDOWN:if(GET_Y_LPARAM(lp)<30&&GET_X_LPARAM(lp)>=widget->rect.right-widget->rect.left-36){widget->locked=!widget->locked;SaveLayout(*g_layout);InvalidateRect(hwnd,nullptr,TRUE);return 0;}else if(GET_Y_LPARAM(lp)<30&&!widget->locked){SetWindowPos(hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);state->dragging=true;state->start=widget->rect;GetCursorPos(&state->mouse);SetCapture(hwnd);}return 0;
+    case WM_LBUTTONDOWN:if(GET_Y_LPARAM(lp)<30&&GET_X_LPARAM(lp)>=widget->rect.right-widget->rect.left-36){widget->locked=!widget->locked;SaveLayout(*g_layout);InvalidateRect(hwnd,nullptr,TRUE);return 0;}else if(GET_Y_LPARAM(lp)<30&&!widget->locked){SetWindowPos(hwnd,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);state->dragging=true;state->start=widget->rect;GetCursorPos(&state->mouse);SetCapture(hwnd);}return 0;
     case WM_MOUSEMOVE:if(state->dragging&&GetCapture()==hwnd){POINT p{};GetCursorPos(&p);const LONG dx=p.x-state->mouse.x,dy=p.y-state->mouse.y;widget->rect=state->start;OffsetRect(&widget->rect,dx,dy);widget->rect=KeepBoxOnScreen(widget->rect,30);POINT top=ParentPoint({widget->rect.left,widget->rect.top});SetWindowPos(hwnd,nullptr,top.x,top.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER);return 0;}break;
     case WM_LBUTTONUP:if(state->dragging){state->dragging=false;ReleaseCapture();SaveLayout(*g_layout);}return 0;
     case WM_CAPTURECHANGED:if(state->dragging){state->dragging=false;SaveLayout(*g_layout);}return 0;
@@ -1035,30 +1044,87 @@ void FinishVisualDrag() {
     if(!moves.empty())QueueMoves(moves);
     SaveLayout(*g_layout);g_visualDirty=true;g_iconDrag=-1;g_iconDragStart.clear();PaintAll();
 }
+bool PrimeSurface() {
+    if(!g_background||!IsWindow(g_background))return false;
+    g_visualDirty=true;
+    RebuildVisualIcons();
+    if(!PaintWindow(g_background))return false;
+    PaintAll();
+    return true;
+}
+void ShowPreparedSurface() {
+    if(!g_visible)return;
+    ShowWindow(g_background,SW_SHOWNOACTIVATE);
+    for(auto& d:g_decorations) {
+        if(IsWindow(d->header))ShowWindow(d->header,SW_SHOWNOACTIVATE);
+        if(IsWindow(d->gripLeft))ShowWindow(d->gripLeft,SW_SHOWNOACTIVATE);
+        if(IsWindow(d->grip))ShowWindow(d->grip,SW_SHOWNOACTIVATE);
+    }
+    SyncWidgets();
+}
+bool HideNativeDesktopAfterSurfaceIsReady() {
+    if(!g_visible)return true;
+    if(!IsWindow(g_host.listview))return false;
+    g_hiddenListview=g_host.listview;
+    ClaimHiddenDesktopListView(g_hiddenListview);
+    ShowWindow(g_hiddenListview,SW_HIDE);
+    if(IsWindowVisible(g_hiddenListview)) {
+        ReleaseHiddenDesktopListView(g_hiddenListview);
+        g_hiddenListview=nullptr;
+        return false;
+    }
+    g_nativeHidden=true;
+    return true;
+}
 bool Attach() {
     auto host=db::DiscoverDesktopHost();
-    if(!host.listview || !host.defviewParent)return false;
-    if(g_background && IsWindow(g_background) && g_host.listview==host.listview)return true;
-    DestroyDecorations();g_host=host;RestoreLegacyMask(host.listview);RecoverBoxPositions();
-    DesktopSnapshot initial;if(ReadDesktop(initial)){g_snapshot=std::move(initial);g_visualDirty=true;}
-    g_hiddenListview=host.listview;ClaimHiddenDesktopListView(g_hiddenListview);ShowWindow(g_hiddenListview,SW_HIDE);g_nativeHidden=true;
+    if(!host.listview || !host.defviewParent){db::LogF("[canvas] attach deferred: desktop host unavailable");return false;}
+    if(g_background && IsWindow(g_background) && g_host.listview==host.listview) {
+        if(!g_visible||g_nativeHidden)return true;
+        if(!PrimeSurface())return false;
+        ShowPreparedSurface();
+        // A hidden layered window can accept UpdateLayeredWindow without
+        // presenting pixels.  Re-prime after ShowWindow before hiding Explorer.
+        if(!PrimeSurface()||!HideNativeDesktopAfterSurfaceIsReady()) {
+            DestroyDecorations();
+            return false;
+        }
+        return true;
+    }
+    DestroyDecorations();g_host=host;
+    g_popupSurface=!host.wallpaperWorker;
+    RestoreLegacyMask(host.listview);RecoverBoxPositions();
+    DesktopSnapshot initial;
+    if(!ReadDesktop(initial)||!initial.readable||initial.listview!=host.listview){
+        db::LogF("[canvas] attach deferred: desktop snapshot unavailable (%s)",db::ToUtf8(initial.error).c_str());
+        return false;
+    }
+    g_snapshot=std::move(initial);g_visualDirty=true;
     POINT origin=ParentPoint({0,0});
     g_background=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
-        L"nestlone-D.Decoration",L"",WS_CHILD,origin.x,origin.y,GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN),host.defviewParent,nullptr,g_instance,nullptr);
+        L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),origin.x,origin.y,GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN),host.defviewParent,nullptr,g_instance,nullptr);
     if(!g_background){DestroyDecorations();return false;}
     // This is the owned desktop surface. Explorer's list view is hidden while
     // the surface is alive; file paths remain unchanged.
-    SetWindowPos(g_background,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    SetWindowPos(g_background,SurfaceBackgroundInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     for(const auto& box:g_layout->boxes)if(IsGroupRoot(box)) {
         auto d=std::make_unique<Decoration>();d->id=box.id;
-        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,200,HeaderHeight(),host.defviewParent,nullptr,g_instance,d.get());
-        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,18,18,host.defviewParent,nullptr,g_instance,d.get());
-        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,18,18,host.defviewParent,nullptr,g_instance,d.get());
+        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,200,HeaderHeight(),host.defviewParent,nullptr,g_instance,d.get());
+        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,host.defviewParent,nullptr,g_instance,d.get());
+        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,host.defviewParent,nullptr,g_instance,d.get());
         if(!d->header||!d->gripLeft||!d->grip){if(d->header)DestroyWindow(d->header);if(d->gripLeft)DestroyWindow(d->gripLeft);if(d->grip)DestroyWindow(d->grip);DestroyDecorations();return false;}
+        SetWindowPos(d->header,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(d->gripLeft,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(d->grip,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         g_decorations.push_back(std::move(d));
     }
-    if(!PaintWindow(g_background)){DestroyDecorations();return false;}
-    ShowWindow(g_background,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);PaintAll();SyncWidgets();UpdateWeatherSchedule();return true;
+    if(!PrimeSurface()){db::LogF("[canvas] attach failed: initial surface paint");DestroyDecorations();return false;}
+    if(g_visible) {
+        ShowPreparedSurface();
+        if(!PrimeSurface()||!HideNativeDesktopAfterSurfaceIsReady()) {db::LogF("[canvas] attach failed: surface presentation");DestroyDecorations();return false;}
+    }
+    UpdateWeatherSchedule();
+    return true;
 }
 void Rebuild(){
     RecoverBoxPositions();
@@ -1075,10 +1141,13 @@ void Rebuild(){
     for(const auto& box:g_layout->boxes)if(IsGroupRoot(box)) {
         if(std::any_of(g_decorations.begin(),g_decorations.end(),[&](const auto& d){return d->id==box.id;}))continue;
         auto d=std::make_unique<Decoration>();d->id=box.id;
-        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,200,HeaderHeight(),g_host.defviewParent,nullptr,g_instance,d.get());
-        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,18,18,g_host.defviewParent,nullptr,g_instance,d.get());
-        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",WS_CHILD,0,0,18,18,g_host.defviewParent,nullptr,g_instance,d.get());
+        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,200,HeaderHeight(),g_host.defviewParent,nullptr,g_instance,d.get());
+        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,g_host.defviewParent,nullptr,g_instance,d.get());
+        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,g_host.defviewParent,nullptr,g_instance,d.get());
         if(!d->header||!d->gripLeft||!d->grip){if(d->header)DestroyWindow(d->header);if(d->gripLeft)DestroyWindow(d->gripLeft);if(d->grip)DestroyWindow(d->grip);continue;}
+        SetWindowPos(d->header,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(d->gripLeft,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(d->grip,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         g_decorations.push_back(std::move(d));
     }
     g_visualDirty=true;PaintAll();SyncWidgets();UpdateWeatherSchedule();SaveLayout(*g_layout);
@@ -1317,7 +1386,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         }
         return 0;
     }
-    if(message==WM_DISPLAYCHANGE||message==WM_DPICHANGED){DestroyDecorations();Attach();return 0;}
+    if(message==WM_DISPLAYCHANGE||message==WM_DPICHANGED){CanvasNotifyDesktopHostChanged();return 0;}
     return DefWindowProcW(hwnd,message,wp,lp);
 }
 }
@@ -1342,16 +1411,32 @@ void DestroyCanvas() {
 }
 bool CanvasVisible(){return g_visible;}
 void CanvasSetOpacity(int opacity){if(g_layout){g_layout->opacity=std::clamp(opacity,0,100);PaintAll();}}
+void CanvasNotifyDesktopHostChanged() {
+    CancelDesktopMoves();
+    // Explorer may have replaced every desktop HWND.  DestroyDecorations first
+    // restores any surviving old ListView, then attach to the new host.
+    DestroyDecorations();
+    g_host={};g_snapshot={};g_visualDirty=true;
+    Attach();
+}
 void HandleCanvasCommand(CanvasCommand command) {
     if(!g_layout)return;
     if(command==CanvasCommand::Toggle) {
         g_visible=!g_visible;CancelDesktopMoves();g_pending=0;g_moves.clear();g_snapshot={};FinishRename(true);
-        if(g_background)ShowWindow(g_background,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);
-        for(auto& widget:g_widgets)if(IsWindow(widget->window))ShowWindow(widget->window,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);
-        if(IsWindow(g_hiddenListview))ShowWindow(g_hiddenListview,g_visible?SW_HIDE:SW_SHOWNOACTIVATE);
-        if(g_visible){DesktopSnapshot current;if(ReadDesktop(current)){g_snapshot=std::move(current);g_visualDirty=true;}}
+        if(!g_visible) {
+            if(g_background)ShowWindow(g_background,SW_HIDE);
+            for(auto& d:g_decorations){if(IsWindow(d->header))ShowWindow(d->header,SW_HIDE);if(IsWindow(d->gripLeft))ShowWindow(d->gripLeft,SW_HIDE);if(IsWindow(d->grip))ShowWindow(d->grip,SW_HIDE);}
+            for(auto& widget:g_widgets)if(IsWindow(widget->window))ShowWindow(widget->window,SW_HIDE);
+            if(IsWindow(g_hiddenListview))ReleaseHiddenDesktopListView(g_hiddenListview);
+            g_hiddenListview=nullptr;g_nativeHidden=false;
+        } else {
+            // Attach prepares and proves the surface before it hides Explorer.
+            // If discovery or painting fails, the native desktop stays visible.
+            if(!Attach()) {g_visible=false;UpdateWeatherSchedule();return;}
+            DesktopSnapshot current;if(ReadDesktop(current)){g_snapshot=std::move(current);g_visualDirty=true;}
+        }
         UpdateWeatherSchedule();if(g_visible)RefreshWeatherNow();
-        PaintAll();
+        if(g_visible)PaintAll();
     }
     if(command==CanvasCommand::NewBox) {Box box;box.id=std::to_wstring(GetTickCount64());box.title=L"新盒子";box.color=g_layout->defaultBoxColor;box.rect={160,160,160+g_layout->defaultBoxWidth,160+g_layout->defaultBoxHeight};g_layout->boxes.push_back(box);Rebuild();}
     if(command==CanvasCommand::NewNote||command==CanvasCommand::NewWeather) {Layout::Widget widget;widget.id=std::to_wstring(GetTickCount64());widget.type=command==CanvasCommand::NewNote?L"note":L"weather";widget.rect={220,160,480,command==CanvasCommand::NewNote?390:310};widget.text=L"双击编辑内容";widget.weather=L"正在获取天气";g_layout->widgets.push_back(std::move(widget));SaveLayout(*g_layout);SyncWidgets();UpdateWeatherSchedule();if(command==CanvasCommand::NewWeather)RefreshWeatherNow();}
