@@ -17,6 +17,7 @@ struct Box {
     bool selected{false}; // transient owned-view selection, not persisted
     // Empty means a standalone box. A member stores the id of its group root.
     std::wstring groupId;
+    int tabOrder{0}; // Stable visual order, independent of the group's root.
     // Used by a group root; empty selects the root's own tab.
     std::wstring activeTabId;
     std::vector<std::wstring> items;

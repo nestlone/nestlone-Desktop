@@ -41,6 +41,7 @@ ULONG_PTR g_token=0;
 HHOOK g_keyboardHook=nullptr;
 HWINEVENTHOOK g_foregroundHook=nullptr;
 bool g_visible=true,g_drag=false,g_resizing=false,g_resizeFromLeft=false,g_tabPending=false,g_tabDetached=false,g_nativeHidden=false;
+int g_tabInsert=-1;
 bool g_interactivePaintQueued=false;
 std::atomic_bool g_weatherRequestInFlight=false;
 std::unique_ptr<Gdiplus::PrivateFontCollection> g_weatherIconFonts;
@@ -131,7 +132,18 @@ Box* ActiveBox(Box& root) {
 std::vector<Box*> GroupTabs(Box& root) {
     std::vector<Box*> tabs;tabs.push_back(&root);
     for(auto& box:g_layout->boxes)if(box.groupId==root.id)tabs.push_back(&box);
+    std::stable_sort(tabs.begin(),tabs.end(),[](const Box* a,const Box* b){return a->tabOrder<b->tabOrder;});
     return tabs;
+}
+void ReorderTab(Box& tab,int insertion) {
+    auto tabs=GroupTabs(*GroupRoot(tab));
+    auto from=std::find(tabs.begin(),tabs.end(),&tab);
+    if(from==tabs.end())return;
+    int old=static_cast<int>(from-tabs.begin());
+    insertion=std::clamp(insertion,0,static_cast<int>(tabs.size()));
+    tabs.erase(from);if(insertion>old)--insertion;
+    tabs.insert(tabs.begin()+insertion,&tab);
+    for(size_t i=0;i<tabs.size();++i)tabs[i]->tabOrder=static_cast<int>(i);
 }
 bool HasGroupTabs(const Box& root) {
     return g_layout&&std::any_of(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const Box& box){return box.groupId==root.id;});
@@ -140,14 +152,16 @@ void DetachTab(Box& tab) {
     Box* root=GroupRoot(tab);
     auto members=GroupTabs(*root);
     if(root==&tab&&members.size()>1) {
-        Box* successor=members[1];
+        members.erase(std::remove(members.begin(),members.end(),&tab),members.end());
+        Box* successor=members.front();
         const auto active=root->activeTabId;
         successor->groupId.clear();successor->groupTitle=root->groupTitle.empty()?root->title:root->groupTitle;
         successor->collapsed=root->collapsed;
         successor->activeTabId=(active.empty()||active==tab.id)?successor->id:active;
-        for(size_t i=2;i<members.size();++i)members[i]->groupId=successor->id;
+        for(size_t i=1;i<members.size();++i)members[i]->groupId=successor->id;
     } else if(root!=&tab&&root->activeTabId==tab.id)root->activeTabId.clear();
     tab.groupId.clear();tab.activeTabId.clear();tab.collapsed=false;
+    tab.tabOrder=0;
 }
 int BoxHeaderHeight(const Box& box) {
     const Box* root=GroupRoot(box);
@@ -274,6 +288,8 @@ bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false,bool leftGrip=false)
         key=std::to_wstring(g_layout->opacity)+L":"+std::to_wstring(box->selected)+L":"+std::to_wstring(box->collapsed)+L":"+std::to_wstring(grip)+L":"+std::to_wstring(HeaderHeight());
         for(auto* tab:GroupTabs(*box))key+=L"|"+std::to_wstring(tab->title.size())+L":"+tab->title+L":"+std::to_wstring(IsActiveTab(*tab));
         key+=L"|"+GroupTitle(*box);
+        key+=L"|"+std::to_wstring(g_tabPending?g_tabInsert:-1);
+        for(auto* tab:GroupTabs(*box))key+=L"|"+tab->id;
         if(buffer.decorationKey==key)return true;
     }
     if(!box) {
@@ -303,6 +319,11 @@ bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false,bool leftGrip=false)
                     const int right=static_cast<int>((i+1)*r.right/tabs.size());
                     Label(g,tabs[i]->title,{left,h,right,headerHeight});
                     if(IsActiveTab(*tabs[i])) {Gdiplus::Pen line(Gdiplus::Color(220,255,255,255),1.0f);g.DrawLine(&line,left+8,headerHeight-3,right-8,headerHeight-3);}
+                }
+                if(g_tabPending&&g_tabInsert>=0&&FindBox(g_dragId)&&GroupRoot(*FindBox(g_dragId))==box) {
+                    int x=std::clamp(g_tabInsert*static_cast<int>(r.right)/static_cast<int>(tabs.size()),2,static_cast<int>(r.right)-2);
+                    Gdiplus::Pen insertion(Gdiplus::Color(255,119,220,255),2.0f);
+                    g.DrawLine(&insertion,x,h+4,x,headerHeight-4);
                 }
             }
             Label(g,L"▦",{r.right-3*h,0,r.right-2*h,h});
@@ -1175,13 +1196,28 @@ void CreateBoxAt(POINT point) {
 }
 void Menu(HWND hwnd,Box& box,POINT point) {
     Box* active=ActiveBox(box);
+    auto tabs=GroupTabs(*GroupRoot(box));Box* orderTab=active;
+    POINT local{point.x-GetSystemMetrics(SM_XVIRTUALSCREEN)-box.rect.left,point.y-GetSystemMetrics(SM_YVIRTUALSCREEN)-box.rect.top};
+    if(tabs.size()>1&&local.y>=HeaderHeight()&&local.y<2*HeaderHeight()&&local.x>=0&&local.x<box.rect.right-box.rect.left)
+        orderTab=tabs[min(tabs.size()-1,static_cast<size_t>(local.x*tabs.size()/max(1L,box.rect.right-box.rect.left)))];
+    int orderIndex=static_cast<int>(std::find(tabs.begin(),tabs.end(),orderTab)-tabs.begin());
     HMENU menu=CreatePopupMenu();
+    if(tabs.size()>1){
+        AppendMenuW(menu,MF_STRING|(orderIndex==0?MF_GRAYED:0),8,L"标签向左移动");
+        AppendMenuW(menu,MF_STRING|(orderIndex+1==static_cast<int>(tabs.size())?MF_GRAYED:0),9,L"标签向右移动");
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+    }
     AppendMenuW(menu,MF_STRING,1,L"重命名盒子");AppendMenuW(menu,MF_STRING,2,L"整理盒内图标位置");
     AppendMenuW(menu,MF_STRING|(active->iconView?MF_CHECKED:0),6,L"图标显示");AppendMenuW(menu,MF_STRING|(!active->iconView?MF_CHECKED:0),7,L"列表显示");
     AppendMenuW(menu,MF_STRING,3,L"收纳区域内图标");AppendMenuW(menu,MF_STRING,4,box.collapsed?L"展开盒子":L"折叠盒子（隐藏图标）");
     AppendMenuW(menu,MF_STRING,5,L"删除盒子（保留图标与文件）");
     if(!g_status.empty())AppendMenuW(menu,MF_STRING|MF_DISABLED,0,g_status.c_str());
     int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,hwnd,nullptr);DestroyMenu(menu);
+    if(command==8||command==9){
+        ReorderTab(*orderTab,command==8?orderIndex-1:orderIndex+2);SaveLayout(*g_layout);
+        for(auto& decoration:g_decorations)if(decoration->id==GroupRoot(box)->id)PaintWindow(decoration->header,GroupRoot(box));
+        return;
+    }
     if(command==1)BeginRename(box,HasGroupTabs(box));
     if(command==2){Arrange(box);if(!g_status.empty())MessageBoxW(hwnd,g_status.c_str(),L"图标位置",MB_OK|MB_ICONINFORMATION);}
     if(command==3) {
@@ -1273,7 +1309,7 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             auto tabs=GroupTabs(*box);
             if(tabs.size()>1) {
                 const size_t index=min(tabs.size()-1,static_cast<size_t>(max(0,x)*static_cast<int>(tabs.size())/max(1,width)));
-                g_tabPending=true;g_dragId=tabs[index]->id;g_boxStart=tabs[index]->rect;GetCursorPos(&g_mouseStart);SetCapture(hwnd);return 0;
+                g_tabPending=true;g_tabInsert=-1;g_dragId=tabs[index]->id;g_boxStart=tabs[index]->rect;GetCursorPos(&g_mouseStart);SetCapture(hwnd);return 0;
             }
         }
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
@@ -1292,7 +1328,17 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     case WM_MOUSEMOVE:
         if(g_tabPending&&GetCapture()==hwnd) {
             POINT p{};GetCursorPos(&p);LONG dx=p.x-g_mouseStart.x,dy=p.y-g_mouseStart.y;
-            if(abs(dx)<4&&abs(dy)<4)return 0;
+            if(g_tabInsert<0&&abs(dx)<GetSystemMetrics(SM_CXDRAG)&&abs(dy)<GetSystemMetrics(SM_CYDRAG))return 0;
+            POINT local=p;ScreenToClient(hwnd,&local);
+            const int width=box->rect.right-box->rect.left,h=HeaderHeight();
+            const int margin=MulDiv(20,GetDpiForWindow(hwnd),96);
+            if(local.x>=-margin&&local.x<=width+margin&&local.y>=h-margin&&local.y<=2*h+margin) {
+                const int count=static_cast<int>(GroupTabs(*box).size());
+                const int insertion=std::clamp((max(0L,local.x)*count+width/2)/max(1,width),0L,static_cast<LONG>(count));
+                if(g_tabInsert!=insertion){g_tabInsert=insertion;PaintWindow(hwnd,box);}
+                return 0;
+            }
+            g_tabInsert=-1;
             if(auto* tab=FindBox(g_dragId)) {
                 DetachTab(*tab);
                 tab->rect=g_boxStart;tab->selected=true;g_boxDragStart={{tab->id,g_boxStart}};g_drag=true;g_tabPending=false;g_tabDetached=true;g_resizing=false;g_visualDirty=true;box=tab;
@@ -1322,9 +1368,16 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         return 0;
     case WM_CANCELMODE:
         EndDragPreview();
-        g_boxButton=0;g_drag=false;g_tabPending=false;g_tabDetached=false;g_resizing=false;g_resizeFromLeft=false;g_boxDragStart.clear();CancelIconGesture();return 0;
+        g_boxButton=0;g_drag=false;g_tabPending=false;g_tabInsert=-1;g_tabDetached=false;g_resizing=false;g_resizeFromLeft=false;g_boxDragStart.clear();CancelIconGesture();return 0;
     case WM_LBUTTONUP:
-        if(g_tabPending){g_tabPending=false;ReleaseCapture();if(auto* tab=FindBox(g_dragId)){if(auto* root=GroupRoot(*tab)){root->activeTabId=tab->id;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}}return 0;}
+        if(g_tabPending){
+            const int insertion=g_tabInsert;g_tabPending=false;g_tabInsert=-1;ReleaseCapture();
+            if(auto* tab=FindBox(g_dragId)) {
+                if(insertion>=0){ReorderTab(*tab,insertion);SaveLayout(*g_layout);PaintWindow(hwnd,box);}
+                else if(auto* root=GroupRoot(*tab)){root->activeTabId=tab->id;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}
+            }
+            return 0;
+        }
         if(g_boxButton){int button=g_boxButton;g_boxButton=0;ReleaseCapture();if(button==1)ToggleBoxView(*ActiveBox(*box));else if(button==2){box->collapsed=!box->collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}else {auto id=box->id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}return 0;}
         if(g_drag){
             if(auto* dragged=FindBox(g_dragId))box=dragged;
@@ -1340,6 +1393,9 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                 if(destination) {
                     if(destination->groupTitle.empty())destination->groupTitle=destination->title;
                     const auto members=GroupTabs(*source);
+                    auto existing=GroupTabs(*destination);int order=0;
+                    for(auto* member:existing)member->tabOrder=order++;
+                    for(auto* member:members)member->tabOrder=order++;
                     for(auto* candidate:members) {candidate->groupId=destination->id;candidate->rect=destination->rect;candidate->color=destination->color;}
                     destination->activeTabId=box->id;g_visualDirty=true;g_boxDragStart.clear();SaveLayout(*g_layout);PostMessageW(g_manager,WM_APP+11,0,0);return 0;
                 }
@@ -1348,7 +1404,9 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             g_boxDragStart.clear();SaveLayout(*g_layout);
             if(rebuildDecorations)PostMessageW(g_manager,WM_APP+11,0,0);
         }return 0;
-    case WM_CAPTURECHANGED:if(g_drag){g_drag=false;EndDragPreview();if(g_resizing)Arrange(*box);g_resizing=false;g_resizeFromLeft=false;g_boxDragStart.clear();SaveLayout(*g_layout);FlushInteractivePaint();}return 0;
+    case WM_CAPTURECHANGED:
+        if(g_tabPending){g_tabPending=false;g_tabInsert=-1;PaintWindow(hwnd,box);}
+        if(g_drag){g_drag=false;EndDragPreview();if(g_resizing)Arrange(*box);g_resizing=false;g_resizeFromLeft=false;g_boxDragStart.clear();SaveLayout(*g_layout);FlushInteractivePaint();}return 0;
     }
     return DefWindowProcW(hwnd,message,wp,lp);
 }
