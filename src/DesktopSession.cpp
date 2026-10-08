@@ -47,7 +47,8 @@ bool ShellBackgroundMenuAvailable() {
     return ShellView(view) && SUCCEEDED(view->GetItemObject(SVGIO_BACKGROUND,IID_PPV_ARGS(&menu)));
 }
 
-bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint) {
+bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint, bool* createBox) {
+    if(createBox)*createBox=false;
     ComPtr<IShellView> view;
     if(!ShellView(view))return false;
     ComPtr<IContextMenu> menu;
@@ -57,6 +58,11 @@ bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint) {
     constexpr UINT first=1,last=0x7fff;
     bool shown=false;
     if(SUCCEEDED(menu->QueryContextMenu(popup,0,first,last,CMF_NORMAL))) {
+        constexpr UINT newBoxCommand=0x8000; // Outside Shell's command range.
+        if(createBox) {
+            InsertMenuW(popup,0,MF_BYPOSITION|MF_STRING,newBoxCommand,L"新建盒子(&B)");
+            InsertMenuW(popup,1,MF_BYPOSITION|MF_SEPARATOR,0,nullptr);
+        }
         // Explorer populates several desktop submenus only when they receive
         // their WM_INITMENUPOPUP / owner-draw messages.  Our layered canvas is
         // the menu owner, therefore retain the interfaces for the duration of
@@ -65,7 +71,9 @@ bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint) {
         if(FAILED(menu.As(&backgroundMenu3)))menu.As(&backgroundMenu2);
         int command=TrackPopupMenuEx(popup,TPM_RETURNCMD|TPM_RIGHTBUTTON,screenPoint.x,screenPoint.y,owner,nullptr);
         backgroundMenu3.Reset();backgroundMenu2.Reset();
-        if(command>=static_cast<int>(first)) {
+        if(createBox&&command==newBoxCommand) {
+            *createBox=true;shown=true;
+        } else if(command>=static_cast<int>(first)&&command<=static_cast<int>(last)) {
             CMINVOKECOMMANDINFOEX invoke{};invoke.cbSize=sizeof(invoke);invoke.fMask=CMIC_MASK_UNICODE;
             invoke.hwnd=owner;invoke.lpVerb=MAKEINTRESOURCEA(command-first);invoke.lpVerbW=MAKEINTRESOURCEW(command-first);invoke.nShow=SW_SHOWNORMAL;
             shown=SUCCEEDED(menu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke)));

@@ -88,12 +88,23 @@ int main() {
     nestlone::g_instance=GetModuleHandleW(nullptr);nestlone::g_visible=false;
     HWND host=CreateWindowExW(0,L"STATIC",L"test",WS_POPUP,0,0,800,600,nullptr,nullptr,nestlone::g_instance,nullptr);
     nestlone::g_host.defviewParent=host;
-    HWND background=CreateWindowExW(0,L"STATIC",L"background",WS_CHILD,0,0,800,600,host,nullptr,nestlone::g_instance,nullptr);
+    HWND background=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"background",WS_POPUP,0,0,800,600,nullptr,nullptr,nestlone::g_instance,nullptr);
+    nestlone::g_background=background;nestlone::g_host.defview=host;
+    HWND normal=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"normal app",WS_POPUP,0,0,10,10,nullptr,nullptr,nestlone::g_instance,nullptr);
+    SetWindowPos(host,HWND_BOTTOM,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    HWND beforeDesktop=GetWindow(host,GW_HWNDPREV);
+    SetWindowPos(normal,beforeDesktop,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    nestlone::g_visible=true;nestlone::UpdateSurfaceVisibility();
+    check(GetWindow(background,GW_OWNER)==nullptr,"desktop canvas has no external Explorer owner");
+    check(GetWindow(background,GW_HWNDNEXT)==host&&GetWindow(background,GW_HWNDPREV)==normal,"canvas stays below app and above desktop");
+    check(IsWindowVisible(background),"foreground app does not hide desktop canvas");
+    nestlone::g_visible=false;nestlone::UpdateSurfaceVisibility();
+    check(!IsWindowVisible(background),"explicit hide still hides canvas");
     WNDCLASSW wc{};wc.hInstance=nestlone::g_instance;wc.lpfnWndProc=nestlone::WidgetProc;wc.lpszClassName=L"nestlone-D.Widget";RegisterClassW(&wc);
     nestlone::SyncWidgets();
     check(nestlone::g_widgets.size()==1,"first widget creates without another component");
     HWND firstWidget=nestlone::g_widgets.front()->window;
-    check(GetWindow(host,GW_CHILD)==firstWidget,"first widget starts above desktop background as a sibling");
+    check(GetParent(firstWidget)==background,"widget is a child of application canvas, not Explorer");
     check((GetWindowLongPtrW(firstWidget,GWL_STYLE)&WS_VISIBLE)==0,"creating while hidden does not reveal widget");
     check(nestlone::PaintWeatherWidget(firstWidget,widgets.widgets[0]),"weather layered presentation succeeds");
     auto& weatherBuffer=*nestlone::g_paintBuffers[firstWidget];
@@ -115,7 +126,7 @@ int main() {
     check(GetParent(firstWidget)==GetParent(nestlone::g_widgets[1]->window),"components remain same-level desktop siblings");
     nestlone::g_visible=true;nestlone::SyncWidgets();check((GetWindowLongPtrW(firstWidget,GWL_STYLE)&WS_VISIBLE)!=0,"hidden widget can be shown again");
     widgets.widgets.clear();nestlone::SyncWidgets();check(nestlone::g_widgets.empty()&&!IsWindow(firstWidget)&&nestlone::g_paintBuffers.empty(),"clear removes component HWNDs and cached buffers");
-    DestroyWindow(background);DestroyWindow(host);nestlone::g_host={};nestlone::g_layout=nullptr;
+    DestroyWindow(normal);DestroyWindow(background);DestroyWindow(host);nestlone::g_background=nullptr;nestlone::g_host={};nestlone::g_layout=nullptr;
     nestlone::g_weatherIconFamily.reset();nestlone::g_weatherIconFonts.reset();
     Gdiplus::GdiplusShutdown(token);return failures?1:0;
 }

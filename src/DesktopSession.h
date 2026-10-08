@@ -27,7 +27,7 @@ struct DesktopSnapshot {
 struct DesktopMove {std::wstring path; POINT position;};
 bool ReadDesktop(DesktopSnapshot& result);
 bool ShellBackgroundMenuAvailable();
-bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint);
+bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint, bool* createBox=nullptr);
 // The custom canvas owns the popup, so it must forward Shell's lazy submenu
 // messages (notably the desktop "New" menu) while the popup is active.
 bool ForwardShellContextMenuMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT* result);

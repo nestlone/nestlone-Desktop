@@ -39,11 +39,8 @@ HWND g_manager=nullptr,g_background=nullptr,g_edit=nullptr;
 HINSTANCE g_instance=nullptr;
 ULONG_PTR g_token=0;
 HHOOK g_keyboardHook=nullptr;
+HWINEVENTHOOK g_foregroundHook=nullptr;
 bool g_visible=true,g_drag=false,g_resizing=false,g_resizeFromLeft=false,g_tabPending=false,g_tabDetached=false,g_nativeHidden=false;
-// Recent Windows builds can host SHELLDLL_DefView directly in Progman instead
-// of a paintable WorkerW.  In that topology child layered windows may exist but
-// never composite.  Use owned popup surfaces only for that fallback.
-bool g_popupSurface=false;
 bool g_interactivePaintQueued=false;
 std::atomic_bool g_weatherRequestInFlight=false;
 std::unique_ptr<Gdiplus::PrivateFontCollection> g_weatherIconFonts;
@@ -93,6 +90,7 @@ void RefreshVisualGeometry();
 void DrawVisualIcons(Gdiplus::Graphics&);
 LRESULT CALLBACK KeyboardProc(int code,WPARAM wParam,LPARAM lParam);
 LRESULT CALLBACK WidgetProc(HWND,UINT,WPARAM,LPARAM);
+void UpdateSurfaceVisibility();
 constexpr int kHeader=32;
 constexpr UINT_PTR kWeatherTimer=4;
 constexpr UINT kWeatherRefreshMs=5*60*1000;
@@ -318,14 +316,10 @@ bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false,bool leftGrip=false)
     if(ok&&box)buffer.decorationKey=key;
     return ok;
 }
-POINT ParentPoint(POINT point) {
-    point.x+=GetSystemMetrics(SM_XVIRTUALSCREEN);point.y+=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    if(g_popupSurface)return point;
-    ScreenToClient(g_host.defviewParent,&point);return point;
-}
-DWORD SurfaceWindowStyle() { return g_popupSurface ? WS_POPUP : WS_CHILD; }
-HWND SurfaceBackgroundInsertAfter() { return g_popupSurface ? HWND_BOTTOM : HWND_TOP; }
-HWND SurfaceControlInsertAfter() { return g_popupSurface && IsWindow(g_background) ? g_background : HWND_TOP; }
+POINT ParentPoint(POINT point) { return point; }
+HWND SurfaceParent() { return g_background ? g_background : g_host.defviewParent; }
+DWORD SurfaceWindowStyle() { return WS_CHILD; }
+HWND SurfaceControlInsertAfter() { return HWND_TOP; }
 struct WeatherReply {std::wstring summary,icon;int temperature=0;};
 bool ReadResourceBytes(int id,const BYTE*& data,DWORD& size) {
     HINSTANCE module=GetModuleHandleW(nullptr);HRSRC resource=FindResourceW(module,MAKEINTRESOURCEW(id),RT_RCDATA);
@@ -417,6 +411,27 @@ void UpdateWeatherSchedule() {
     SetTimer(g_manager,kWeatherTimer,kWeatherRefreshMs,nullptr);
 }
 void RefreshWeatherNow() {if(HasActiveWeatherWidget())FetchWeather();}
+// The application owns one top-level surface and all its decorations are
+// children. Keep the surface immediately above the desktop, below normal apps.
+// Never infer desktop visibility from a foreground process ID (Explorer also
+// owns ordinary folder windows), or hide the entire desktop on focus changes.
+bool SurfacePresentationAllowed() {return g_visible;}
+void UpdateSurfaceVisibility() {
+    if(!IsWindow(g_background))return;
+    if(!g_visible){ShowWindow(g_background,SW_HIDE);return;}
+    HWND desktop=GetAncestor(g_host.defview,GA_ROOT);
+    if(!IsWindow(desktop))return;
+    HWND preceding=GetWindow(desktop,GW_HWNDPREV);
+    while(preceding==g_background)preceding=GetWindow(preceding,GW_HWNDPREV);
+    // Inserting after a topmost window can itself promote our window.  Keep
+    // the canvas in the normal window band even when the desktop is foremost.
+    if(preceding&&(GetWindowLongPtrW(preceding,GWL_EXSTYLE)&WS_EX_TOPMOST))preceding=nullptr;
+    SetWindowPos(g_background,preceding?preceding:HWND_TOP,0,0,0,0,
+        SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_SHOWWINDOW);
+}
+void CALLBACK ForegroundProc(HWINEVENTHOOK,DWORD,HWND,LONG,LONG,DWORD,DWORD) {
+    if(g_manager)PostMessageW(g_manager,WM_APP+21,0,0);
+}
 void SyncWidgets() {
     if(!g_layout||!g_host.defviewParent)return;
     for(auto it=g_widgets.begin();it!=g_widgets.end();) {
@@ -427,15 +442,15 @@ void SyncWidgets() {
         if(found==g_widgets.end()) {
             auto widget=std::make_unique<WidgetWindow>();widget->id=model.id;POINT p=ParentPoint({model.rect.left,model.rect.top});
             const DWORD extended=model.type==L"weather"?(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW):WS_EX_TOOLWINDOW;
-            widget->window=CreateWindowExW(extended,L"nestlone-D.Widget",L"",SurfaceWindowStyle()|WS_CLIPCHILDREN,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,g_host.defviewParent,nullptr,g_instance,widget.get());
+            widget->window=CreateWindowExW(extended,L"nestlone-D.Widget",L"",SurfaceWindowStyle()|WS_CLIPCHILDREN,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,SurfaceParent(),nullptr,g_instance,widget.get());
             if(!widget->window)continue;
             if(model.type==L"note")widget->edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",model.text.c_str(),WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL,10,34,100,100,widget->window,reinterpret_cast<HMENU>(1),g_instance,nullptr);
             if(widget->edit)SendMessageW(widget->edit,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),TRUE);
             if(widget->edit)MoveWindow(widget->edit,8,34,max(1L,model.rect.right-model.rect.left-16),max(1L,model.rect.bottom-model.rect.top-42),TRUE);
             SetWindowPos(widget->window,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-            ShowWindow(widget->window,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);
+            ShowWindow(widget->window,SurfacePresentationAllowed()?SW_SHOWNOACTIVATE:SW_HIDE);
             g_widgets.push_back(std::move(widget));
-        } else {POINT p=ParentPoint({model.rect.left,model.rect.top});SetWindowPos((*found)->window,nullptr,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,SWP_NOACTIVATE|SWP_NOZORDER);ShowWindow((*found)->window,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);}
+        } else {POINT p=ParentPoint({model.rect.left,model.rect.top});SetWindowPos((*found)->window,nullptr,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,SWP_NOACTIVATE|SWP_NOZORDER);ShowWindow((*found)->window,SurfacePresentationAllowed()?SW_SHOWNOACTIVATE:SW_HIDE);}
     }
 }
 RECT ConstrainBoxToWorkArea(RECT rect,RECT work,int headerHeight) {
@@ -480,9 +495,10 @@ void PaintAll() {
         corner=ParentPoint({box->rect.left,box->rect.bottom-18});
         SetWindowPos(d->gripLeft,nullptr,corner.x,corner.y,18,18,SWP_NOACTIVATE|SWP_NOZORDER);
         PaintWindow(d->gripLeft,box,true,true);
-        ShowWindow(d->header,g_visible?SW_SHOWNOACTIVATE:SW_HIDE);
-        ShowWindow(d->grip,g_visible&&!box->collapsed?SW_SHOWNOACTIVATE:SW_HIDE);
-        ShowWindow(d->gripLeft,g_visible&&!box->collapsed?SW_SHOWNOACTIVATE:SW_HIDE);
+        const bool show=SurfacePresentationAllowed();
+        ShowWindow(d->header,show?SW_SHOWNOACTIVATE:SW_HIDE);
+        ShowWindow(d->grip,show&&!box->collapsed?SW_SHOWNOACTIVATE:SW_HIDE);
+        ShowWindow(d->gripLeft,show&&!box->collapsed?SW_SHOWNOACTIVATE:SW_HIDE);
     }
 }
 // Mouse messages can arrive much faster than the compositor can redraw the
@@ -772,7 +788,7 @@ bool BeginDragPreview(Box& box) {
     }
     WNDCLASSW wc{};wc.hInstance=g_instance;wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"nestlone-D.DragPreview";RegisterClassW(&wc);
     POINT top=ParentPoint({bounds.left,bounds.top});
-    HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,wc.lpszClassName,L"",SurfaceWindowStyle(),top.x,top.y,width,height,g_host.defviewParent,nullptr,g_instance,nullptr);
+    HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,wc.lpszClassName,L"",SurfaceWindowStyle(),top.x,top.y,width,height,SurfaceParent(),nullptr,g_instance,nullptr);
     if(!preview)return false;
     POINT source{};SIZE size{width,height};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
     if(!UpdateLayeredWindow(preview,nullptr,nullptr,&size,buffer.dc,&source,0,&blend,ULW_ALPHA)){DestroyWindow(preview);return false;}
@@ -871,7 +887,6 @@ void DestroyDecorations() {
     for(auto& d:g_decorations){if(IsWindow(d->header))DestroyWindow(d->header);if(IsWindow(d->gripLeft))DestroyWindow(d->gripLeft);if(IsWindow(d->grip))DestroyWindow(d->grip);}
     g_decorations.clear();if(IsWindow(g_background))DestroyWindow(g_background);g_background=nullptr;
     ReleaseVisualIcons();if(IsWindow(g_hiddenListview))ReleaseHiddenDesktopListView(g_hiddenListview);g_hiddenListview=nullptr;g_nativeHidden=false;
-    g_popupSurface=false;
 }
 LRESULT CALLBACK DecorationProc(HWND,UINT,WPARAM,LPARAM);
 void DrawWidgetLockGlyph(HDC dc,const RECT& bounds,bool locked,COLORREF background) {
@@ -1054,13 +1069,8 @@ bool PrimeSurface() {
 }
 void ShowPreparedSurface() {
     if(!g_visible)return;
-    ShowWindow(g_background,SW_SHOWNOACTIVATE);
-    for(auto& d:g_decorations) {
-        if(IsWindow(d->header))ShowWindow(d->header,SW_SHOWNOACTIVATE);
-        if(IsWindow(d->gripLeft))ShowWindow(d->gripLeft,SW_SHOWNOACTIVATE);
-        if(IsWindow(d->grip))ShowWindow(d->grip,SW_SHOWNOACTIVATE);
-    }
     SyncWidgets();
+    UpdateSurfaceVisibility();
 }
 bool HideNativeDesktopAfterSurfaceIsReady() {
     if(!g_visible)return true;
@@ -1077,10 +1087,15 @@ bool HideNativeDesktopAfterSurfaceIsReady() {
     return true;
 }
 bool Attach() {
+    // Foreground changes only require ordering our window. Do not enumerate
+    // every Explorer child or synchronously query its ListView every 350 ms.
+    if(IsWindow(g_background)&&IsWindow(g_host.listview)&&IsWindow(g_host.defviewParent)&&g_nativeHidden) {
+        UpdateSurfaceVisibility();return true;
+    }
     auto host=db::DiscoverDesktopHost();
     if(!host.listview || !host.defviewParent){db::LogF("[canvas] attach deferred: desktop host unavailable");return false;}
     if(g_background && IsWindow(g_background) && g_host.listview==host.listview) {
-        if(!g_visible||g_nativeHidden)return true;
+        if(!g_visible||g_nativeHidden){UpdateSurfaceVisibility();return true;}
         if(!PrimeSurface())return false;
         ShowPreparedSurface();
         // A hidden layered window can accept UpdateLayeredWindow without
@@ -1092,7 +1107,6 @@ bool Attach() {
         return true;
     }
     DestroyDecorations();g_host=host;
-    g_popupSurface=!host.wallpaperWorker;
     RestoreLegacyMask(host.listview);RecoverBoxPositions();
     DesktopSnapshot initial;
     if(!ReadDesktop(initial)||!initial.readable||initial.listview!=host.listview){
@@ -1100,18 +1114,18 @@ bool Attach() {
         return false;
     }
     g_snapshot=std::move(initial);g_visualDirty=true;
-    POINT origin=ParentPoint({0,0});
+    POINT origin{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)};
     g_background=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
-        L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),origin.x,origin.y,GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN),host.defviewParent,nullptr,g_instance,nullptr);
+        L"nestlone-D.Decoration",L"",WS_POPUP,origin.x,origin.y,GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN),nullptr,nullptr,g_instance,nullptr);
     if(!g_background){DestroyDecorations();return false;}
     // This is the owned desktop surface. Explorer's list view is hidden while
     // the surface is alive; file paths remain unchanged.
-    SetWindowPos(g_background,SurfaceBackgroundInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    SetWindowPos(g_background,HWND_BOTTOM,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     for(const auto& box:g_layout->boxes)if(IsGroupRoot(box)) {
         auto d=std::make_unique<Decoration>();d->id=box.id;
-        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,200,HeaderHeight(),host.defviewParent,nullptr,g_instance,d.get());
-        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,host.defviewParent,nullptr,g_instance,d.get());
-        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,host.defviewParent,nullptr,g_instance,d.get());
+        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,200,HeaderHeight(),SurfaceParent(),nullptr,g_instance,d.get());
+        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,SurfaceParent(),nullptr,g_instance,d.get());
+        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,SurfaceParent(),nullptr,g_instance,d.get());
         if(!d->header||!d->gripLeft||!d->grip){if(d->header)DestroyWindow(d->header);if(d->gripLeft)DestroyWindow(d->gripLeft);if(d->grip)DestroyWindow(d->grip);DestroyDecorations();return false;}
         SetWindowPos(d->header,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         SetWindowPos(d->gripLeft,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
@@ -1141,9 +1155,9 @@ void Rebuild(){
     for(const auto& box:g_layout->boxes)if(IsGroupRoot(box)) {
         if(std::any_of(g_decorations.begin(),g_decorations.end(),[&](const auto& d){return d->id==box.id;}))continue;
         auto d=std::make_unique<Decoration>();d->id=box.id;
-        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,200,HeaderHeight(),g_host.defviewParent,nullptr,g_instance,d.get());
-        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,g_host.defviewParent,nullptr,g_instance,d.get());
-        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,g_host.defviewParent,nullptr,g_instance,d.get());
+        d->header=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,200,HeaderHeight(),SurfaceParent(),nullptr,g_instance,d.get());
+        d->gripLeft=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,SurfaceParent(),nullptr,g_instance,d.get());
+        d->grip=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"nestlone-D.Decoration",L"",SurfaceWindowStyle(),0,0,18,18,SurfaceParent(),nullptr,g_instance,d.get());
         if(!d->header||!d->gripLeft||!d->grip){if(d->header)DestroyWindow(d->header);if(d->gripLeft)DestroyWindow(d->gripLeft);if(d->grip)DestroyWindow(d->grip);continue;}
         SetWindowPos(d->header,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         SetWindowPos(d->gripLeft,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
@@ -1153,6 +1167,12 @@ void Rebuild(){
     g_visualDirty=true;PaintAll();SyncWidgets();UpdateWeatherSchedule();SaveLayout(*g_layout);
 }
 void ToggleBoxView(Box& box) {box.iconView=!box.iconView;box.listScroll=0;SyncGroupRect(box);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
+void CreateBoxAt(POINT point) {
+    Box box;box.id=std::to_wstring(GetTickCount64());box.title=L"新盒子";
+    box.color=g_layout->defaultBoxColor;
+    box.rect={point.x,point.y,point.x+g_layout->defaultBoxWidth,point.y+g_layout->defaultBoxHeight};
+    g_layout->boxes.push_back(std::move(box));Rebuild();
+}
 void Menu(HWND hwnd,Box& box,POINT point) {
     Box* active=ActiveBox(box);
     HMENU menu=CreatePopupMenu();
@@ -1178,6 +1198,7 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     LRESULT shellResult=0;
     if(ForwardShellContextMenuMessage(message,wp,lp,&shellResult))return shellResult;
     if(message==WM_NCDESTROY)g_paintBuffers.erase(hwnd);
+    if(message==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
     if(message==WM_NCCREATE){auto c=reinterpret_cast<CREATESTRUCTW*>(lp);SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(c->lpCreateParams));}
     auto* d=reinterpret_cast<Decoration*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
     Box* box=d?FindBox(d->id):nullptr;
@@ -1209,7 +1230,13 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             else {
                 POINT virtualPoint{screen.x-GetSystemMetrics(SM_XVIRTUALSCREEN),screen.y-GetSystemMetrics(SM_YVIRTUALSCREEN)};bool boxHit=false;
                 for(auto& candidate:g_layout->boxes){RECT bounds=DisplayRect(candidate);if(PtInRect(&bounds,virtualPoint)){Menu(hwnd,candidate,screen);boxHit=true;break;}}
-                if(!boxHit&&ShowShellBackgroundMenu(hwnd,screen))PostMessageW(g_manager,WM_APP+12,0,0);
+                if(!boxHit) {
+                    bool createBox=false;
+                    if(ShowShellBackgroundMenu(hwnd,screen,&createBox)) {
+                        if(createBox)CreateBoxAt(virtualPoint);
+                        else PostMessageW(g_manager,WM_APP+12,0,0);
+                    }
+                }
             }
             return 0;
         }
@@ -1334,6 +1361,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         if(reply&&g_layout){for(auto& widget:g_layout->widgets)if(widget.type==L"weather"){widget.temperature=reply->temperature;widget.weather=reply->summary;widget.weatherIcon=reply->icon;}SaveLayout(*g_layout);for(auto& window:g_widgets)if(IsWindow(window->window)){if(auto* model=FindWidget(window->id);model&&model->type==L"weather")PaintWeatherWidget(window->window,*model);else InvalidateRect(window->window,nullptr,TRUE);}}
         return 0;
     }
+    if(message==WM_APP+21){UpdateSurfaceVisibility();return 0;}
     if(message==WM_APP+12){
         // Explorer may commit a background-menu command (New, View size,
         // Refresh) after the menu closes. Poll briefly so the owned canvas
@@ -1399,11 +1427,13 @@ bool CreateCanvas(HINSTANCE instance,HWND,Layout* layout) {
     g_manager=CreateWindowExW(WS_EX_TOOLWINDOW,L"nestlone-D.PositionRules",L"",WS_POPUP,0,0,0,0,nullptr,nullptr,instance,nullptr);
     if(!g_manager)return false;
     g_keyboardHook=SetWindowsHookExW(WH_KEYBOARD_LL,KeyboardProc,instance,0);
+    g_foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,ForegroundProc,0,0,WINEVENT_OUTOFCONTEXT);
     SetTimer(g_manager,1,350,nullptr);Attach();PollDesktop(g_snapshot);RefreshWeatherNow();return true;
 }
 void DestroyCanvas() {
     CancelDesktopMoves();DestroyDecorations();if(g_manager)DestroyWindow(g_manager);g_manager=nullptr;
     if(g_keyboardHook){UnhookWindowsHookEx(g_keyboardHook);g_keyboardHook=nullptr;}
+    if(g_foregroundHook){UnhookWinEvent(g_foregroundHook);g_foregroundHook=nullptr;}
     g_interactivePaintQueued=false;g_paintBuffers.clear();g_iconCache.clear();
     if(g_editFont){DeleteObject(g_editFont);g_editFont=nullptr;}
     g_weatherIconFamily.reset();g_weatherIconFonts.reset();g_weatherIconCss.clear();
@@ -1437,8 +1467,9 @@ void HandleCanvasCommand(CanvasCommand command) {
         }
         UpdateWeatherSchedule();if(g_visible)RefreshWeatherNow();
         if(g_visible)PaintAll();
+        UpdateSurfaceVisibility();
     }
-    if(command==CanvasCommand::NewBox) {Box box;box.id=std::to_wstring(GetTickCount64());box.title=L"新盒子";box.color=g_layout->defaultBoxColor;box.rect={160,160,160+g_layout->defaultBoxWidth,160+g_layout->defaultBoxHeight};g_layout->boxes.push_back(box);Rebuild();}
+    if(command==CanvasCommand::NewBox)CreateBoxAt({160,160});
     if(command==CanvasCommand::NewNote||command==CanvasCommand::NewWeather) {Layout::Widget widget;widget.id=std::to_wstring(GetTickCount64());widget.type=command==CanvasCommand::NewNote?L"note":L"weather";widget.rect={220,160,480,command==CanvasCommand::NewNote?390:310};widget.text=L"双击编辑内容";widget.weather=L"正在获取天气";g_layout->widgets.push_back(std::move(widget));SaveLayout(*g_layout);SyncWidgets();UpdateWeatherSchedule();if(command==CanvasCommand::NewWeather)RefreshWeatherNow();}
     if(command==CanvasCommand::ClearWidgets) {g_layout->widgets.clear();SaveLayout(*g_layout);SyncWidgets();UpdateWeatherSchedule();}
     if(command==CanvasCommand::Reload){g_iconCache.clear();*g_layout=LoadLayout();Rebuild();}
