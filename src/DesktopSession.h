@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <objidl.h>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -31,6 +32,9 @@ struct DesktopSnapshot {
 };
 struct DesktopMove {std::wstring path; POINT position;};
 bool ReadDesktop(DesktopSnapshot& result);
+// Builds Explorer's standard IDataObject for items in the current desktop
+// view.  The object uses the desktop parent PIDL and child PIDLs, not paths.
+HRESULT CreateDesktopDataObject(const std::vector<std::wstring>& paths, IDataObject** output);
 bool ShellBackgroundMenuAvailable();
 bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint, bool* createBox=nullptr);
 // The custom canvas owns the popup, so it must forward Shell's lazy submenu

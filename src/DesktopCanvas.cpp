@@ -1164,19 +1164,13 @@ void ShowShellMenu(HWND owner,const std::wstring& path,POINT screen) {
     } CoTaskMemFree(pidl);
 }
 bool DropDesktopItemsOn(const std::vector<std::wstring>& paths,const std::wstring& destination,POINT screen) {
-    std::vector<PIDLIST_ABSOLUTE> owned;std::vector<PCIDLIST_ABSOLUTE> pidls;
-    for(const auto& path:paths) {
-        PIDLIST_ABSOLUTE pidl=nullptr;
-        if(SUCCEEDED(SHParseDisplayName(path.c_str(),nullptr,&pidl,0,nullptr))&&pidl) {owned.push_back(pidl);pidls.push_back(pidl);}
-    }
-    if(pidls.empty())return false;
-    ComPtr<IDataObject> data;const HRESULT dataResult=SHCreateDataObject(nullptr,static_cast<UINT>(pidls.size()),pidls.data(),nullptr,IID_PPV_ARGS(&data));
-    for(auto pidl:owned)CoTaskMemFree(pidl);
+    ComPtr<IDataObject> data;const HRESULT dataResult=CreateDesktopDataObject(paths,data.GetAddressOf());
     auto target=ShellDropTargetFor(destination);if(FAILED(dataResult)||!target)return false;
     POINTL point{screen.x,screen.y};DWORD effect=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
     const HRESULT enter=target->DragEnter(data.Get(),MK_LBUTTON,point,&effect);
-    const HRESULT drop=SUCCEEDED(enter)&&effect!=DROPEFFECT_NONE?target->Drop(data.Get(),MK_LBUTTON,point,&effect):E_FAIL;
-    if(FAILED(drop)||effect==DROPEFFECT_NONE)return false;
+    const HRESULT over=SUCCEEDED(enter)&&effect!=DROPEFFECT_NONE?target->DragOver(MK_LBUTTON,point,&effect):E_FAIL;
+    const HRESULT drop=SUCCEEDED(over)&&effect!=DROPEFFECT_NONE?target->Drop(data.Get(),MK_LBUTTON,point,&effect):E_FAIL;
+    if(FAILED(drop)||effect==DROPEFFECT_NONE){db::LogF("[drop] target rejected source=0x%08lx enter=0x%08lx over=0x%08lx drop=0x%08lx effect=%lu",static_cast<unsigned long>(dataResult),static_cast<unsigned long>(enter),static_cast<unsigned long>(over),static_cast<unsigned long>(drop),static_cast<unsigned long>(effect));return false;}
     for(auto& box:g_layout->boxes)box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.c_str())==0;});}),box.items.end());
     g_layout->desktop.erase(std::remove_if(g_layout->desktop.begin(),g_layout->desktop.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.path.c_str())==0;});}),g_layout->desktop.end());
     SaveLayout(*g_layout);PostMessageW(g_manager,WM_APP+12,0,0);return true;

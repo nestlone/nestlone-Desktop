@@ -137,6 +137,34 @@ bool ReadDesktop(DesktopSnapshot& result) {
     }
     result.readable=true;return true;
 }
+HRESULT CreateDesktopDataObject(const std::vector<std::wstring>& paths,IDataObject** output) {
+    if(!output)return E_POINTER;*output=nullptr;
+    if(paths.empty())return E_INVALIDARG;
+    ComPtr<IFolderView2> view;ComPtr<IShellFolder> folder;
+    if(!View(view)||FAILED(view->GetFolder(IID_PPV_ARGS(&folder))))return E_FAIL;
+    PIDLIST_ABSOLUTE parent=nullptr;
+    HRESULT result=SHGetIDListFromObject(folder.Get(),&parent);
+    if(FAILED(result)||!parent)return FAILED(result)?result:E_FAIL;
+    std::vector<PITEMID_CHILD> children;children.reserve(paths.size());
+    int count=0;result=view->ItemCount(SVGIO_ALLVIEW,&count);
+    if(SUCCEEDED(result))for(int index=0;index<count&&children.size()<paths.size();++index) {
+        PITEMID_CHILD item=nullptr;STRRET parsed{};wchar_t name[32768]{};
+        if(SUCCEEDED(view->Item(index,&item))&&item) {
+            const bool matches=SUCCEEDED(folder->GetDisplayNameOf(item,SHGDN_FORPARSING,&parsed))&&
+                SUCCEEDED(StrRetToBufW(&parsed,item,name,32768))&&std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),name)==0;});
+            if(matches)if(auto copy=ILClone(item))children.push_back(copy);
+            CoTaskMemFree(item);
+        }
+    }
+    if(SUCCEEDED(result)&&children.size()==paths.size()) {
+        std::vector<PCUITEMID_CHILD> childViews;childViews.reserve(children.size());
+        for(const auto child:children)childViews.push_back(child);
+        result=SHCreateDataObject(parent,static_cast<UINT>(childViews.size()),childViews.data(),nullptr,IID_PPV_ARGS(output));
+    }
+    else if(SUCCEEDED(result))result=HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    for(auto child:children)CoTaskMemFree(child);
+    CoTaskMemFree(parent);return result;
+}
 uint64_t QueueDesktopMoves(const std::vector<DesktopMove>& moves) {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->moves=moves;return ++state->requested;
