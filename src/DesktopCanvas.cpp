@@ -89,6 +89,8 @@ POINT g_marqueeStart{};
 RECT g_marqueeRect{};
 std::vector<std::wstring> g_selectionStart;
 std::vector<std::wstring> g_pendingDelete;
+struct PendingShellDrop {std::wstring path;ULONGLONG started=0;};
+std::vector<PendingShellDrop> g_pendingShellDrops;
 bool g_visualDirty=true;
 void CancelIconGesture();
 void BeginItemRename(const std::wstring& path);
@@ -756,6 +758,23 @@ void SetVisualGeometry(VisualIcon& visual,const Box* box,int slot) {
         : RECT{row.left,visual.position.y+visual.size+3,row.right,min(row.bottom,visual.position.y+visual.size+3+titleHeight)};
 }
 void ReleaseVisualIcons() { g_visualIcons.clear(); }
+bool IsPendingShellDrop(const std::wstring& path) {return std::any_of(g_pendingShellDrops.begin(),g_pendingShellDrops.end(),[&](const auto& pending){return _wcsicmp(pending.path.c_str(),path.c_str())==0;});}
+void MarkPendingShellDrops(const std::vector<std::wstring>& paths) {
+    const ULONGLONG now=GetTickCount64();
+    for(const auto& path:paths)if(!IsPendingShellDrop(path))g_pendingShellDrops.push_back({path,now});
+}
+void ClearPendingShellDrops(const std::vector<std::wstring>& paths) {
+    g_pendingShellDrops.erase(std::remove_if(g_pendingShellDrops.begin(),g_pendingShellDrops.end(),[&](const auto& pending){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),pending.path.c_str())==0;});}),g_pendingShellDrops.end());
+}
+void ReconcilePendingShellDrops(const DesktopSnapshot& snapshot) {
+    const ULONGLONG now=GetTickCount64();const auto previous=g_pendingShellDrops.size();
+    g_pendingShellDrops.erase(std::remove_if(g_pendingShellDrops.begin(),g_pendingShellDrops.end(),[&](const auto& pending){
+        // A missing desktop item confirms a move/delete. A target that did
+        // not ultimately consume it is restored after a short safety window.
+        return !FindEntry(snapshot,pending.path)||now-pending.started>2500;
+    }),g_pendingShellDrops.end());
+    if(previous!=g_pendingShellDrops.size())g_visualDirty=true;
+}
 POINT VisualPosition(const std::wstring& path) {
     for(const auto& box:g_layout->boxes)if(HasPath(box,path)&&!box.collapsed) {
         int slot=0;for(const auto& item:box.items){if(_wcsicmp(item.c_str(),path.c_str())==0)break;if(FindEntry(g_snapshot,item))++slot;}
@@ -770,6 +789,7 @@ POINT VisualPosition(const std::wstring& path) {
 void RebuildVisualIcons() {
     std::vector<std::wstring> selected;for(const auto& item:g_visualIcons)if(item.selected)selected.push_back(item.path);ReleaseVisualIcons();if(!g_snapshot.readable)return;
     for(const auto& entry:g_snapshot.entries) {
+        if(IsPendingShellDrop(entry.path))continue;
         const Box* owner=nullptr;int slot=0;
         for(const auto& box:g_layout->boxes)if(HasPath(box,entry.path)){owner=&box;for(const auto& item:box.items){if(_wcsicmp(item.c_str(),entry.path.c_str())==0)break;if(FindEntry(g_snapshot,item))++slot;}break;}
         if(owner&&(!IsActiveTab(*owner)||GroupRoot(*owner)->collapsed))continue;
@@ -1163,17 +1183,30 @@ void ShowShellMenu(HWND owner,const std::wstring& path,POINT screen) {
         }
     } CoTaskMemFree(pidl);
 }
-bool DropDesktopItemsOn(const std::vector<std::wstring>& paths,const std::wstring& destination,POINT screen) {
+struct ShellDropOperation {ComPtr<IDataObject> data;ComPtr<IDropTarget> target;POINTL point{};DWORD agreedEffect=0;std::vector<std::wstring> paths;};
+void RemoveMovedDesktopItems(const std::vector<std::wstring>& paths) {
+    for(auto& box:g_layout->boxes)box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.c_str())==0;});}),box.items.end());
+    g_layout->desktop.erase(std::remove_if(g_layout->desktop.begin(),g_layout->desktop.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.path.c_str())==0;});}),g_layout->desktop.end());
+    SaveLayout(*g_layout);
+}
+std::unique_ptr<ShellDropOperation> BeginDesktopShellDrop(const std::vector<std::wstring>& paths,const std::wstring& destination,POINT screen) {
     ComPtr<IDataObject> data;const HRESULT dataResult=CreateDesktopDataObject(paths,data.GetAddressOf());
-    auto target=ShellDropTargetFor(destination);if(FAILED(dataResult)||!target)return false;
+    auto target=ShellDropTargetFor(destination);if(FAILED(dataResult)||!target)return {};
     POINTL point{screen.x,screen.y};DWORD effect=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
     const HRESULT enter=target->DragEnter(data.Get(),MK_LBUTTON,point,&effect);
     const HRESULT over=SUCCEEDED(enter)&&effect!=DROPEFFECT_NONE?target->DragOver(MK_LBUTTON,point,&effect):E_FAIL;
-    const HRESULT drop=SUCCEEDED(over)&&effect!=DROPEFFECT_NONE?target->Drop(data.Get(),MK_LBUTTON,point,&effect):E_FAIL;
-    if(FAILED(drop)||effect==DROPEFFECT_NONE){db::LogF("[drop] target rejected source=0x%08lx enter=0x%08lx over=0x%08lx drop=0x%08lx effect=%lu",static_cast<unsigned long>(dataResult),static_cast<unsigned long>(enter),static_cast<unsigned long>(over),static_cast<unsigned long>(drop),static_cast<unsigned long>(effect));return false;}
-    for(auto& box:g_layout->boxes)box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.c_str())==0;});}),box.items.end());
-    g_layout->desktop.erase(std::remove_if(g_layout->desktop.begin(),g_layout->desktop.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.path.c_str())==0;});}),g_layout->desktop.end());
-    SaveLayout(*g_layout);PostMessageW(g_manager,WM_APP+12,0,0);return true;
+    if(FAILED(over)||effect==DROPEFFECT_NONE){target->DragLeave();db::LogF("[drop] target rejected source=0x%08lx enter=0x%08lx over=0x%08lx effect=%lu",static_cast<unsigned long>(dataResult),static_cast<unsigned long>(enter),static_cast<unsigned long>(over),static_cast<unsigned long>(effect));return {};}
+    auto operation=std::make_unique<ShellDropOperation>();operation->data=std::move(data);operation->target=std::move(target);operation->point=point;operation->agreedEffect=effect;operation->paths=paths;return operation;
+}
+bool CompleteDesktopShellDrop(ShellDropOperation& operation) {
+    // Some Shell targets (notably Recycle Bin) accept the transfer but write
+    // DROPEFFECT_NONE on return. The negotiated DragOver effect is the stable
+    // result; only a failing HRESULT means the optimistic visual must revert.
+    DWORD reportedEffect=operation.agreedEffect;
+    const HRESULT drop=operation.target->Drop(operation.data.Get(),0,operation.point,&reportedEffect);
+    if(FAILED(drop)){db::LogF("[drop] completion failed drop=0x%08lx effect=%lu",static_cast<unsigned long>(drop),static_cast<unsigned long>(reportedEffect));ClearPendingShellDrops(operation.paths);g_visualDirty=true;PaintAll();return false;}
+    if(operation.agreedEffect&DROPEFFECT_MOVE)RemoveMovedDesktopItems(operation.paths);
+    PostMessageW(g_manager,WM_APP+12,0,0);return true;
 }
 void FinishVisualDrag() {
     if(g_iconDrag<0||g_iconDrag>=static_cast<int>(g_visualIcons.size()))return;
@@ -1209,7 +1242,11 @@ void FinishVisualDrag() {
     });
     if(nativeTarget!=g_visualIcons.rend()) {
         POINT screen{center.x+GetSystemMetrics(SM_XVIRTUALSCREEN),center.y+GetSystemMetrics(SM_YVIRTUALSCREEN)};
-        if(DropDesktopItemsOn(paths,nativeTarget->path,screen)) {g_visualDirty=true;g_iconDrag=-1;g_iconDragStart.clear();PaintAll();return;}
+        if(auto operation=BeginDesktopShellDrop(paths,nativeTarget->path,screen)) {
+            if(operation->agreedEffect&DROPEFFECT_MOVE)MarkPendingShellDrops(paths);
+            g_visualDirty=true;g_iconDrag=-1;g_iconDragStart.clear();PaintAll();
+            PostMessageW(g_manager,WM_APP+15,0,reinterpret_cast<LPARAM>(operation.release()));return;
+        }
     }
     for(auto& box:g_layout->boxes) {
         box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& item){
@@ -1578,6 +1615,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     if(message==WM_APP+11){Rebuild();return 0;}
     if(message==WM_APP+13){DeleteSelection();return 0;}
     if(message==WM_APP+14){std::unique_ptr<std::wstring> path(reinterpret_cast<std::wstring*>(lp));if(path)BeginItemRename(*path);return 0;}
+    if(message==WM_APP+15){std::unique_ptr<ShellDropOperation> operation(reinterpret_cast<ShellDropOperation*>(lp));if(operation)CompleteDesktopShellDrop(*operation);return 0;}
     if(message==WM_APP+20){
         std::unique_ptr<WeatherReply> reply(reinterpret_cast<WeatherReply*>(lp));
         if(reply&&!reply->diagnostic.empty())db::LogF("[weather] %s",db::ToUtf8(reply->diagnostic).c_str());
@@ -1590,7 +1628,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         // Refresh) after the menu closes. Poll briefly so the owned canvas
         // receives the same change notification it would have received from
         // Explorer's visible ListView.
-        g_shellRefreshAttempts=10;SetTimer(hwnd,kShellRefreshTimer,120,nullptr);return 0;
+        g_shellRefreshAttempts=g_pendingShellDrops.empty()?10:40;SetTimer(hwnd,kShellRefreshTimer,g_pendingShellDrops.empty()?120:50,nullptr);return 0;
     }
     if(message==WM_TIMER&&wp==kInteractivePaintTimer) {
         KillTimer(hwnd,kInteractivePaintTimer);g_interactivePaintQueued=false;
@@ -1606,6 +1644,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         if(PollDesktop(next)&&next.readable) {
             const bool changed=SnapshotVisualsChanged(g_snapshot,next);
             PlaceNewDesktopEntries(g_snapshot,next);
+            ReconcilePendingShellDrops(next);
             g_snapshot=std::move(next);
             if(changed)g_iconCache.clear();
             // Force an owned-canvas redraw even for a shell command whose
@@ -1632,6 +1671,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                 if(!(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000)){
                     bool resourcesChanged=SnapshotVisualsChanged(g_snapshot,next);
                     PlaceNewDesktopEntries(g_snapshot,next);
+                    ReconcilePendingShellDrops(next);
                     g_snapshot=std::move(next);
                     if(g_nativeHidden&&resourcesChanged){g_iconCache.clear();g_visualDirty=true;PaintAll();}
                 }
