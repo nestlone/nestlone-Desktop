@@ -35,8 +35,14 @@ bool ReadDesktop(DesktopSnapshot& result);
 // Builds Explorer's standard IDataObject for items in the current desktop
 // view.  The object uses the desktop parent PIDL and child PIDLs, not paths.
 HRESULT CreateDesktopDataObject(const std::vector<std::wstring>& paths, IDataObject** output);
+// Gives the real desktop ListView the selected Shell items and a keyboard
+// command, preserving Explorer's copy/cut/delete/undo behavior.
+bool ForwardDesktopShortcut(const std::vector<std::wstring>& selectedPaths, UINT virtualKey);
+HRESULT CreateDesktopBackgroundDropTarget(HWND owner, IDropTarget** output);
 bool ShellBackgroundMenuAvailable();
 bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint, bool* createBox=nullptr);
+// Invokes Explorer's background Paste command against the real desktop view.
+bool PasteDesktopClipboard(HWND owner);
 // The custom canvas owns the popup, so it must forward Shell's lazy submenu
 // messages (notably the desktop "New" menu) while the popup is active.
 bool ForwardShellContextMenuMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT* result);

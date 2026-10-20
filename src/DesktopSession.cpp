@@ -81,6 +81,25 @@ bool ShowShellBackgroundMenu(HWND owner, POINT screenPoint, bool* createBox) {
     }
     DestroyMenu(popup);return shown;
 }
+bool PasteDesktopClipboard(HWND owner) {
+    ComPtr<IShellView> view;ComPtr<IContextMenu> menu;
+    if(!ShellView(view)||FAILED(view->GetItemObject(SVGIO_BACKGROUND,IID_PPV_ARGS(&menu))))return false;
+    HMENU popup=CreatePopupMenu();if(!popup)return false;
+    constexpr UINT first=1,last=0x7fff;bool pasted=false;
+    if(SUCCEEDED(menu->QueryContextMenu(popup,0,first,last,CMF_NORMAL))) {
+        const int count=GetMenuItemCount(popup);
+        for(int index=0;index<count;++index) {
+            const UINT command=GetMenuItemID(popup,index);
+            if(command==static_cast<UINT>(-1)||command<first||command>last)continue;
+            char verb[64]{};
+            if(FAILED(menu->GetCommandString(command-first,GCS_VERBA,nullptr,verb,sizeof(verb)))||_stricmp(verb,"paste")!=0)continue;
+            CMINVOKECOMMANDINFOEX invoke{};invoke.cbSize=sizeof(invoke);invoke.fMask=CMIC_MASK_UNICODE;invoke.hwnd=owner;
+            invoke.lpVerb=MAKEINTRESOURCEA(command-first);invoke.lpVerbW=MAKEINTRESOURCEW(command-first);invoke.nShow=SW_SHOWNORMAL;
+            pasted=SUCCEEDED(menu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke)));break;
+        }
+    }
+    DestroyMenu(popup);return pasted;
+}
 bool ForwardShellContextMenuMessage(UINT message, WPARAM wParam, LPARAM lParam, LRESULT* result) {
     if(message!=WM_INITMENUPOPUP&&message!=WM_DRAWITEM&&message!=WM_MEASUREITEM&&message!=WM_MENUCHAR)return false;
     if(backgroundMenu3) {
@@ -164,6 +183,46 @@ HRESULT CreateDesktopDataObject(const std::vector<std::wstring>& paths,IDataObje
     else if(SUCCEEDED(result))result=HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
     for(auto child:children)CoTaskMemFree(child);
     CoTaskMemFree(parent);return result;
+}
+bool ForwardDesktopShortcut(const std::vector<std::wstring>& selectedPaths,UINT virtualKey) {
+    auto host=db::DiscoverDesktopHost();ComPtr<IFolderView2> view;ComPtr<IShellFolder> folder;
+    if(!host.listview||!View(view)||FAILED(view->GetFolder(IID_PPV_ARGS(&folder))))return false;
+    bool focused=false;int count=0;
+    if(FAILED(view->ItemCount(SVGIO_ALLVIEW,&count)))return false;
+    for(int index=0;index<count;++index) {
+        PITEMID_CHILD item=nullptr;STRRET parsed{};wchar_t name[32768]{};
+        if(SUCCEEDED(view->Item(index,&item))&&item) {
+            const bool selected=SUCCEEDED(folder->GetDisplayNameOf(item,SHGDN_FORPARSING,&parsed))&&
+                SUCCEEDED(StrRetToBufW(&parsed,item,name,32768))&&std::any_of(selectedPaths.begin(),selectedPaths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),name)==0;});
+            if(selected) {
+                DWORD flags=SVSI_SELECT;
+                if(!focused){flags|=SVSI_DESELECTOTHERS|SVSI_FOCUSED;focused=true;}
+                view->SelectItem(index,flags);
+            }
+            CoTaskMemFree(item);
+        }
+    }
+    if(!focused)view->SelectItem(-1,SVSI_DESELECTOTHERS);
+    const LPARAM keyData=1|(static_cast<LPARAM>(MapVirtualKeyW(virtualKey,MAPVK_VK_TO_VSC))<<16);
+    DWORD_PTR reply=0;
+    const bool down=SendMessageTimeoutW(host.listview,WM_KEYDOWN,virtualKey,keyData,SMTO_ABORTIFHUNG,300,&reply)!=0;
+    SendMessageTimeoutW(host.listview,WM_KEYUP,virtualKey,keyData|0xC0000000,SMTO_ABORTIFHUNG,300,&reply);
+    return down;
+}
+HRESULT CreateDesktopBackgroundDropTarget(HWND owner,IDropTarget** output) {
+    if(!output)return E_POINTER;*output=nullptr;
+    // The active view owns the best target because it understands the
+    // desktop's current namespace and view settings.  Some Explorer builds
+    // do not expose SVGIO_BACKGROUND while the ListView is hidden, so retain
+    // the desktop folder's documented CreateViewObject target as a fallback.
+    ComPtr<IShellView> shellView;
+    if(ShellView(shellView)) {
+        const HRESULT fromView=shellView->GetItemObject(SVGIO_BACKGROUND,IID_IDropTarget,reinterpret_cast<void**>(output));
+        if(SUCCEEDED(fromView)&&*output)return S_OK;
+    }
+    ComPtr<IFolderView2> view;ComPtr<IShellFolder> folder;
+    if(!View(view)||FAILED(view->GetFolder(IID_PPV_ARGS(&folder))))return E_FAIL;
+    return folder->CreateViewObject(owner,IID_IDropTarget,reinterpret_cast<void**>(output));
 }
 uint64_t QueueDesktopMoves(const std::vector<DesktopMove>& moves) {
     std::lock_guard<std::mutex> lock(state->mutex);

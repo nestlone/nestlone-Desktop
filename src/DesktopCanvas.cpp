@@ -10,6 +10,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <ole2.h>
 #include <winhttp.h>
 #pragma warning(push)
 #pragma warning(disable:4996)
@@ -1077,7 +1078,7 @@ int HitVisualIcon(int x,int y) { for(int i=static_cast<int>(g_visualIcons.size()
 ComPtr<IDropTarget> ShellDropTargetFor(const std::wstring& path) {
     PIDLIST_ABSOLUTE pidl=nullptr;ComPtr<IShellFolder> parent;PCUITEMID_CHILD child=nullptr;ComPtr<IDropTarget> target;
     if(SUCCEEDED(SHParseDisplayName(path.c_str(),nullptr,&pidl,0,nullptr))&&pidl) {
-        if(SUCCEEDED(SHBindToParent(pidl,IID_PPV_ARGS(&parent),&child)))parent->GetUIObjectOf(g_background,1,&child,IID_IDropTarget,nullptr,reinterpret_cast<void**>(target.GetAddressOf()));
+        if(SUCCEEDED(SHBindToParent(pidl,IID_PPV_ARGS(&parent),&child)))parent->GetUIObjectOf(g_host.defviewParent?g_host.defviewParent:g_background,1,&child,IID_IDropTarget,nullptr,reinterpret_cast<void**>(target.GetAddressOf()));
         CoTaskMemFree(pidl);
     }
     return target;
@@ -1091,8 +1092,8 @@ class CanvasDropTarget final : public IDropTarget {
     HRESULT Select(IDataObject* data,DWORD keys,POINTL point,DWORD* effect) {
         const int index=HitVisualIcon(point.x-GetSystemMetrics(SM_XVIRTUALSCREEN),point.y-GetSystemMetrics(SM_YVIRTUALSCREEN));
         const std::wstring next=index>=0?g_visualIcons[index].path:L"";
-        if(next.empty()) {Clear(true);if(effect)*effect=DROPEFFECT_NONE;return S_OK;}
-        if(!target_||_wcsicmp(next.c_str(),path_.c_str())!=0) {Clear(true);target_=ShellDropTargetFor(next);path_=next;}
+        const std::wstring key=next.empty()?L"<desktop-background>":next;
+        if(!target_||_wcsicmp(key.c_str(),path_.c_str())!=0) {Clear(true);if(next.empty())CreateDesktopBackgroundDropTarget(g_host.defviewParent?g_host.defviewParent:g_background,target_.GetAddressOf());else target_=ShellDropTargetFor(next);path_=key;}
         if(!target_) {if(effect)*effect=DROPEFFECT_NONE;return S_OK;}
         data_=data;return target_->DragEnter(data,keys,point,effect);
     }
@@ -1104,7 +1105,8 @@ public:
     HRESULT STDMETHODCALLTYPE DragOver(DWORD keys,POINTL point,DWORD* effect) override {
         const int index=HitVisualIcon(point.x-GetSystemMetrics(SM_XVIRTUALSCREEN),point.y-GetSystemMetrics(SM_YVIRTUALSCREEN));
         const std::wstring next=index>=0?g_visualIcons[index].path:L"";
-        if(next!=path_)return Select(data_.Get(),keys,point,effect);
+        const std::wstring key=next.empty()?L"<desktop-background>":next;
+        if(key!=path_)return Select(data_.Get(),keys,point,effect);
         if(!target_){if(effect)*effect=DROPEFFECT_NONE;return S_OK;}return target_->DragOver(keys,point,effect);
     }
     HRESULT STDMETHODCALLTYPE DragLeave() override {Clear(true);return S_OK;}
@@ -1134,6 +1136,9 @@ void RequestDeleteSelection() {
     for(const auto& item:g_visualIcons)if(item.selected&&GetFileAttributesW(item.path.c_str())!=INVALID_FILE_ATTRIBUTES)g_pendingDelete.push_back(item.path);
     if(!g_pendingDelete.empty())PostMessageW(g_manager,WM_APP+13,0,0);
 }
+std::vector<std::wstring> SelectedVisualPaths() {
+    std::vector<std::wstring> paths;for(const auto& item:g_visualIcons)if(item.selected)paths.push_back(item.path);return paths;
+}
 void DeleteSelection() {
     std::vector<std::wstring> paths=std::move(g_pendingDelete);g_pendingDelete.clear();
     if(paths.empty())return;
@@ -1144,16 +1149,14 @@ void DeleteSelection() {
 LRESULT CALLBACK KeyboardProc(int code,WPARAM wParam,LPARAM lParam) {
     if(code==HC_ACTION&&(wParam==WM_KEYDOWN||wParam==WM_SYSKEYDOWN)&&!g_edit&&g_visible&&DesktopPointerActive()) {
         const auto* key=reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
-        const bool deleteKey=key->vkCode==VK_DELETE;
-        const bool ctrlD=key->vkCode=='D'&&(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
-        if(deleteKey||ctrlD) {
-            RequestDeleteSelection();
-            if(!g_pendingDelete.empty())return 1;
-        }
+        const bool ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
+        const bool nativeShortcut=key->vkCode==VK_DELETE||(ctrl&&(key->vkCode=='A'||key->vkCode=='C'||key->vkCode=='X'||key->vkCode=='D'||key->vkCode=='Z'||key->vkCode=='Y'));
+        if(nativeShortcut&&ForwardDesktopShortcut(SelectedVisualPaths(),key->vkCode)) {if(ctrl&&key->vkCode=='A'){for(auto& icon:g_visualIcons)icon.selected=true;PaintAll();}return 1;}
         if(key->vkCode==VK_F2) {
             auto selected=std::find_if(g_visualIcons.begin(),g_visualIcons.end(),[](const auto& icon){return icon.selected;});
             if(selected!=g_visualIcons.end()) {PostMessageW(g_manager,WM_APP+14,0,reinterpret_cast<LPARAM>(new std::wstring(selected->path)));return 1;}
         }
+        if(ctrl&&key->vkCode=='V'&&ForwardDesktopShortcut({},key->vkCode))return 1;
     }
     return CallNextHookEx(g_keyboardHook,code,wParam,lParam);
 }
@@ -1184,6 +1187,49 @@ void ShowShellMenu(HWND owner,const std::wstring& path,POINT screen) {
     } CoTaskMemFree(pidl);
 }
 struct ShellDropOperation {ComPtr<IDataObject> data;ComPtr<IDropTarget> target;POINTL point{};DWORD agreedEffect=0;std::vector<std::wstring> paths;};
+// Explorer performs cross-window file drags through OLE.  The canvas owns the
+// hit testing for desktop icons, so use a minimal source object when the
+// pointer leaves the canvas and hand Explorer's IDataObject to DoDragDrop.
+class DesktopDragSource final : public IDropSource {
+    LONG references_=1;
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** value) override {
+        if(!value)return E_POINTER;*value=nullptr;
+        if(iid==IID_IUnknown||iid==IID_IDropSource){*value=static_cast<IDropSource*>(this);AddRef();return S_OK;}
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {return static_cast<ULONG>(InterlockedIncrement(&references_));}
+    ULONG STDMETHODCALLTYPE Release() override {const LONG count=InterlockedDecrement(&references_);if(!count)delete this;return static_cast<ULONG>(count);}
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape,DWORD keys) override {
+        if(escape)return DRAGDROP_S_CANCEL;
+        return (keys&MK_LBUTTON)?S_OK:DRAGDROP_S_DROP;
+    }
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override {return DRAGDROP_S_USEDEFAULTCURSORS;}
+};
+bool IsCanvasSurfaceWindow(HWND window) {
+    return window&&(window==g_background||IsChild(g_background,window));
+}
+void RemoveMovedDesktopItems(const std::vector<std::wstring>& paths);
+void BeginExternalShellDrag() {
+    std::vector<std::wstring> paths;
+    for(const auto& item:g_iconDragStart)paths.push_back(item.first);
+    if(paths.empty())return;
+    ComPtr<IDataObject> data;
+    const HRESULT create=CreateDesktopDataObject(paths,data.GetAddressOf());
+    if(FAILED(create)){db::LogF("[drag] desktop data object unavailable: 0x%08lx",static_cast<unsigned long>(create));return;}
+    g_iconDrag=-1;g_iconMoved=false;g_iconDragStart.clear();
+    if(GetCapture())ReleaseCapture();
+    auto* source=new DesktopDragSource();DWORD effect=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
+    const HRESULT result=DoDragDrop(data.Get(),source,effect,&effect);
+    source->Release();
+    if(SUCCEEDED(result)&&(effect&DROPEFFECT_MOVE)) {
+        // The target owns the filesystem operation.  Hide the source visuals
+        // immediately and let the regular shell refresh confirm the move.
+        MarkPendingShellDrops(paths);RemoveMovedDesktopItems(paths);
+    }
+    g_visualDirty=true;PaintAll();
+    PostMessageW(g_manager,WM_APP+12,0,0);
+}
 void RemoveMovedDesktopItems(const std::vector<std::wstring>& paths) {
     for(auto& box:g_layout->boxes)box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.c_str())==0;});}),box.items.end());
     g_layout->desktop.erase(std::remove_if(g_layout->desktop.begin(),g_layout->desktop.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.path.c_str())==0;});}),g_layout->desktop.end());
@@ -1455,7 +1501,7 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         if(hwnd==g_background && message==WM_MOUSEMOVE && GetCapture()==hwnd) {
             POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
             if(g_marquee){UpdateMarquee(point);QueueInteractivePaint();return 0;}
-            if(g_iconDrag>=0){POINT cursor{};GetCursorPos(&cursor);LONG dx=cursor.x-g_iconMouseStart.x,dy=cursor.y-g_iconMouseStart.y;if(!g_iconMoved&&abs(dx)<4&&abs(dy)<4)return 0;g_iconMoved=true;for(auto& item:g_visualIcons)if(item.selected){auto start=std::find_if(g_iconDragStart.begin(),g_iconDragStart.end(),[&](const auto& value){return _wcsicmp(value.first.c_str(),item.path.c_str())==0;});if(start!=g_iconDragStart.end()){item.position=ClampDesktopPosition({start->second.x+dx,start->second.y+dy});RefreshIconHit(item);}}QueueInteractivePaint();return 0;}
+            if(g_iconDrag>=0){POINT cursor{};GetCursorPos(&cursor);LONG dx=cursor.x-g_iconMouseStart.x,dy=cursor.y-g_iconMouseStart.y;if(!g_iconMoved&&abs(dx)<4&&abs(dy)<4)return 0;if(!IsCanvasSurfaceWindow(WindowFromPoint(cursor))){BeginExternalShellDrag();return 0;}g_iconMoved=true;for(auto& item:g_visualIcons)if(item.selected){auto start=std::find_if(g_iconDragStart.begin(),g_iconDragStart.end(),[&](const auto& value){return _wcsicmp(value.first.c_str(),item.path.c_str())==0;});if(start!=g_iconDragStart.end()){item.position=ClampDesktopPosition({start->second.x+dx,start->second.y+dy});RefreshIconHit(item);}}QueueInteractivePaint();return 0;}
         }
         if(hwnd==g_background && message==WM_LBUTTONUP){if(g_marquee){ReleaseCapture();FinishMarquee();return 0;}if(g_iconDrag>=0){ReleaseCapture();if(g_iconMoved)FinishVisualDrag();else{g_iconDrag=-1;g_iconDragStart.clear();}return 0;}}
         if(hwnd==g_background && message==WM_LBUTTONDBLCLK){int hit=HitVisualIcon(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));if(hit>=0)ShellExecuteW(nullptr,L"open",g_visualIcons[hit].path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);return 0;}
@@ -1616,6 +1662,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     if(message==WM_APP+13){DeleteSelection();return 0;}
     if(message==WM_APP+14){std::unique_ptr<std::wstring> path(reinterpret_cast<std::wstring*>(lp));if(path)BeginItemRename(*path);return 0;}
     if(message==WM_APP+15){std::unique_ptr<ShellDropOperation> operation(reinterpret_cast<ShellDropOperation*>(lp));if(operation)CompleteDesktopShellDrop(*operation);return 0;}
+    if(message==WM_APP+16){if(PasteDesktopClipboard(g_background))PostMessageW(hwnd,WM_APP+12,0,0);return 0;}
     if(message==WM_APP+20){
         std::unique_ptr<WeatherReply> reply(reinterpret_cast<WeatherReply*>(lp));
         if(reply&&!reply->diagnostic.empty())db::LogF("[weather] %s",db::ToUtf8(reply->diagnostic).c_str());
@@ -1628,7 +1675,9 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         // Refresh) after the menu closes. Poll briefly so the owned canvas
         // receives the same change notification it would have received from
         // Explorer's visible ListView.
-        g_shellRefreshAttempts=g_pendingShellDrops.empty()?10:40;SetTimer(hwnd,kShellRefreshTimer,g_pendingShellDrops.empty()?120:50,nullptr);return 0;
+        // New and pasted items should appear promptly. Explorer may still be
+        // committing the operation, so keep a brief high-frequency window.
+        g_shellRefreshAttempts=g_pendingShellDrops.empty()?24:40;SetTimer(hwnd,kShellRefreshTimer,g_pendingShellDrops.empty()?40:50,nullptr);return 0;
     }
     if(message==WM_TIMER&&wp==kInteractivePaintTimer) {
         KillTimer(hwnd,kInteractivePaintTimer);g_interactivePaintQueued=false;
