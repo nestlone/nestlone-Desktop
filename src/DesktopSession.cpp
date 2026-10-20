@@ -118,10 +118,16 @@ bool ReadDesktop(DesktopSnapshot& result) {
     for(int i=0;i<count;++i) {
         PITEMID_CHILD item=nullptr;
         if(FAILED(view->Item(i,&item))||!item)continue;
-        STRRET parsed{};wchar_t path[32768]{};POINT position{};
+        STRRET parsed{},display{};wchar_t path[32768]{},name[32768]{};POINT position{};
         if(SUCCEEDED(folder->GetDisplayNameOf(item,SHGDN_FORPARSING,&parsed)) &&
            SUCCEEDED(StrRetToBufW(&parsed,item,path,32768)) && SUCCEEDED(view->GetItemPosition(item,&position))) {
             DesktopEntry entry;entry.path=path;entry.index=i;
+            // SHGDN_FORPARSING is an identifier used to locate the item again;
+            // it is not a label.  In particular, Recycle Bin is represented
+            // by a ::{GUID} namespace name rather than a file path.
+            if(SUCCEEDED(folder->GetDisplayNameOf(item,SHGDN_NORMAL,&display)) &&
+               SUCCEEDED(StrRetToBufW(&display,item,name,32768))) entry.displayName=name;
+            if(entry.displayName.empty()) entry.displayName=entry.path;
             entry.position={position.x+origin.x,position.y+origin.y};
             LONG padding=max(0L,(result.spacing.x-result.iconSize)/2);
             entry.bounds={entry.position.x-padding,entry.position.y,entry.position.x-padding+result.spacing.x,entry.position.y+result.spacing.y};

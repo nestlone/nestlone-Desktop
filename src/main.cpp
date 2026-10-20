@@ -64,7 +64,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
         return 0;
     }
     db::LogInit();
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    OleInitialize(nullptr);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const std::wstring layoutFile=nestlone::LayoutPath();
     if(GetFileAttributesW(layoutFile.c_str())!=INVALID_FILE_ATTRIBUTES)
@@ -108,7 +108,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
     db::LogClose();
-    CoUninitialize();
+    OleUninitialize();
     CloseHandle(g_mutex);
     return static_cast<int>(message.wParam);
 }

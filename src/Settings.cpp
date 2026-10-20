@@ -2,6 +2,8 @@
 #include "DesktopCanvas.h"
 #include "DesktopItems.h"
 #include "Theme.h"
+#include "Location.h"
+#include <thread>
 #include "resource.h"
 #include <commctrl.h>
 #include <shellapi.h>
@@ -29,6 +31,16 @@ constexpr int kSidebarAuto = 2202;
 constexpr int kSidebarBackup = 2203;
 constexpr int kSidebarAbout = 2204;
 constexpr int kSidebarWidgets = 2205;
+constexpr int kSidebarInfo=2206,kWeatherHost=2701,kWeatherKey=2702,kWeatherSave=2703,kLocationAuthorize=2704,kLocationRefresh=2705,kLocationSystem=2706,kLocationFallback=2707,kLocationName=2708,kLocationLon=2709,kLocationLat=2710,kLocationSave=2711;
+int g_page=0;
+HFONT g_headingFont=nullptr;
+HWND g_locationStatus=nullptr;
+std::atomic_bool g_locationReading=false;
+std::vector<HWND> g_infoPage;
+bool ValidConfigHost(const std::wstring& host) {
+    const std::wstring suffix=L".qweatherapi.com";
+    return host.size()>suffix.size()&&host.size()<254&&host.compare(host.size()-suffix.size(),suffix.size(),suffix)==0&&std::all_of(host.begin(),host.end(),[](wchar_t c){return (c>=L'a'&&c<=L'z')||(c>=L'0'&&c<=L'9')||c==L'-'||c==L'.';});
+}
 constexpr int kAboutRepository = 2501;
 constexpr int kWidgetNote = 2601;
 constexpr int kWidgetWeather = 2602;
@@ -102,12 +114,15 @@ Gdiplus::Bitmap* GitHubLogo() {
     g_githubLogo=std::move(logo);return g_githubLogo.get();
 }
 void SelectPage(int page) {
+    g_page=page;
+    for(HWND control:g_infoPage)ShowWindow(control,page==5?SW_SHOW:SW_HIDE);
+    if(g_window){if(page==5)SetTimer(g_window,71,700,nullptr);else KillTimer(g_window,71);}
     for(HWND control:g_themePage)ShowWindow(control,page==0?SW_SHOW:SW_HIDE);
     for(HWND control:g_autoPage)ShowWindow(control,page==1?SW_SHOW:SW_HIDE);
     for(HWND control:g_backupPage)ShowWindow(control,page==2?SW_SHOW:SW_HIDE);
     for(HWND control:g_aboutPage)ShowWindow(control,page==3?SW_SHOW:SW_HIDE);
     for(HWND control:g_widgetsPage)ShowWindow(control,page==4?SW_SHOW:SW_HIDE);
-    if(g_window)InvalidateRect(g_window,nullptr,TRUE);
+    if(g_window)RedrawWindow(g_window,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
 }
 std::filesystem::path BackupDirectory(){auto path=std::filesystem::path(LayoutPath()).parent_path()/L"backups";std::error_code error;std::filesystem::create_directories(path,error);return path;}
 std::wstring BackupStamp(){SYSTEMTIME t{};GetLocalTime(&t);wchar_t value[32]{};swprintf_s(value,L"%04u%02u%02u%02u%02u%02u",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond);return value;}
@@ -151,9 +166,12 @@ void UpdateDefaultBoxMetrics() {
 
 LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_TIMER:
+        if(wParam==71&&g_locationStatus){const auto status=location::Status();wchar_t old[256]{};GetWindowTextW(g_locationStatus,old,256);if(status!=old)SetWindowTextW(g_locationStatus,status.c_str());EnableWindow(GetDlgItem(hwnd,kLocationRefresh),!g_locationReading.load());}
+        return 0;
     case WM_GETMINMAXINFO: {
         auto* info=reinterpret_cast<MINMAXINFO*>(lParam);
-        info->ptMinTrackSize={540,590};
+        info->ptMinTrackSize={540,700};
         return 0;
     }
     case WM_PAINT: {
@@ -172,6 +190,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_CREATE: {
         HFONT font = g_font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        g_headingFont=CreateFontW(-19,0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
+        HWND info=CreateWindowW(L"BUTTON",L"配置",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,12,220,116,34,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarInfo)),nullptr,nullptr);SendMessageW(info,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
         HWND sidebar = CreateWindowW(L"STATIC", L"nestlone-D", WS_CHILD | WS_VISIBLE, 20, 24, 120, 28, hwnd, nullptr, nullptr, nullptr);
         SendMessageW(sidebar, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         HWND theme = CreateWindowW(L"BUTTON", L"主题设置", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 12, 60, 116, 34, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSidebarTheme)), nullptr, nullptr);
@@ -279,6 +299,33 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         HWND noteWidget=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170,66,132,170,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kWidgetNote)),nullptr,nullptr);SendMessageW(noteWidget,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_widgetsPage.push_back(noteWidget);
         HWND weatherWidget=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,316,66,132,170,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kWidgetWeather)),nullptr,nullptr);SendMessageW(weatherWidget,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_widgetsPage.push_back(weatherWidget);
         HWND clearWidgets=CreateWindowW(L"BUTTON",L"清除全部组件",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,170,252,278,30,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kWidgetClear)),nullptr,nullptr);SendMessageW(clearWidgets,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_widgetsPage.push_back(clearWidgets);
+        auto locationControl=[&](const wchar_t* cls,const wchar_t* text,DWORD style,int id,int x,int y,int w,int h) {
+            HWND control=CreateWindowW(cls,text,WS_CHILD|style,x,y,w,h,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
+            SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);g_infoPage.push_back(control);return control;
+        };
+        locationControl(L"STATIC",L"配置",0,0,170,20,290,28);
+        locationControl(L"STATIC",L"和风天气接口",0,0,170,62,290,24);
+        locationControl(L"STATIC",L"API Host",0,0,170,98,80,24);
+        locationControl(L"EDIT",g_layout->weatherApiHost.c_str(),WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,kWeatherHost,258,94,202,28);
+        locationControl(L"STATIC",L"API Key",0,0,170,136,80,24);
+        locationControl(L"EDIT",g_layout->weatherApiKey.c_str(),WS_BORDER|WS_TABSTOP|ES_PASSWORD|ES_AUTOHSCROLL,kWeatherKey,258,132,202,28);
+        locationControl(L"STATIC",L"请填写和风天气控制台中的专属 API Host 与 API Key。",0,0,170,170,300,32);
+        locationControl(L"BUTTON",L"保存天气接口信息",BS_OWNERDRAW|WS_TABSTOP,kWeatherSave,170,210,290,32);
+        locationControl(L"STATIC",L"位置信息",0,0,170,268,290,24);
+        g_locationStatus=locationControl(L"STATIC",location::Status().c_str(),0,0,170,302,300,58);
+        locationControl(L"BUTTON",L"授权定位",BS_OWNERDRAW|WS_TABSTOP,kLocationAuthorize,170,370,138,32);
+        locationControl(L"BUTTON",L"获取当前位置",BS_OWNERDRAW|WS_TABSTOP,kLocationRefresh,320,370,140,32);
+        locationControl(L"BUTTON",L"Windows 定位设置",BS_OWNERDRAW|WS_TABSTOP,kLocationSystem,170,414,290,32);
+        locationControl(L"BUTTON",L"定位不可用时使用手动位置",BS_AUTOCHECKBOX|WS_TABSTOP,kLocationFallback,170,462,300,26);
+        SendDlgItemMessageW(hwnd,kLocationFallback,BM_SETCHECK,g_layout->locationFallback?BST_CHECKED:BST_UNCHECKED,0);
+        locationControl(L"STATIC",L"地点名称",0,0,170,502,82,24);
+        locationControl(L"EDIT",g_layout->manualLocationName.c_str(),WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,kLocationName,258,498,202,28);
+        locationControl(L"STATIC",L"经度 / 纬度",0,0,170,540,88,24);
+        locationControl(L"EDIT",g_layout->manualLongitude.c_str(),WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,kLocationLon,258,536,96,28);
+        locationControl(L"EDIT",g_layout->manualLatitude.c_str(),WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,kLocationLat,364,536,96,28);
+        locationControl(L"STATIC",L"经度 -180～180，纬度 -90～90。\r\n查询天气时会向和风天气发送位置坐标。",0,0,170,576,300,42);
+        locationControl(L"BUTTON",L"保存备选位置",BS_OWNERDRAW|WS_TABSTOP,kLocationSave,170,624,290,32);
+        for(auto* page:{&g_themePage,&g_autoPage,&g_backupPage,&g_aboutPage,&g_widgetsPage,&g_infoPage})if(!page->empty())SendMessageW(page->front(),WM_SETFONT,reinterpret_cast<WPARAM>(g_headingFont),TRUE);
         // All page controls must exist before the first visibility pass.
         SelectPage(0);
         return 0;
@@ -287,8 +334,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     case WM_CTLCOLORBTN: {
         HDC dc=reinterpret_cast<HDC>(wParam);
         SetTextColor(dc,theme::title);
-        SetBkMode(dc,TRANSPARENT);
-        return reinterpret_cast<LRESULT>(GetStockObject(HOLLOW_BRUSH));
+        RECT bounds{};GetWindowRect(reinterpret_cast<HWND>(lParam),&bounds);MapWindowPoints(nullptr,hwnd,reinterpret_cast<POINT*>(&bounds),2);
+        COLORREF background=bounds.left<144?RGB(230,242,247):RGB(255,255,255);
+        SetBkColor(dc,background);SetDCBrushColor(dc,background);
+        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
     }
     case WM_HSCROLL:
         if (reinterpret_cast<HWND>(lParam) && GetDlgCtrlID(reinterpret_cast<HWND>(lParam)) == kSlider) {
@@ -318,9 +367,13 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             }
             return TRUE;
         }
-        if (draw && (draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kSidebarBackup || draw->CtlID == kSidebarAbout || draw->CtlID == kSidebarWidgets || draw->CtlID == kWidgetClear || draw->CtlID == kAutoAdd || (draw->CtlID>=kBackupCreate&&draw->CtlID<=kBackupDelete) || draw->CtlID == IDCANCEL)) {
-            const COLORREF fill=RGB(219,242,246);
-            const COLORREF border=RGB(190,224,230);
+        if (draw && (draw->CtlID == kSidebarInfo || draw->CtlID==kWeatherSave || (draw->CtlID>=kLocationAuthorize&&draw->CtlID<=kLocationSave) || draw->CtlID == kSidebarTheme || draw->CtlID == kSidebarAuto || draw->CtlID == kSidebarBackup || draw->CtlID == kSidebarAbout || draw->CtlID == kSidebarWidgets || draw->CtlID == kWidgetClear || draw->CtlID == kAutoAdd || (draw->CtlID>=kBackupCreate&&draw->CtlID<=kBackupDelete) || draw->CtlID == IDCANCEL)) {
+            const bool navigation=draw->CtlID>=kSidebarTheme&&draw->CtlID<=kSidebarInfo;
+            const int pages[]={0,1,2,3,4,5};
+            const bool selected=navigation&&g_page==pages[draw->CtlID-kSidebarTheme];
+            const bool pressed=(draw->itemState&ODS_SELECTED)!=0;
+            const COLORREF fill=selected?RGB(205,234,239):pressed?RGB(221,235,240):navigation?RGB(230,242,247):RGB(240,247,249);
+            const COLORREF border=selected?RGB(125,191,202):navigation?fill:RGB(208,226,232);
             HBRUSH brush=CreateSolidBrush(fill);
             HPEN pen=CreatePen(PS_SOLID,1,border);
             auto ob=SelectObject(draw->hDC,brush); auto op=SelectObject(draw->hDC,pen);
@@ -330,7 +383,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             DeleteObject(brush); DeleteObject(pen);
             auto of=SelectObject(draw->hDC,g_font);
             SetBkMode(draw->hDC,TRANSPARENT); SetTextColor(draw->hDC,theme::title);
-            const wchar_t* caption=draw->CtlID==IDCANCEL?L"完成":draw->CtlID==kSidebarAuto?L"自动分类":draw->CtlID==kSidebarBackup?L"备份与还原":draw->CtlID==kSidebarAbout?L"关于":draw->CtlID==kSidebarWidgets?L"组件":draw->CtlID==kWidgetClear?L"清除全部组件":draw->CtlID==kAutoAdd?L"添加规则":draw->CtlID==kBackupCreate?L"立即备份":draw->CtlID==kBackupApply?L"应用备份":draw->CtlID==kBackupDelete?L"删除备份":L"主题设置";
+            wchar_t caption[128]{};GetWindowTextW(draw->hwndItem,caption,128);
             RECT label=r; DrawTextW(draw->hDC,caption,-1,&label,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             if(draw->itemState & ODS_FOCUS) { InflateRect(&label,-3,-3); DrawFocusRect(draw->hDC,&label); }
             SelectObject(draw->hDC,of);
@@ -347,6 +400,33 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         return FALSE;
     }
     case WM_COMMAND:
+        if((LOWORD(wParam)==kWeatherHost||LOWORD(wParam)==kWeatherKey)&&HIWORD(wParam)==EN_CHANGE)SetWindowTextW(GetDlgItem(hwnd,kWeatherSave),L"保存天气接口信息");
+        if((LOWORD(wParam)>=kLocationName&&LOWORD(wParam)<=kLocationLat&&HIWORD(wParam)==EN_CHANGE)||LOWORD(wParam)==kLocationFallback)SetWindowTextW(GetDlgItem(hwnd,kLocationSave),L"保存备选位置");
+        if(LOWORD(wParam)==kSidebarInfo){SelectPage(5);return 0;}
+        if(LOWORD(wParam)==kWeatherSave){
+            wchar_t host[256]{},key[256]{};GetDlgItemTextW(hwnd,kWeatherHost,host,256);GetDlgItemTextW(hwnd,kWeatherKey,key,256);
+            const std::wstring apiHost=host,apiKey=key;
+            const bool validKey=!apiKey.empty()&&std::all_of(apiKey.begin(),apiKey.end(),[](wchar_t c){return (c>=L'a'&&c<=L'z')||(c>=L'A'&&c<=L'Z')||(c>=L'0'&&c<=L'9');});
+            if(!ValidConfigHost(apiHost)||!validKey){MessageBoxW(hwnd,L"请填写有效的专属 API Host（以 .qweatherapi.com 结尾）和 API Key。",L"天气接口",MB_OK|MB_ICONINFORMATION);return 0;}
+            g_layout->weatherApiHost=apiHost;g_layout->weatherApiKey=apiKey;
+            if(SaveLayout(*g_layout))SetWindowTextW(GetDlgItem(hwnd,kWeatherSave),L"天气接口信息已保存");
+            return 0;
+        }
+        if(LOWORD(wParam)==kLocationAuthorize){location::RequestAccess();return 0;}
+        if(LOWORD(wParam)==kLocationSystem){ShellExecuteW(hwnd,L"open",L"ms-settings:privacy-location",nullptr,nullptr,SW_SHOWNORMAL);return 0;}
+        if(LOWORD(wParam)==kLocationRefresh){
+            if(!g_locationReading.exchange(true)){location::Status(L"正在获取当前位置…");std::thread([]{double lat=0,lon=0;std::wstring error;location::Read(lat,lon,error);g_locationReading=false;}).detach();}
+            return 0;
+        }
+        if(LOWORD(wParam)==kLocationSave){
+            wchar_t name[100]{},lon[64]{},lat[64]{};GetDlgItemTextW(hwnd,kLocationName,name,100);GetDlgItemTextW(hwnd,kLocationLon,lon,64);GetDlgItemTextW(hwnd,kLocationLat,lat,64);
+            const bool enabled=SendDlgItemMessageW(hwnd,kLocationFallback,BM_GETCHECK,0,0)==BST_CHECKED;
+            double longitude=0,latitude=0;
+            if((enabled||*lon||*lat)&&(!location::ParseCoordinate(lon,180,longitude)||!location::ParseCoordinate(lat,90,latitude))){MessageBoxW(hwnd,L"请输入有效经纬度：经度 -180～180，纬度 -90～90。",L"位置信息",MB_OK|MB_ICONINFORMATION);return 0;}
+            g_layout->locationFallback=enabled;g_layout->manualLocationName=name;g_layout->manualLongitude=lon;g_layout->manualLatitude=lat;
+            if(SaveLayout(*g_layout))SetWindowTextW(GetDlgItem(hwnd,kLocationSave),L"已保存");
+            return 0;
+        }
         if(LOWORD(wParam)==kSidebarTheme){SelectPage(0);return 0;}
         if(LOWORD(wParam)==kSidebarAuto){SelectPage(1);return 0;}
         if(LOWORD(wParam)==kSidebarBackup){SelectPage(2);return 0;}
@@ -385,7 +465,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hwnd);
         return 0;
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_close=nullptr;g_sidebarAbout=nullptr; g_value = nullptr; g_cornerValue=nullptr;g_defaultWidth=nullptr;g_defaultHeight=nullptr;g_fontFamily=nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_backupList=nullptr;g_themePage.clear();g_autoPage.clear();g_backupPage.clear();g_aboutPage.clear();g_widgetsPage.clear();g_layout = nullptr; return 0;
+    case WM_DESTROY: KillTimer(hwnd,71);g_infoPage.clear();g_locationStatus=nullptr;if(g_headingFont){DeleteObject(g_headingFont);g_headingFont=nullptr;} if (g_font) { DeleteObject(g_font); g_font=nullptr; } g_window = nullptr; g_close=nullptr;g_sidebarAbout=nullptr; g_value = nullptr; g_cornerValue=nullptr;g_defaultWidth=nullptr;g_defaultHeight=nullptr;g_fontFamily=nullptr; g_boxSelect=nullptr;g_autoBox=nullptr;g_autoExtensions=nullptr;g_autoRules=nullptr;g_backupList=nullptr;g_themePage.clear();g_autoPage.clear();g_backupPage.clear();g_aboutPage.clear();g_widgetsPage.clear();g_layout = nullptr; return 0;
     default: return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }
@@ -404,7 +484,7 @@ void ShowSettings(HINSTANCE instance, Layout* layout) {
     if (!g_surface) g_surface=CreateSolidBrush(RGB(246,250,252));
     wc.hbrBackground = g_surface;
     RegisterClassW(&wc);
-    g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kClassName, L"nestlone-D 设置中心", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 540, 590, nullptr, nullptr, instance, nullptr);
+    g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kClassName, L"nestlone-D 设置中心", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 560, 720, nullptr, nullptr, instance, nullptr);
     if (!g_window) return;
     ShowWindow(g_window, SW_SHOWNORMAL);
     UpdateWindow(g_window);

@@ -4,6 +4,9 @@ int main() {
     Gdiplus::GdiplusStartupInput input;ULONG_PTR token=0;
     if(Gdiplus::GdiplusStartup(&token,&input,nullptr)!=Gdiplus::Ok)return 1;
     int failures=0;auto check=[&](bool ok,const char* text){printf("%s %s\n",ok?"PASS":"FAIL",text);if(!ok)++failures;};
+    double coordinate=0;
+    check(nestlone::location::ParseCoordinate(L"116.40",180,coordinate)&&coordinate==116.40,"manual longitude parses decimals");
+    check(!nestlone::location::ParseCoordinate(L"",90,coordinate)&&!nestlone::location::ParseCoordinate(L"nan",90,coordinate)&&!nestlone::location::ParseCoordinate(L"91",90,coordinate)&&!nestlone::location::ParseCoordinate(L"30east",180,coordinate),"manual coordinates reject empty nonfinite out-of-range and malformed input");
     nestlone::Layout layout;nestlone::Box box;box.rect={20,20,300,220};box.title=L"Native";layout.boxes.push_back(box);
     std::vector<DWORD> low(320*240),high(low.size()),withItems(low.size());
     layout.opacity=20;check(nestlone::RenderPixels(low.data(),320,240,layout),"render background at 20%");
@@ -62,8 +65,12 @@ int main() {
     check(ordered[0]->id==L"c"&&ordered[1]->id==L"b"&&ordered[2]->id==L"a","member can move from middle to first");
     nestlone::ReorderTab(groups.boxes[2],1);ordered=nestlone::GroupTabs(groups.boxes[0]);
     check(ordered[0]->id==L"c","drop beside original slot keeps order");
+    groups.locationFallback=true;groups.manualLongitude=L"116.40";groups.manualLatitude=L"39.90";groups.manualLocationName=L"手动测试";
+    groups.weatherApiHost=L"example.qweatherapi.com";groups.weatherApiKey=L"testKey2026";
     check(nestlone::SaveLayout(groups),"sorted layout saves to isolated test file");
     groups=nestlone::LoadLayout();ordered=nestlone::GroupTabs(groups.boxes[0]);
+    check(groups.locationFallback&&groups.manualLongitude==L"116.40"&&groups.manualLatitude==L"39.90"&&groups.manualLocationName==L"手动测试","manual fallback settings survive reload");
+    check(groups.weatherApiHost==L"example.qweatherapi.com"&&groups.weatherApiKey==L"testKey2026","weather API configuration survives reload");
     check(ordered[0]->id==L"c"&&ordered[2]->id==L"a"&&groups.boxes[0].activeTabId==L"c","saved tab order and active selection survive reload");
     nestlone::DetachTab(groups.boxes[0]);
     check(groups.boxes[2].groupId.empty()&&groups.boxes[1].groupId==L"c","detaching reordered root promotes first remaining visual tab");

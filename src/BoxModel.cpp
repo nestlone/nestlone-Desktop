@@ -171,6 +171,12 @@ Layout LoadLayout() {
     if (ReadNumber(json, L"defaultBoxHeight", savedHeight)) layout.defaultBoxHeight = static_cast<int>(std::clamp(savedHeight, 160L, 800L));
     if (ReadNumber(json, L"defaultBoxColor", savedColor)) layout.defaultBoxColor = static_cast<COLORREF>(savedColor);
     ReadString(json, L"fontFamily", layout.fontFamily);
+    ReadString(json,L"weatherApiHost",layout.weatherApiHost);
+    ReadString(json,L"weatherApiKey",layout.weatherApiKey);
+    long fallback=0;ReadNumber(json,L"locationFallback",fallback);layout.locationFallback=fallback!=0;
+    ReadString(json,L"manualLongitude",layout.manualLongitude);
+    ReadString(json,L"manualLatitude",layout.manualLatitude);
+    ReadString(json,L"manualLocationName",layout.manualLocationName);
     long automatic = 0;
     if (ReadNumber(json, L"autoOrganize", automatic)) layout.autoOrganize = automatic != 0;
     size_t at = 0;
@@ -242,7 +248,7 @@ bool SaveLayout(const Layout& layout) {
         for (size_t j = 0; j < box.items.size(); ++j) { if (j) json += L','; json += L"\"" + Escape(box.items[j]) + L"\""; }
         json += L"]}";
     }
-    json += L"],\"desktop\":[";
+    json += L"],\"weatherApiHost\":\""+Escape(layout.weatherApiHost)+L"\",\"weatherApiKey\":\""+Escape(layout.weatherApiKey)+L"\",\"locationFallback\":"+std::to_wstring(layout.locationFallback?1:0)+L",\"manualLongitude\":\""+Escape(layout.manualLongitude)+L"\",\"manualLatitude\":\""+Escape(layout.manualLatitude)+L"\",\"manualLocationName\":\""+Escape(layout.manualLocationName)+L"\",\"desktop\":[";
     for(size_t i=0;i<layout.desktop.size();++i) {
         if(i)json+=L',';
         const auto& item=layout.desktop[i];

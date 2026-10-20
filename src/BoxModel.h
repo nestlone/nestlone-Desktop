@@ -31,6 +31,11 @@ struct Layout {
     int defaultBoxHeight{320};
     COLORREF defaultBoxColor{RGB(184, 235, 238)};
     std::wstring fontFamily{L"Microsoft YaHei UI"};
+    // Stored only in the user's local layout. New installations start blank.
+    std::wstring weatherApiHost;
+    std::wstring weatherApiKey;
+    bool locationFallback{false};
+    std::wstring manualLongitude,manualLatitude,manualLocationName;
     struct Placement { std::wstring path; POINT point; };
     std::vector<Placement> desktop;
     struct Widget {
@@ -42,6 +47,8 @@ struct Layout {
         std::wstring weather;
         std::wstring weatherIcon{L"999"};
         int temperature{0};
+        bool weatherValid{false};
+        std::wstring weatherLocation{L"Windows 定位"};
         bool locked{false};
     };
     std::vector<Widget> widgets;

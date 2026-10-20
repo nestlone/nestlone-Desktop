@@ -1,4 +1,5 @@
 #include "DesktopCanvas.h"
+#include "Location.h"
 #include "DesktopSession.h"
 #include "DesktopHost.h"
 #include "resource.h"
@@ -8,6 +9,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <winhttp.h>
 #pragma warning(push)
 #pragma warning(disable:4996)
@@ -30,6 +32,7 @@
 #include <atomic>
 #include <iomanip>
 #include <sstream>
+#include <locale>
 
 namespace nestlone {
 namespace {
@@ -53,6 +56,7 @@ HWND g_dragPreview=nullptr;
 std::wstring g_previewGroup,g_renderOnlyGroup;
 void EndDragPreview();
 HWND g_hiddenListview=nullptr;
+bool g_dropRegistered=false;
 db::HostInfo g_host;
 DesktopSnapshot g_snapshot;
 uint64_t g_pending=0;
@@ -61,6 +65,7 @@ POINT g_mouseStart{};
 RECT g_boxStart{};
 std::wstring g_dragId,g_editId,g_status;
 bool g_editGroupTitle=false;
+std::wstring g_editItemPath;
 std::vector<std::pair<std::wstring,RECT>> g_boxDragStart;
 HFONT g_editFont=nullptr;
 struct Decoration {std::wstring id;HWND header=nullptr,gripLeft=nullptr,grip=nullptr;};
@@ -86,6 +91,7 @@ std::vector<std::wstring> g_selectionStart;
 std::vector<std::wstring> g_pendingDelete;
 bool g_visualDirty=true;
 void CancelIconGesture();
+void BeginItemRename(const std::wstring& path);
 void RebuildVisualIcons();
 void RefreshVisualGeometry();
 void DrawVisualIcons(Gdiplus::Graphics&);
@@ -236,7 +242,7 @@ int CornerDiameter(const Layout& layout) {
 }
 void Rounded(Gdiplus::Graphics& g,const RECT& r,Gdiplus::Color color,int diameter=12) {
     if(r.right<=r.left||r.bottom<=r.top)return;
-    if(diameter<=0){Gdiplus::SolidBrush brush(color);g.FillRectangle(&brush,r.left,r.top,r.right-r.left,r.bottom-r.top);return;}
+    if(diameter<=0){Gdiplus::SolidBrush brush(color);g.FillRectangle(&brush,static_cast<int>(r.left),static_cast<int>(r.top),static_cast<int>(r.right-r.left),static_cast<int>(r.bottom-r.top));return;}
     Gdiplus::GraphicsPath path;
     const float d=static_cast<float>(min(static_cast<LONG>(diameter),min(r.right-r.left,r.bottom-r.top))),x=static_cast<float>(r.left),y=static_cast<float>(r.top);
     const float w=static_cast<float>(r.right-r.left),h=static_cast<float>(r.bottom-r.top);
@@ -341,7 +347,7 @@ POINT ParentPoint(POINT point) { return point; }
 HWND SurfaceParent() { return g_background ? g_background : g_host.defviewParent; }
 DWORD SurfaceWindowStyle() { return WS_CHILD; }
 HWND SurfaceControlInsertAfter() { return HWND_TOP; }
-struct WeatherReply {std::wstring summary,icon;int temperature=0;};
+struct WeatherReply {std::wstring summary,icon,source=L"Windows 定位",diagnostic;int temperature=0;bool valid=false;};
 bool ReadResourceBytes(int id,const BYTE*& data,DWORD& size) {
     HINSTANCE module=GetModuleHandleW(nullptr);HRSRC resource=FindResourceW(module,MAKEINTRESOURCEW(id),RT_RCDATA);
     if(!resource)return false;size=SizeofResource(module,resource);data=static_cast<const BYTE*>(LockResource(LoadResource(module,resource)));return data&&size;
@@ -375,51 +381,83 @@ std::wstring JsonText(const std::string& text,const char* key) {
     const int count=MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),nullptr,0);
     std::wstring result(max(0,count),L'\0');if(count)MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),result.data(),count);return result;
 }
-std::wstring WeatherApiKey() {
-    const auto path=std::filesystem::path(LayoutPath()).parent_path()/L"weather-api-key.txt";
-    std::ifstream file(path,std::ios::binary);std::string key;if(!file||!std::getline(file,key))return {};
-    while(!key.empty()&&(key.back()=='\r'||key.back()=='\n'||key.back()==' '||key.back()=='\t'))key.pop_back();
-    return std::wstring(key.begin(),key.end());
+bool ValidWeatherHost(const std::wstring& host) {
+    const std::wstring suffix=L".qweatherapi.com";
+    return host.size()>suffix.size()&&host.size()<254&&host.compare(host.size()-suffix.size(),suffix.size(),suffix)==0&&
+        std::all_of(host.begin(),host.end(),[](wchar_t c){return (c>=L'a'&&c<=L'z')||(c>=L'0'&&c<=L'9')||c==L'-'||c==L'.';});
 }
-#pragma warning(push)
-#pragma warning(disable:4995)
-bool CurrentCoordinates(double& latitude,double& longitude) {
-    const HRESULT initialized=CoInitializeEx(nullptr,COINIT_MULTITHREADED);if(FAILED(initialized)&&initialized!=RPC_E_CHANGED_MODE)return false;
-    ILocation* location=nullptr;ILocationReport* base=nullptr;ILatLongReport* report=nullptr;bool found=false;
-    if(SUCCEEDED(CoCreateInstance(CLSID_Location,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&location)))&&
-       SUCCEEDED(location->GetReport(IID_ILatLongReport,&base))&&
-       SUCCEEDED(base->QueryInterface(IID_PPV_ARGS(&report)))&&
-       SUCCEEDED(report->GetLatitude(&latitude))&&SUCCEEDED(report->GetLongitude(&longitude)))found=true;
-    if(report)report->Release();if(base)base->Release();if(location)location->Release();if(SUCCEEDED(initialized))CoUninitialize();return found;
+bool WeatherConfigured() {
+    if(!g_layout||!ValidWeatherHost(g_layout->weatherApiHost)||g_layout->weatherApiKey.empty())return false;
+    return std::all_of(g_layout->weatherApiKey.begin(),g_layout->weatherApiKey.end(),[](wchar_t c){return (c>=L'a'&&c<=L'z')||(c>=L'A'&&c<=L'Z')||(c>=L'0'&&c<=L'9');});
 }
-#pragma warning(pop)
+// Ignore insignificant JSON whitespace without altering quoted text.
+std::string CompactWeatherJson(const std::string& body) {
+    std::string result;result.reserve(body.size());bool quoted=false,escaped=false;
+    for(unsigned char c:body) {
+        if(quoted){result+=static_cast<char>(c);if(escaped)escaped=false;else if(c=='\\')escaped=true;else if(c=='"')quoted=false;}
+        else if(c=='"'){quoted=true;result+='"';}
+        else if(!std::isspace(c))result+=static_cast<char>(c);
+    }
+    return result;
+}
+void RequestWeather(const std::wstring& host,const std::wstring& key,double latitude,double longitude,WeatherReply& reply) {
+    struct InternetHandle {HINTERNET value;~InternetHandle(){if(value)WinHttpCloseHandle(value);}};
+    auto fail=[&](const wchar_t* stage){DWORD code=GetLastError();reply.summary=L"网络错误 "+std::to_wstring(code);reply.diagnostic=std::wstring(stage)+L" winhttp="+std::to_wstring(code);};
+    InternetHandle session{WinHttpOpen(L"nestlone-D/0.2",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
+    if(!session.value){fail(L"session");return;}
+    WinHttpSetTimeouts(session.value,5000,5000,8000,8000);
+    InternetHandle connection{WinHttpConnect(session.value,host.c_str(),INTERNET_DEFAULT_HTTPS_PORT,0)};
+    if(!connection.value){fail(L"connect");return;}
+    std::wostringstream coordinate;coordinate.imbue(std::locale::classic());coordinate<<std::fixed<<std::setprecision(2)<<longitude<<L","<<latitude;
+    const std::wstring path=L"/v7/weather/now?location="+coordinate.str()+L"&lang=zh";
+    InternetHandle request{WinHttpOpenRequest(connection.value,L"GET",path.c_str(),nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE)};
+    if(!request.value){fail(L"request");return;}
+    DWORD redirects=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if(!WinHttpSetOption(request.value,WINHTTP_OPTION_REDIRECT_POLICY,&redirects,sizeof(redirects))){fail(L"redirect policy");return;}
+    DWORD decompression=WINHTTP_DECOMPRESSION_FLAG_GZIP|WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
+    if(!WinHttpSetOption(request.value,WINHTTP_OPTION_DECOMPRESSION,&decompression,sizeof(decompression))){fail(L"decompression");return;}
+    const std::wstring headers=L"X-QW-Api-Key: "+key+L"\r\nAccept: application/json\r\n";
+    if(!WinHttpSendRequest(request.value,headers.c_str(),static_cast<DWORD>(headers.size()),WINHTTP_NO_REQUEST_DATA,0,0,0)||!WinHttpReceiveResponse(request.value,nullptr)){fail(L"send/receive");return;}
+    DWORD status=0,size=sizeof(status);
+    if(!WinHttpQueryHeaders(request.value,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&status,&size,WINHTTP_NO_HEADER_INDEX)){fail(L"status");return;}
+    if(status!=200){reply.summary=L"天气 HTTP "+std::to_wstring(status);reply.diagnostic=L"http="+std::to_wstring(status);return;}
+    std::string body;char bytes[4096];DWORD count=0;
+    for(;;){if(!WinHttpReadData(request.value,bytes,sizeof(bytes),&count)){fail(L"read");return;}if(!count)break;body.append(bytes,count);if(body.size()>1024*1024){reply.summary=L"天气响应过大";reply.diagnostic=L"response exceeds size limit";return;}}
+    body=CompactWeatherJson(body);
+    const auto code=JsonText(body,"\"code\":\"");
+    if(code!=L"200") {
+        const bool numeric=!code.empty()&&code.size()<=5&&std::all_of(code.begin(),code.end(),[](wchar_t c){return c>=L'0'&&c<=L'9';});
+        reply.summary=numeric?L"天气接口错误 "+code:L"天气响应格式异常";
+        reply.diagnostic=numeric?L"api="+code:L"invalid response JSON";return;
+    }
+    const auto now=body.find("\"now\":{");
+    if(now==std::string::npos){reply.summary=L"缺少实时天气数据";return;}
+    const auto current=body.substr(now);
+    const auto temperature=JsonText(current,"\"temp\":\""),description=JsonText(current,"\"text\":\""),icon=JsonText(current,"\"icon\":\"");
+    wchar_t* end=nullptr;const long value=wcstol(temperature.c_str(),&end,10);
+    if(temperature.empty()||*end||value<-150||value>100||description.empty()||icon.empty()){reply.summary=L"天气数据不完整";return;}
+    reply.temperature=static_cast<int>(value);reply.summary=description;reply.icon=icon;reply.valid=true;
+}
 bool HasActiveWeatherWidget() {return g_visible&&g_layout&&std::any_of(g_layout->widgets.begin(),g_layout->widgets.end(),[](const auto& widget){return widget.type==L"weather";});}
 void FetchWeather() {
     if(g_weatherRequestInFlight.exchange(true))return;
-    std::thread([] {
+    const bool configured=WeatherConfigured();
+    const bool fallback=g_layout->locationFallback;
+    const auto manualLon=g_layout->manualLongitude,manualLat=g_layout->manualLatitude,manualName=g_layout->manualLocationName;
+    std::thread([configured,fallback,manualLon,manualLat,manualName] {
         auto reply=std::make_unique<WeatherReply>();reply->summary=L"天气暂不可用";reply->icon=L"999";
-        const std::wstring key=WeatherApiKey();
+        const std::wstring key=g_layout?g_layout->weatherApiKey:L"",host=g_layout?g_layout->weatherApiHost:L"";
         double latitude=0,longitude=0;
-        if(key.empty())reply->summary=L"未配置和风天气密钥";
-        else if(!CurrentCoordinates(latitude,longitude))reply->summary=L"请开启 Windows 定位服务";
+        if(!configured)reply->summary=L"无法添加，请前往配置填写天气接口信息";
         else {
-        HINTERNET session=WinHttpOpen(L"nestlone-D/0.2",WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
-        if(session) {
-            WinHttpSetTimeouts(session,3000,3000,6000,6000);
-            HINTERNET connection=WinHttpConnect(session,L"devapi.qweather.com",INTERNET_DEFAULT_HTTPS_PORT,0);
-            if(connection) {
-                std::wostringstream coordinate;coordinate<<std::fixed<<std::setprecision(2)<<longitude<<L","<<latitude;
-                const std::wstring path=L"/v7/weather/now?location="+coordinate.str()+L"&key="+key+L"&lang=zh";
-                HINTERNET request=WinHttpOpenRequest(connection,L"GET",path.c_str(),nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE);
-                if(request&&WinHttpSendRequest(request,WINHTTP_NO_ADDITIONAL_HEADERS,0,WINHTTP_NO_REQUEST_DATA,0,0,0)&&WinHttpReceiveResponse(request,nullptr)) {
-                    std::string body;DWORD available=0;
-                    while(WinHttpQueryDataAvailable(request,&available)&&available) {std::string chunk(available,'\0');DWORD read=0;if(!WinHttpReadData(request,chunk.data(),available,&read))break;chunk.resize(read);body+=chunk;}
-                    if(body.find("\"code\":\"200\"")!=std::string::npos) {reply->temperature=JsonNumber(body,"\"temp\":\"");reply->summary=JsonText(body,"\"text\":\"");reply->icon=JsonText(body,"\"icon\":\"");if(reply->summary.empty())reply->summary=L"天气暂不可用";if(reply->icon.empty())reply->icon=L"999";}
-                }
-                if(request)WinHttpCloseHandle(request);
-                WinHttpCloseHandle(connection);
-            }
-            WinHttpCloseHandle(session);
+        std::wstring error;
+        bool located=location::Read(latitude,longitude,error);
+        if(!located&&fallback&&location::ParseCoordinate(manualLon,180,longitude)&&location::ParseCoordinate(manualLat,90,latitude)) {
+            located=true;reply->source=L"手动 · "+(manualName.empty()?L"指定位置":manualName);
+        }
+        if(!located)reply->summary=L"无法定位，请查看信息采集";
+        else {
+        RequestWeather(host,key,latitude,longitude,*reply);
         }
         }
         g_weatherRequestInFlight=false;HWND manager=g_manager;WeatherReply* raw=reply.release();
@@ -642,7 +680,16 @@ std::shared_ptr<Gdiplus::Bitmap> DecodeIconWithMasks(HICON icon) {
 }
 std::shared_ptr<Gdiplus::Bitmap> DecodeIconImage(const std::wstring& path,int size) {
     SHFILEINFOW info{};
-    if(!SHGetFileInfoW(path.c_str(),0,&info,sizeof(info),SHGFI_ICON|SHGFI_LARGEICON)||!info.hIcon)return {};
+    // A desktop item may be a Shell namespace object (Recycle Bin, This PC,
+    // control-panel extensions) rather than a filesystem path.  Resolve its
+    // parsing name to a PIDL first; SHGFI_PIDL preserves that distinction.
+    PIDLIST_ABSOLUTE pidl=nullptr;
+    bool gotIcon=false;
+    if(SUCCEEDED(SHParseDisplayName(path.c_str(),nullptr,&pidl,0,nullptr))&&pidl) {
+        gotIcon=SHGetFileInfoW(reinterpret_cast<LPCWSTR>(pidl),0,&info,sizeof(info),SHGFI_PIDL|SHGFI_ICON|SHGFI_LARGEICON)!=0&&info.hIcon;
+        CoTaskMemFree(pidl);
+    }
+    if(!gotIcon && (!SHGetFileInfoW(path.c_str(),0,&info,sizeof(info),SHGFI_ICON|SHGFI_LARGEICON)||!info.hIcon))return {};
     HICON icon=info.hIcon;
     auto decoded=DecodeIconWithMasks(icon);
     if(!decoded) {
@@ -726,7 +773,8 @@ void RebuildVisualIcons() {
         const Box* owner=nullptr;int slot=0;
         for(const auto& box:g_layout->boxes)if(HasPath(box,entry.path)){owner=&box;for(const auto& item:box.items){if(_wcsicmp(item.c_str(),entry.path.c_str())==0)break;if(FindEntry(g_snapshot,item))++slot;}break;}
         if(owner&&(!IsActiveTab(*owner)||GroupRoot(*owner)->collapsed))continue;
-        VisualIcon visual;visual.path=entry.path;visual.name=entry.path;auto slash=visual.name.find_last_of(L"\\/");if(slash!=std::wstring::npos)visual.name=visual.name.substr(slash+1);
+        VisualIcon visual;visual.path=entry.path;visual.name=entry.displayName.empty()?entry.path:entry.displayName;
+        if(entry.displayName.empty()) {auto slash=visual.name.find_last_of(L"\\/");if(slash!=std::wstring::npos)visual.name=visual.name.substr(slash+1);}
         visual.position=VisualPosition(entry.path);visual.image=LoadIconImage(entry.path,owner&& !owner->iconView?min(24,HeaderHeight()):max(16,g_snapshot.iconSize));visual.selected=std::any_of(selected.begin(),selected.end(),[&](const auto& path){return _wcsicmp(path.c_str(),entry.path.c_str())==0;});SetVisualGeometry(visual,owner,slot);g_visualIcons.push_back(std::move(visual));
     }
     if(g_focusIcon>=static_cast<int>(g_visualIcons.size()))g_focusIcon=-1;
@@ -870,16 +918,39 @@ void Observe(const DesktopSnapshot& before,const DesktopSnapshot& after) {
     if(changed)SaveLayout(*g_layout);
     for(size_t i=0;i<arrange.size();++i)if(arrange[i])Arrange(g_layout->boxes[i],after);
 }
+void PlaceNewDesktopEntries(const DesktopSnapshot& before,const DesktopSnapshot& after) {
+    if(!g_layout||!before.readable||before.listview!=after.listview)return;
+    std::vector<std::pair<std::wstring,POINT>> added;
+    for(const auto& entry:after.entries)if(!FindEntry(before,entry.path))added.push_back({entry.path,entry.position});
+    if(added.empty())return;
+    // Explorer can place a just-created item at a coordinate occupied by our
+    // presentation layer.  Retain its intended vicinity, but resolve it to a
+    // vacant desktop grid cell before the next paint.
+    const auto placed=SnapDesktopDrop(added);
+    for(const auto& item:placed)AssignDesktopItem(*g_layout,item.first,-1,item.second);
+    std::vector<DesktopMove> moves;for(const auto& item:placed)moves.push_back({item.first,item.second});
+    QueueMoves(moves);SaveLayout(*g_layout);
+}
 void FinishRename(bool save) {
     HWND edit=g_edit;if(!edit)return;g_edit=nullptr;
     wchar_t value[81]{};GetWindowTextW(edit,value,81);
     std::wstring text=value;auto first=text.find_first_not_of(L" \t\r\n");
-    if(save&&first!=std::wstring::npos)if(auto* box=FindBox(g_editId)) {
+    if(save&&first!=std::wstring::npos) {
         const std::wstring trimmed=text.substr(first,text.find_last_not_of(L" \t\r\n")-first+1);
-        if(g_editGroupTitle)box->groupTitle=trimmed;else box->title=trimmed;
-        SaveLayout(*g_layout);
+        if(!g_editItemPath.empty()) {
+            ComPtr<IShellItem> item;ComPtr<IFileOperation> operation;
+            const HRESULT itemResult=SHCreateItemFromParsingName(g_editItemPath.c_str(),nullptr,IID_PPV_ARGS(&item));
+            const HRESULT operationResult=SUCCEEDED(itemResult)?CoCreateInstance(CLSID_FileOperation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&operation)):itemResult;
+            if(SUCCEEDED(operationResult) && SUCCEEDED(operation->SetOperationFlags(FOF_NOCONFIRMATION)) &&
+               SUCCEEDED(operation->RenameItem(item.Get(),trimmed.c_str(),nullptr)) && SUCCEEDED(operation->PerformOperations())) {
+                g_shellRefreshAttempts=10;SetTimer(g_manager,kShellRefreshTimer,120,nullptr);
+            } else g_status=L"无法重命名该桌面项目";
+        } else if(auto* box=FindBox(g_editId)) {
+            if(g_editGroupTitle)box->groupTitle=trimmed;else box->title=trimmed;
+            SaveLayout(*g_layout);
+        }
     }
-    DestroyWindow(edit);g_editId.clear();g_editGroupTitle=false;PaintAll();
+    DestroyWindow(edit);g_editId.clear();g_editItemPath.clear();g_editGroupTitle=false;PaintAll();
 }
 LRESULT CALLBACK EditProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
     if(msg==WM_KEYDOWN&&(wp==VK_RETURN||wp==VK_ESCAPE)){FinishRename(wp==VK_RETURN);return 0;}
@@ -900,13 +971,29 @@ void BeginRename(Box& box,bool groupTitle=false) {
     SendMessageW(g_edit,WM_SETFONT,reinterpret_cast<WPARAM>(g_editFont),TRUE);SendMessageW(g_edit,EM_SETLIMITTEXT,80,0);
     SetWindowSubclass(g_edit,EditProc,1,0);ShowWindow(g_edit,SW_SHOW);SetForegroundWindow(g_edit);SetFocus(g_edit);SendMessageW(g_edit,EM_SETSEL,0,-1);
 }
+void BeginItemRename(const std::wstring& path) {
+    auto found=std::find_if(g_visualIcons.begin(),g_visualIcons.end(),[&](const auto& icon){return _wcsicmp(icon.path.c_str(),path.c_str())==0;});
+    if(found==g_visualIcons.end())return;
+    FinishRename(true);g_editItemPath=path;
+    RECT label=found->label;const LONG width=max(120L,label.right-label.left);
+    POINT top{label.left+(label.right-label.left-width)/2,label.top};
+    top.x+=GetSystemMetrics(SM_XVIRTUALSCREEN);top.y+=GetSystemMetrics(SM_YVIRTUALSCREEN);
+    g_edit=CreateWindowExW(WS_EX_TOOLWINDOW,L"EDIT",found->name.c_str(),WS_POPUP|ES_CENTER|ES_AUTOHSCROLL,
+        top.x,top.y,width,max(22L,label.bottom-label.top),nullptr,nullptr,g_instance,nullptr);
+    if(!g_edit){g_editItemPath.clear();return;}
+    if(g_editFont)DeleteObject(g_editFont);
+    g_editFont=CreateFontW(-max(12,HeaderHeight()*2/5),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,CanvasFontFamily());
+    SendMessageW(g_edit,WM_SETFONT,reinterpret_cast<WPARAM>(g_editFont),TRUE);SendMessageW(g_edit,EM_SETLIMITTEXT,260,0);
+    SetWindowSubclass(g_edit,EditProc,1,0);ShowWindow(g_edit,SW_SHOW);SetForegroundWindow(g_edit);SetFocus(g_edit);
+    const auto dot=found->name.find_last_of(L'.');const int selectEnd=(dot!=std::wstring::npos&&dot!=0)?static_cast<int>(dot):-1;SendMessageW(g_edit,EM_SETSEL,0,selectEnd);
+}
 void DestroyDecorations() {
     EndDragPreview();
     FinishRename(false);
     for(auto& widget:g_widgets){if(IsWindow(widget->window))DestroyWindow(widget->window);g_paintBuffers.erase(widget->window);}
     g_widgets.clear();
     for(auto& d:g_decorations){if(IsWindow(d->header))DestroyWindow(d->header);if(IsWindow(d->gripLeft))DestroyWindow(d->gripLeft);if(IsWindow(d->grip))DestroyWindow(d->grip);}
-    g_decorations.clear();if(IsWindow(g_background))DestroyWindow(g_background);g_background=nullptr;
+    g_decorations.clear();if(g_dropRegistered&&IsWindow(g_background)){RevokeDragDrop(g_background);g_dropRegistered=false;}if(IsWindow(g_background))DestroyWindow(g_background);g_background=nullptr;
     ReleaseVisualIcons();if(IsWindow(g_hiddenListview))ReleaseHiddenDesktopListView(g_hiddenListview);g_hiddenListview=nullptr;g_nativeHidden=false;
 }
 LRESULT CALLBACK DecorationProc(HWND,UINT,WPARAM,LPARAM);
@@ -928,7 +1015,7 @@ bool PaintWeatherWidget(HWND hwnd,const Layout::Widget& widget) {
     auto& stored=g_paintBuffers[hwnd];if(!stored)stored=std::make_unique<PaintBuffer>();auto& buffer=*stored;if(!buffer.Ensure(r.right,r.bottom))return false;
     Gdiplus::Bitmap surface(r.right,r.bottom,r.right*4,PixelFormat32bppPARGB,static_cast<BYTE*>(buffer.pixels));Gdiplus::Graphics graphics(&surface);graphics.Clear(Gdiplus::Color(0,0,0,0));graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);Rounded(graphics,r,Gdiplus::Color(255,215,241,248),16);Rounded(graphics,{0,0,r.right,31},Gdiplus::Color(255,157,216,231),16);
     Gdiplus::FontFamily family(CanvasFontFamily());Gdiplus::Font title(&family,13,Gdiplus::FontStyleBold,Gdiplus::UnitPixel),body(&family,14,Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);Gdiplus::SolidBrush ink(Gdiplus::Color(255,25,49,60));Gdiplus::StringFormat centered;centered.SetAlignment(Gdiplus::StringAlignmentCenter);centered.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    const std::wstring heading=L"天气 · 当前定位";graphics.DrawString(heading.c_str(),-1,&title,Gdiplus::RectF(8,0,static_cast<Gdiplus::REAL>(r.right-44),31),&centered,&ink);const std::wstring value=std::to_wstring(widget.temperature)+L"°C  "+widget.weather;graphics.DrawString(value.c_str(),-1,&body,Gdiplus::RectF(72,47,static_cast<Gdiplus::REAL>(max(1L,r.right-84)),40),&centered,&ink);graphics.Flush();
+    const std::wstring heading=L"天气 · "+widget.weatherLocation;graphics.DrawString(heading.c_str(),-1,&title,Gdiplus::RectF(8,0,static_cast<Gdiplus::REAL>(r.right-44),31),&centered,&ink);const std::wstring value=(widget.weatherValid?std::to_wstring(widget.temperature)+L"°C":L"--")+L"  "+widget.weather;graphics.DrawString(value.c_str(),-1,&body,Gdiplus::RectF(72,47,static_cast<Gdiplus::REAL>(max(1L,r.right-84)),40),&centered,&ink);graphics.Flush();
     // Keep all pixels in the same PARGB graphics surface. GDI writes into this
     // DIB can zero alpha and make lock/icon pixels invisible to hit testing.
     const wchar_t glyph=WeatherGlyph(widget.weatherIcon);
@@ -967,6 +1054,45 @@ LRESULT CALLBACK WidgetProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     return DefWindowProcW(hwnd,message,wp,lp);
 }
 int HitVisualIcon(int x,int y) { for(int i=static_cast<int>(g_visualIcons.size())-1;i>=0;--i)if(PtInRect(&g_visualIcons[i].hit,POINT{x,y}))return i;return -1; }
+ComPtr<IDropTarget> ShellDropTargetFor(const std::wstring& path) {
+    PIDLIST_ABSOLUTE pidl=nullptr;ComPtr<IShellFolder> parent;PCUITEMID_CHILD child=nullptr;ComPtr<IDropTarget> target;
+    if(SUCCEEDED(SHParseDisplayName(path.c_str(),nullptr,&pidl,0,nullptr))&&pidl) {
+        if(SUCCEEDED(SHBindToParent(pidl,IID_PPV_ARGS(&parent),&child)))parent->GetUIObjectOf(g_background,1,&child,IID_IDropTarget,nullptr,reinterpret_cast<void**>(target.GetAddressOf()));
+        CoTaskMemFree(pidl);
+    }
+    return target;
+}
+// The canvas owns icon hit testing, so it must also be an OLE drop target.
+// Delegate the actual operation to the selected item's Shell IDropTarget: this
+// retains Explorer's behavior for programs, folders, Recycle Bin and extensions.
+class CanvasDropTarget final : public IDropTarget {
+    LONG references_=1;ComPtr<IDropTarget> target_;ComPtr<IDataObject> data_;std::wstring path_;
+    void Clear(bool leave) {if(target_&&leave)target_->DragLeave();target_.Reset();data_.Reset();path_.clear();}
+    HRESULT Select(IDataObject* data,DWORD keys,POINTL point,DWORD* effect) {
+        const int index=HitVisualIcon(point.x-GetSystemMetrics(SM_XVIRTUALSCREEN),point.y-GetSystemMetrics(SM_YVIRTUALSCREEN));
+        const std::wstring next=index>=0?g_visualIcons[index].path:L"";
+        if(next.empty()) {Clear(true);if(effect)*effect=DROPEFFECT_NONE;return S_OK;}
+        if(!target_||_wcsicmp(next.c_str(),path_.c_str())!=0) {Clear(true);target_=ShellDropTargetFor(next);path_=next;}
+        if(!target_) {if(effect)*effect=DROPEFFECT_NONE;return S_OK;}
+        data_=data;return target_->DragEnter(data,keys,point,effect);
+    }
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** value) override {if(!value)return E_POINTER;*value=nullptr;if(iid==IID_IUnknown||iid==IID_IDropTarget){*value=static_cast<IDropTarget*>(this);AddRef();return S_OK;}return E_NOINTERFACE;}
+    ULONG STDMETHODCALLTYPE AddRef() override {return static_cast<ULONG>(InterlockedIncrement(&references_));}
+    ULONG STDMETHODCALLTYPE Release() override {const LONG count=InterlockedDecrement(&references_);if(!count)delete this;return static_cast<ULONG>(count);}
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data,DWORD keys,POINTL point,DWORD* effect) override {return Select(data,keys,point,effect);}
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD keys,POINTL point,DWORD* effect) override {
+        const int index=HitVisualIcon(point.x-GetSystemMetrics(SM_XVIRTUALSCREEN),point.y-GetSystemMetrics(SM_YVIRTUALSCREEN));
+        const std::wstring next=index>=0?g_visualIcons[index].path:L"";
+        if(next!=path_)return Select(data_.Get(),keys,point,effect);
+        if(!target_){if(effect)*effect=DROPEFFECT_NONE;return S_OK;}return target_->DragOver(keys,point,effect);
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {Clear(true);return S_OK;}
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data,DWORD keys,POINTL point,DWORD* effect) override {
+        const HRESULT result=target_?target_->Drop(data,keys,point,effect):S_OK;
+        if(!target_&&effect)*effect=DROPEFFECT_NONE;Clear(false);PostMessageW(g_manager,WM_APP+12,0,0);return result;
+    }
+};
 void RefreshIconHit(VisualIcon& item) {
     const LONG padding=max(0L,(g_snapshot.spacing.x-item.size)/2);
     item.hit={item.position.x-padding,item.position.y,item.position.x-padding+g_snapshot.spacing.x,item.position.y+g_snapshot.spacing.y};
@@ -1004,6 +1130,10 @@ LRESULT CALLBACK KeyboardProc(int code,WPARAM wParam,LPARAM lParam) {
             RequestDeleteSelection();
             if(!g_pendingDelete.empty())return 1;
         }
+        if(key->vkCode==VK_F2) {
+            auto selected=std::find_if(g_visualIcons.begin(),g_visualIcons.end(),[](const auto& icon){return icon.selected;});
+            if(selected!=g_visualIcons.end()) {PostMessageW(g_manager,WM_APP+14,0,reinterpret_cast<LPARAM>(new std::wstring(selected->path)));return 1;}
+        }
     }
     return CallNextHookEx(g_keyboardHook,code,wParam,lParam);
 }
@@ -1023,10 +1153,33 @@ void ShowShellMenu(HWND owner,const std::wstring& path,POINT screen) {
         ComPtr<IContextMenu> menu; if(SUCCEEDED(parent->GetUIObjectOf(owner,1,&child,IID_IContextMenu,nullptr,reinterpret_cast<void**>(menu.GetAddressOf())))) {
             HMENU popup=CreatePopupMenu();if(SUCCEEDED(menu->QueryContextMenu(popup,0,1,0x7fff,CMF_NORMAL))) {
                 int command=TrackPopupMenu(popup,TPM_RETURNCMD|TPM_RIGHTBUTTON,screen.x,screen.y,0,owner,nullptr);
-                if(command){CMINVOKECOMMANDINFOEX invoke{};invoke.cbSize=sizeof(invoke);invoke.fMask=CMIC_MASK_UNICODE;invoke.hwnd=owner;invoke.lpVerb=MAKEINTRESOURCEA(command-1);invoke.lpVerbW=MAKEINTRESOURCEW(command-1);invoke.nShow=SW_SHOWNORMAL;menu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));}
+                if(command){
+                    char verb[64]{};
+                    const bool rename=SUCCEEDED(menu->GetCommandString(command-1,GCS_VERBA,nullptr,verb,sizeof(verb)))&&_stricmp(verb,"rename")==0;
+                    if(rename)BeginItemRename(path);
+                    else {CMINVOKECOMMANDINFOEX invoke{};invoke.cbSize=sizeof(invoke);invoke.fMask=CMIC_MASK_UNICODE;invoke.hwnd=owner;invoke.lpVerb=MAKEINTRESOURCEA(command-1);invoke.lpVerbW=MAKEINTRESOURCEW(command-1);invoke.nShow=SW_SHOWNORMAL;menu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));PostMessageW(g_manager,WM_APP+12,0,0);}
+                }
             } DeleteMenu(popup,0,MF_BYPOSITION);DestroyMenu(popup);
         }
     } CoTaskMemFree(pidl);
+}
+bool DropDesktopItemsOn(const std::vector<std::wstring>& paths,const std::wstring& destination,POINT screen) {
+    std::vector<PIDLIST_ABSOLUTE> owned;std::vector<PCIDLIST_ABSOLUTE> pidls;
+    for(const auto& path:paths) {
+        PIDLIST_ABSOLUTE pidl=nullptr;
+        if(SUCCEEDED(SHParseDisplayName(path.c_str(),nullptr,&pidl,0,nullptr))&&pidl) {owned.push_back(pidl);pidls.push_back(pidl);}
+    }
+    if(pidls.empty())return false;
+    ComPtr<IDataObject> data;const HRESULT dataResult=SHCreateDataObject(nullptr,static_cast<UINT>(pidls.size()),pidls.data(),nullptr,IID_PPV_ARGS(&data));
+    for(auto pidl:owned)CoTaskMemFree(pidl);
+    auto target=ShellDropTargetFor(destination);if(FAILED(dataResult)||!target)return false;
+    POINTL point{screen.x,screen.y};DWORD effect=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
+    const HRESULT enter=target->DragEnter(data.Get(),MK_LBUTTON,point,&effect);
+    const HRESULT drop=SUCCEEDED(enter)&&effect!=DROPEFFECT_NONE?target->Drop(data.Get(),MK_LBUTTON,point,&effect):E_FAIL;
+    if(FAILED(drop)||effect==DROPEFFECT_NONE)return false;
+    for(auto& box:g_layout->boxes)box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.c_str())==0;});}),box.items.end());
+    g_layout->desktop.erase(std::remove_if(g_layout->desktop.begin(),g_layout->desktop.end(),[&](const auto& item){return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.path.c_str())==0;});}),g_layout->desktop.end());
+    SaveLayout(*g_layout);PostMessageW(g_manager,WM_APP+12,0,0);return true;
 }
 void FinishVisualDrag() {
     if(g_iconDrag<0||g_iconDrag>=static_cast<int>(g_visualIcons.size()))return;
@@ -1052,6 +1205,18 @@ void FinishVisualDrag() {
         for(int i=0;i<static_cast<int>(g_layout->boxes.size());++i)if(HasPath(g_layout->boxes[i],start.first)){affected.push_back(i);break;}
     }
     std::vector<std::wstring> paths;for(const auto& item:dragged)paths.push_back(item.first);
+    // A desktop icon drag starts inside our canvas, not in Explorer's hidden
+    // list view.  Detect a non-dragged icon under the drop point and delegate
+    // to its Shell target so folders, applications and Recycle Bin retain
+    // their normal drop semantics.
+    const auto nativeTarget=std::find_if(g_visualIcons.rbegin(),g_visualIcons.rend(),[&](const auto& icon){
+        const bool moving=std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),icon.path.c_str())==0;});
+        return !moving&&PtInRect(&icon.hit,center);
+    });
+    if(nativeTarget!=g_visualIcons.rend()) {
+        POINT screen{center.x+GetSystemMetrics(SM_XVIRTUALSCREEN),center.y+GetSystemMetrics(SM_YVIRTUALSCREEN)};
+        if(DropDesktopItemsOn(paths,nativeTarget->path,screen)) {g_visualDirty=true;g_iconDrag=-1;g_iconDragStart.clear();PaintAll();return;}
+    }
     for(auto& box:g_layout->boxes) {
         box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& item){
             return std::any_of(paths.begin(),paths.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.c_str())==0;});
@@ -1139,6 +1304,10 @@ bool Attach() {
     g_background=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
         L"nestlone-D.Decoration",L"",WS_POPUP,origin.x,origin.y,GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN),nullptr,nullptr,g_instance,nullptr);
     if(!g_background){DestroyDecorations();return false;}
+    auto* dropTarget=new CanvasDropTarget();
+    g_dropRegistered=SUCCEEDED(RegisterDragDrop(g_background,dropTarget));
+    dropTarget->Release();
+    if(!g_dropRegistered)db::LogF("[canvas] OLE drop target unavailable: %lu",GetLastError());
     // This is the owned desktop surface. Explorer's list view is hidden while
     // the surface is alive; file paths remain unchanged.
     SetWindowPos(g_background,HWND_BOTTOM,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
@@ -1414,9 +1583,11 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     if(message==WM_APP+10){FinishRename(true);return 0;}
     if(message==WM_APP+11){Rebuild();return 0;}
     if(message==WM_APP+13){DeleteSelection();return 0;}
+    if(message==WM_APP+14){std::unique_ptr<std::wstring> path(reinterpret_cast<std::wstring*>(lp));if(path)BeginItemRename(*path);return 0;}
     if(message==WM_APP+20){
         std::unique_ptr<WeatherReply> reply(reinterpret_cast<WeatherReply*>(lp));
-        if(reply&&g_layout){for(auto& widget:g_layout->widgets)if(widget.type==L"weather"){widget.temperature=reply->temperature;widget.weather=reply->summary;widget.weatherIcon=reply->icon;}SaveLayout(*g_layout);for(auto& window:g_widgets)if(IsWindow(window->window)){if(auto* model=FindWidget(window->id);model&&model->type==L"weather")PaintWeatherWidget(window->window,*model);else InvalidateRect(window->window,nullptr,TRUE);}}
+        if(reply&&!reply->diagnostic.empty())db::LogF("[weather] %s",db::ToUtf8(reply->diagnostic).c_str());
+        if(reply&&g_layout){for(auto& widget:g_layout->widgets)if(widget.type==L"weather"){widget.temperature=reply->temperature;widget.weather=reply->summary;widget.weatherIcon=reply->icon;widget.weatherValid=reply->valid;widget.weatherLocation=reply->source;}SaveLayout(*g_layout);for(auto& window:g_widgets)if(IsWindow(window->window)){if(auto* model=FindWidget(window->id);model&&model->type==L"weather")PaintWeatherWidget(window->window,*model);else InvalidateRect(window->window,nullptr,TRUE);}}
         return 0;
     }
     if(message==WM_APP+21){UpdateSurfaceVisibility();return 0;}
@@ -1440,6 +1611,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         DesktopSnapshot next;
         if(PollDesktop(next)&&next.readable) {
             const bool changed=SnapshotVisualsChanged(g_snapshot,next);
+            PlaceNewDesktopEntries(g_snapshot,next);
             g_snapshot=std::move(next);
             if(changed)g_iconCache.clear();
             // Force an owned-canvas redraw even for a shell command whose
@@ -1465,6 +1637,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                 // Keep the pre-drag baseline until Explorer has finished native drag/drop.
                 if(!(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000)){
                     bool resourcesChanged=SnapshotVisualsChanged(g_snapshot,next);
+                    PlaceNewDesktopEntries(g_snapshot,next);
                     g_snapshot=std::move(next);
                     if(g_nativeHidden&&resourcesChanged){g_iconCache.clear();g_visualDirty=true;PaintAll();}
                 }
@@ -1528,6 +1701,7 @@ void HandleCanvasCommand(CanvasCommand command) {
         UpdateSurfaceVisibility();
     }
     if(command==CanvasCommand::NewBox)CreateBoxAt({160,160});
+    if(command==CanvasCommand::NewWeather&&!WeatherConfigured()) {MessageBoxW(nullptr,L"无法添加天气组件，请前往设置中心的“配置”填写天气接口信息。",L"天气组件",MB_OK|MB_ICONINFORMATION);return;}
     if(command==CanvasCommand::NewNote||command==CanvasCommand::NewWeather) {Layout::Widget widget;widget.id=std::to_wstring(GetTickCount64());widget.type=command==CanvasCommand::NewNote?L"note":L"weather";widget.rect={220,160,480,command==CanvasCommand::NewNote?390:310};widget.text=L"双击编辑内容";widget.weather=L"正在获取天气";g_layout->widgets.push_back(std::move(widget));SaveLayout(*g_layout);SyncWidgets();UpdateWeatherSchedule();if(command==CanvasCommand::NewWeather)RefreshWeatherNow();}
     if(command==CanvasCommand::ClearWidgets) {g_layout->widgets.clear();SaveLayout(*g_layout);SyncWidgets();UpdateWeatherSchedule();}
     if(command==CanvasCommand::Reload){g_iconCache.clear();*g_layout=LoadLayout();Rebuild();}

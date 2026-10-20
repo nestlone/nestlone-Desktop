@@ -7,7 +7,12 @@
 namespace nestlone {
 // Coordinates are physical pixels relative to the virtual-screen origin.
 struct DesktopEntry {
+    // `path` is the Shell parsing name.  It is a filesystem path for ordinary
+    // items, but can be a namespace identifier (for example Recycle Bin).
     std::wstring path;
+    // Shell's user-facing name.  Never derive this from `path`: virtual
+    // desktop items do not have a filename to strip.
+    std::wstring displayName;
     POINT position{};
     RECT bounds{};
     int index=-1;
