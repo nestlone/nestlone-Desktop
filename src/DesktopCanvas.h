@@ -3,7 +3,7 @@
 #include "BoxModel.h"
 
 namespace nestlone {
-enum class CanvasCommand { Toggle, NewBox, NewNote, NewWeather, ClearWidgets, Reload, Exit };
+enum class CanvasCommand { Toggle, NewBox, ClearWidgets, RefreshLayout, Reload, Exit };
 bool CreateCanvas(HINSTANCE instance, HWND parent, Layout* layout);
 void DestroyCanvas();
 void HandleCanvasCommand(CanvasCommand command);
@@ -11,5 +11,7 @@ void HandleCanvasCommand(CanvasCommand command);
 // leaving the native ListView hidden while the replacement surface is absent.
 void CanvasNotifyDesktopHostChanged();
 bool CanvasVisible();
+bool CanvasCreateNote(HWND settings);
+bool CanvasShowNote(const std::wstring& id);
 void CanvasSetOpacity(int opacity);
 }

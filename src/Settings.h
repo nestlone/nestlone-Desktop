@@ -5,6 +5,8 @@
 
 namespace nestlone {
 
-void ShowSettings(HINSTANCE instance, Layout* layout);
+void ShowSettings(HINSTANCE instance, HWND owner, Layout* layout);
+bool ProcessSettingsMessage(MSG& message);
+void CloseSettings();
 
 }

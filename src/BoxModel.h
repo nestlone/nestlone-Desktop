@@ -31,28 +31,19 @@ struct Layout {
     int defaultBoxHeight{320};
     COLORREF defaultBoxColor{RGB(184, 235, 238)};
     std::wstring fontFamily{L"Microsoft YaHei UI"};
-    // Stored only in the user's local layout. New installations start blank.
-    std::wstring weatherApiHost;
-    std::wstring weatherApiKey;
-    bool locationFallback{false};
-    std::wstring manualLongitude,manualLatitude,manualLocationName;
     struct Placement { std::wstring path; POINT point; };
     std::vector<Placement> desktop;
     struct Widget {
         std::wstring id;
-        std::wstring type; // note | weather
+        std::wstring type{L"note"};
         RECT rect{120, 120, 380, 300};
         std::wstring text;
-        std::wstring city{L"北京"};
-        std::wstring weather;
-        std::wstring weatherIcon{L"999"};
-        int temperature{0};
-        bool weatherValid{false};
-        std::wstring weatherLocation{L"Windows 定位"};
         bool locked{false};
+        bool closed{false};
+        COLORREF color{RGB(255,255,255)};
     };
     std::vector<Widget> widgets;
-    struct AutoRule { std::wstring boxId; bool folders{false}; std::wstring extensions; };
+    struct AutoRule { std::wstring boxId; bool folders{false}; std::wstring extensions; bool enabled{true}; };
     bool autoOrganize{false};
     std::vector<AutoRule> autoRules;
 };
@@ -62,4 +53,5 @@ Layout LoadLayout();
 bool SaveLayout(const Layout& layout);
 bool AddItem(Box& box, const std::wstring& path);
 bool AssignDesktopItem(Layout& layout, const std::wstring& path, int boxIndex, POINT point);
+bool MatchesAutoRule(const Layout::AutoRule& rule, bool directory, const std::wstring& extension);
 }

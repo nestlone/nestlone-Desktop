@@ -1,21 +1,16 @@
 #include "DesktopCanvas.h"
-#include "Location.h"
+#include "NoteStyle.h"
 #include "DesktopSession.h"
 #include "DesktopHost.h"
-#include "resource.h"
 #include "log.h"
 #include <windowsx.h>
 #include <gdiplus.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <ole2.h>
-#include <winhttp.h>
-#pragma warning(push)
-#pragma warning(disable:4996)
-#include <locationapi.h>
-#pragma warning(pop)
 #include <wrl/client.h>
 #include <algorithm>
 #include <memory>
@@ -23,17 +18,10 @@
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
-#include <thread>
 #include <string>
 #include <cmath>
 #include <cstdlib>
-#include <cctype>
 #include <filesystem>
-#include <fstream>
-#include <atomic>
-#include <iomanip>
-#include <sstream>
-#include <locale>
 
 namespace nestlone {
 namespace {
@@ -43,17 +31,17 @@ HWND g_manager=nullptr,g_background=nullptr,g_edit=nullptr;
 HINSTANCE g_instance=nullptr;
 ULONG_PTR g_token=0;
 HHOOK g_keyboardHook=nullptr;
+HHOOK g_renameMouseHook=nullptr;
 HWINEVENTHOOK g_foregroundHook=nullptr;
 bool g_visible=true,g_drag=false,g_resizing=false,g_resizeFromLeft=false,g_tabPending=false,g_tabDetached=false,g_nativeHidden=false;
 int g_tabInsert=-1;
 bool g_interactivePaintQueued=false;
-std::atomic_bool g_weatherRequestInFlight=false;
-std::unique_ptr<Gdiplus::PrivateFontCollection> g_weatherIconFonts;
-std::unique_ptr<Gdiplus::FontFamily> g_weatherIconFamily;
-std::string g_weatherIconCss;
 bool g_visualGeometryDirty=false;
 int g_shellRefreshAttempts=0;
 HWND g_dragPreview=nullptr;
+HWND g_iconDragPreview=nullptr;
+POINT g_iconPreviewOrigin{};
+std::unordered_set<std::wstring> g_iconPreviewPaths;
 std::wstring g_previewGroup,g_renderOnlyGroup;
 void EndDragPreview();
 HWND g_hiddenListview=nullptr;
@@ -66,11 +54,19 @@ POINT g_mouseStart{};
 RECT g_boxStart{};
 std::wstring g_dragId,g_editId,g_status;
 bool g_editGroupTitle=false;
-std::wstring g_editItemPath;
+std::wstring g_editItemPath,g_editHiddenExtension;
 std::vector<std::pair<std::wstring,RECT>> g_boxDragStart;
 HFONT g_editFont=nullptr;
 struct Decoration {std::wstring id;HWND header=nullptr,gripLeft=nullptr,grip=nullptr;};
-struct WidgetWindow {std::wstring id;HWND window=nullptr,edit=nullptr;bool dragging=false,pendingSave=false;POINT mouse{};RECT start{};};
+struct WidgetWindow {
+    std::wstring id;
+    HWND window=nullptr,edit=nullptr;
+    HWND buttons[3]{};
+    bool dragging=false,resizing=false,pendingSave=false,syncingText=false;
+    int scrollGrab=-1,wheelRemainder=0;
+    POINT mouse{};
+    RECT start{};
+};
 std::vector<std::unique_ptr<Decoration>> g_decorations;
 std::vector<std::unique_ptr<WidgetWindow>> g_widgets;
 struct VisualIcon {
@@ -93,17 +89,15 @@ std::vector<std::wstring> g_pendingDelete;
 struct PendingShellDrop {std::wstring path;ULONGLONG started=0;};
 std::vector<PendingShellDrop> g_pendingShellDrops;
 bool g_visualDirty=true;
-void CancelIconGesture();
+void CancelIconGesture(bool releaseCapture=true);
 void BeginItemRename(const std::wstring& path);
 void RebuildVisualIcons();
 void RefreshVisualGeometry();
-void DrawVisualIcons(Gdiplus::Graphics&);
+void DrawVisualIcons(Gdiplus::Graphics&,bool iconPreview=false);
 LRESULT CALLBACK KeyboardProc(int code,WPARAM wParam,LPARAM lParam);
 LRESULT CALLBACK WidgetProc(HWND,UINT,WPARAM,LPARAM);
 void UpdateSurfaceVisibility();
 constexpr int kHeader=32;
-constexpr UINT_PTR kWeatherTimer=4;
-constexpr UINT kWeatherRefreshMs=5*60*1000;
 int HeaderHeight(){return MulDiv(kHeader,static_cast<int>(g_host.listview?GetDpiForWindow(g_host.listview):96),96);}
 const wchar_t* CanvasFontFamily() { return g_layout&&!g_layout->fontFamily.empty()?g_layout->fontFamily.c_str():L"Microsoft YaHei UI"; }
 Box* FindBox(const std::wstring& id) {
@@ -350,129 +344,6 @@ POINT ParentPoint(POINT point) { return point; }
 HWND SurfaceParent() { return g_background ? g_background : g_host.defviewParent; }
 DWORD SurfaceWindowStyle() { return WS_CHILD; }
 HWND SurfaceControlInsertAfter() { return HWND_TOP; }
-struct WeatherReply {std::wstring summary,icon,source=L"Windows 定位",diagnostic;int temperature=0;bool valid=false;};
-bool ReadResourceBytes(int id,const BYTE*& data,DWORD& size) {
-    HINSTANCE module=GetModuleHandleW(nullptr);HRSRC resource=FindResourceW(module,MAKEINTRESOURCEW(id),RT_RCDATA);
-    if(!resource)return false;size=SizeofResource(module,resource);data=static_cast<const BYTE*>(LockResource(LoadResource(module,resource)));return data&&size;
-}
-void EnsureWeatherIconFont() {
-    if(g_weatherIconFamily)return;
-    const BYTE* fontData=nullptr;DWORD fontSize=0;if(!ReadResourceBytes(IDR_QWEATHER_FONT,fontData,fontSize))return;
-    if(!g_weatherIconFonts)g_weatherIconFonts=std::make_unique<Gdiplus::PrivateFontCollection>();
-    if(g_weatherIconFonts->AddMemoryFont(fontData,fontSize)!=Gdiplus::Ok)return;
-    const INT count=g_weatherIconFonts->GetFamilyCount();if(count<1)return;
-    Gdiplus::FontFamily family;INT found=0;if(g_weatherIconFonts->GetFamilies(1,&family,&found)!=Gdiplus::Ok||found<1)return;
-    WCHAR name[LF_FACESIZE]{};if(family.GetFamilyName(name)!=Gdiplus::Ok)return;
-    auto loaded=std::make_unique<Gdiplus::FontFamily>(name,g_weatherIconFonts.get());if(loaded->GetLastStatus()==Gdiplus::Ok)g_weatherIconFamily=std::move(loaded);
-    const BYTE* cssData=nullptr;DWORD cssSize=0;if(ReadResourceBytes(IDR_QWEATHER_CSS,cssData,cssSize))g_weatherIconCss.assign(reinterpret_cast<const char*>(cssData),cssSize);
-}
-wchar_t WeatherGlyph(const std::wstring& code) {
-    EnsureWeatherIconFont();if(g_weatherIconCss.empty())return 0;
-    std::string id;id.reserve(code.size());for(const wchar_t value:code){if(value>0x7f)return 0;id.push_back(static_cast<char>(value));}const size_t rule=g_weatherIconCss.find(".qi-"+id+"::before");if(rule==std::string::npos)return 0;
-    const size_t marker=g_weatherIconCss.find("\\f",rule);if(marker==std::string::npos)return 0;
-    size_t end=marker+1;while(end<g_weatherIconCss.size()&&std::isxdigit(static_cast<unsigned char>(g_weatherIconCss[end])))++end;
-    return static_cast<wchar_t>(std::strtoul(g_weatherIconCss.substr(marker+1,end-marker-1).c_str(),nullptr,16));
-}
-int JsonNumber(const std::string& text,const char* key) {
-    const auto at=text.find(key);if(at==std::string::npos)return 0;
-    return static_cast<int>(std::lround(std::strtod(text.c_str()+at+strlen(key),nullptr)));
-}
-std::wstring JsonText(const std::string& text,const char* key) {
-    const auto at=text.find(key);if(at==std::string::npos)return {};
-    const size_t begin=at+strlen(key),end=text.find('"',begin);if(end==std::string::npos)return {};
-    const std::string value=text.substr(begin,end-begin);if(value.empty())return {};
-    const int count=MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),nullptr,0);
-    std::wstring result(max(0,count),L'\0');if(count)MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),result.data(),count);return result;
-}
-bool ValidWeatherHost(const std::wstring& host) {
-    const std::wstring suffix=L".qweatherapi.com";
-    return host.size()>suffix.size()&&host.size()<254&&host.compare(host.size()-suffix.size(),suffix.size(),suffix)==0&&
-        std::all_of(host.begin(),host.end(),[](wchar_t c){return (c>=L'a'&&c<=L'z')||(c>=L'0'&&c<=L'9')||c==L'-'||c==L'.';});
-}
-bool WeatherConfigured() {
-    if(!g_layout||!ValidWeatherHost(g_layout->weatherApiHost)||g_layout->weatherApiKey.empty())return false;
-    return std::all_of(g_layout->weatherApiKey.begin(),g_layout->weatherApiKey.end(),[](wchar_t c){return (c>=L'a'&&c<=L'z')||(c>=L'A'&&c<=L'Z')||(c>=L'0'&&c<=L'9');});
-}
-// Ignore insignificant JSON whitespace without altering quoted text.
-std::string CompactWeatherJson(const std::string& body) {
-    std::string result;result.reserve(body.size());bool quoted=false,escaped=false;
-    for(unsigned char c:body) {
-        if(quoted){result+=static_cast<char>(c);if(escaped)escaped=false;else if(c=='\\')escaped=true;else if(c=='"')quoted=false;}
-        else if(c=='"'){quoted=true;result+='"';}
-        else if(!std::isspace(c))result+=static_cast<char>(c);
-    }
-    return result;
-}
-void RequestWeather(const std::wstring& host,const std::wstring& key,double latitude,double longitude,WeatherReply& reply) {
-    struct InternetHandle {HINTERNET value;~InternetHandle(){if(value)WinHttpCloseHandle(value);}};
-    auto fail=[&](const wchar_t* stage){DWORD code=GetLastError();reply.summary=L"网络错误 "+std::to_wstring(code);reply.diagnostic=std::wstring(stage)+L" winhttp="+std::to_wstring(code);};
-    InternetHandle session{WinHttpOpen(L"nestlone-D/0.2",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
-    if(!session.value){fail(L"session");return;}
-    WinHttpSetTimeouts(session.value,5000,5000,8000,8000);
-    InternetHandle connection{WinHttpConnect(session.value,host.c_str(),INTERNET_DEFAULT_HTTPS_PORT,0)};
-    if(!connection.value){fail(L"connect");return;}
-    std::wostringstream coordinate;coordinate.imbue(std::locale::classic());coordinate<<std::fixed<<std::setprecision(2)<<longitude<<L","<<latitude;
-    const std::wstring path=L"/v7/weather/now?location="+coordinate.str()+L"&lang=zh";
-    InternetHandle request{WinHttpOpenRequest(connection.value,L"GET",path.c_str(),nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE)};
-    if(!request.value){fail(L"request");return;}
-    DWORD redirects=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    if(!WinHttpSetOption(request.value,WINHTTP_OPTION_REDIRECT_POLICY,&redirects,sizeof(redirects))){fail(L"redirect policy");return;}
-    DWORD decompression=WINHTTP_DECOMPRESSION_FLAG_GZIP|WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
-    if(!WinHttpSetOption(request.value,WINHTTP_OPTION_DECOMPRESSION,&decompression,sizeof(decompression))){fail(L"decompression");return;}
-    const std::wstring headers=L"X-QW-Api-Key: "+key+L"\r\nAccept: application/json\r\n";
-    if(!WinHttpSendRequest(request.value,headers.c_str(),static_cast<DWORD>(headers.size()),WINHTTP_NO_REQUEST_DATA,0,0,0)||!WinHttpReceiveResponse(request.value,nullptr)){fail(L"send/receive");return;}
-    DWORD status=0,size=sizeof(status);
-    if(!WinHttpQueryHeaders(request.value,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&status,&size,WINHTTP_NO_HEADER_INDEX)){fail(L"status");return;}
-    if(status!=200){reply.summary=L"天气 HTTP "+std::to_wstring(status);reply.diagnostic=L"http="+std::to_wstring(status);return;}
-    std::string body;char bytes[4096];DWORD count=0;
-    for(;;){if(!WinHttpReadData(request.value,bytes,sizeof(bytes),&count)){fail(L"read");return;}if(!count)break;body.append(bytes,count);if(body.size()>1024*1024){reply.summary=L"天气响应过大";reply.diagnostic=L"response exceeds size limit";return;}}
-    body=CompactWeatherJson(body);
-    const auto code=JsonText(body,"\"code\":\"");
-    if(code!=L"200") {
-        const bool numeric=!code.empty()&&code.size()<=5&&std::all_of(code.begin(),code.end(),[](wchar_t c){return c>=L'0'&&c<=L'9';});
-        reply.summary=numeric?L"天气接口错误 "+code:L"天气响应格式异常";
-        reply.diagnostic=numeric?L"api="+code:L"invalid response JSON";return;
-    }
-    const auto now=body.find("\"now\":{");
-    if(now==std::string::npos){reply.summary=L"缺少实时天气数据";return;}
-    const auto current=body.substr(now);
-    const auto temperature=JsonText(current,"\"temp\":\""),description=JsonText(current,"\"text\":\""),icon=JsonText(current,"\"icon\":\"");
-    wchar_t* end=nullptr;const long value=wcstol(temperature.c_str(),&end,10);
-    if(temperature.empty()||*end||value<-150||value>100||description.empty()||icon.empty()){reply.summary=L"天气数据不完整";return;}
-    reply.temperature=static_cast<int>(value);reply.summary=description;reply.icon=icon;reply.valid=true;
-}
-bool HasActiveWeatherWidget() {return g_visible&&g_layout&&std::any_of(g_layout->widgets.begin(),g_layout->widgets.end(),[](const auto& widget){return widget.type==L"weather";});}
-void FetchWeather() {
-    if(g_weatherRequestInFlight.exchange(true))return;
-    const bool configured=WeatherConfigured();
-    const bool fallback=g_layout->locationFallback;
-    const auto manualLon=g_layout->manualLongitude,manualLat=g_layout->manualLatitude,manualName=g_layout->manualLocationName;
-    std::thread([configured,fallback,manualLon,manualLat,manualName] {
-        auto reply=std::make_unique<WeatherReply>();reply->summary=L"天气暂不可用";reply->icon=L"999";
-        const std::wstring key=g_layout?g_layout->weatherApiKey:L"",host=g_layout?g_layout->weatherApiHost:L"";
-        double latitude=0,longitude=0;
-        if(!configured)reply->summary=L"无法添加，请前往配置填写天气接口信息";
-        else {
-        std::wstring error;
-        bool located=location::Read(latitude,longitude,error);
-        if(!located&&fallback&&location::ParseCoordinate(manualLon,180,longitude)&&location::ParseCoordinate(manualLat,90,latitude)) {
-            located=true;reply->source=L"手动 · "+(manualName.empty()?L"指定位置":manualName);
-        }
-        if(!located)reply->summary=L"无法定位，请查看信息采集";
-        else {
-        RequestWeather(host,key,latitude,longitude,*reply);
-        }
-        }
-        g_weatherRequestInFlight=false;HWND manager=g_manager;WeatherReply* raw=reply.release();
-        if(!manager||!PostMessageW(manager,WM_APP+20,0,reinterpret_cast<LPARAM>(raw)))delete raw;
-    }).detach();
-}
-void UpdateWeatherSchedule() {
-    if(!g_manager)return;
-    if(!HasActiveWeatherWidget()){KillTimer(g_manager,kWeatherTimer);return;}
-    SetTimer(g_manager,kWeatherTimer,kWeatherRefreshMs,nullptr);
-}
-void RefreshWeatherNow() {if(HasActiveWeatherWidget())FetchWeather();}
 // The application owns one top-level surface and all its decorations are
 // children. Keep the surface immediately above the desktop, below normal apps.
 // Never infer desktop visibility from a foreground process ID (Explorer also
@@ -480,19 +351,132 @@ void RefreshWeatherNow() {if(HasActiveWeatherWidget())FetchWeather();}
 bool SurfacePresentationAllowed() {return g_visible;}
 void UpdateSurfaceVisibility() {
     if(!IsWindow(g_background))return;
-    if(!g_visible){ShowWindow(g_background,SW_HIDE);return;}
+    if(!g_visible) {
+        for(const auto& widget:g_widgets)ShowWindow(widget->window,SW_HIDE);
+        ShowWindow(g_background,SW_HIDE);
+        return;
+    }
     HWND desktop=GetAncestor(g_host.defview,GA_ROOT);
     if(!IsWindow(desktop))return;
     HWND preceding=GetWindow(desktop,GW_HWNDPREV);
-    while(preceding==g_background)preceding=GetWindow(preceding,GW_HWNDPREV);
+    while(preceding&&(preceding==g_background||FindWidgetWindow(preceding)))
+        preceding=GetWindow(preceding,GW_HWNDPREV);
     // Inserting after a topmost window can itself promote our window.  Keep
     // the canvas in the normal window band even when the desktop is foremost.
     if(preceding&&(GetWindowLongPtrW(preceding,GWL_EXSTYLE)&WS_EX_TOPMOST))preceding=nullptr;
-    SetWindowPos(g_background,preceding?preceding:HWND_TOP,0,0,0,0,
-        SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_SHOWWINDOW);
+    const HWND insertAfter=preceding?preceding:HWND_TOP;
+    constexpr UINT flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_SHOWWINDOW;
+    SetWindowPos(g_background,insertAfter,0,0,0,0,flags);
+    const HWND foreground=GetForegroundWindow();
+    for(const auto& widget:g_widgets) {
+        const auto* model=FindWidget(widget->id);
+        if(!model||model->closed) {
+            if(IsWindowVisible(widget->window))ShowWindow(widget->window,SW_HIDE);
+            continue;
+        }
+        // An active note stays in front while the user types. Other notes
+        // sit immediately above the canvas, below ordinary app windows.
+        if(widget->window!=foreground)SetWindowPos(widget->window,insertAfter,0,0,0,0,flags);
+    }
 }
 void CALLBACK ForegroundProc(HWINEVENTHOOK,DWORD,HWND,LONG,LONG,DWORD,DWORD) {
     if(g_manager)PostMessageW(g_manager,WM_APP+21,0,0);
+}
+std::wstring NoteText(HWND edit) {
+    std::wstring text(static_cast<size_t>(GetWindowTextLengthW(edit))+1,L'\0');
+    text.resize(GetWindowTextW(edit,text.data(),static_cast<int>(text.size())));
+    return text;
+}
+constexpr int kNoteColor=2,kNoteLock=3,kNoteClose=4;
+constexpr int kNoteButtonWidth=27,kNoteButtonInset=7;
+RECT NoteScrollTrack(HWND window) {
+    RECT r{};GetClientRect(window,&r);
+    return {r.right-note::padding,note::headerHeight+note::padding,r.right-6,r.bottom-note::padding};
+}
+struct NoteScroll {
+    RECT track{},thumb{};
+    int first=0,last=0,page=1;
+};
+NoteScroll ReadNoteScroll(const WidgetWindow& state) {
+    NoteScroll scroll;
+    scroll.track=NoteScrollTrack(state.window);
+    const LONG height=scroll.track.bottom-scroll.track.top;
+    if(!state.edit||height<2)return scroll;
+    RECT format{};
+    SendMessageW(state.edit,EM_GETRECT,0,reinterpret_cast<LPARAM>(&format));
+    TEXTMETRICW metric{};
+    if(HDC dc=GetDC(state.edit)) {
+        const auto font=reinterpret_cast<HFONT>(SendMessageW(state.edit,WM_GETFONT,0,0));
+        const auto old=font?SelectObject(dc,font):nullptr;
+        GetTextMetricsW(dc,&metric);
+        if(old)SelectObject(dc,old);
+        ReleaseDC(state.edit,dc);
+    }
+    scroll.page=max(1L,(format.bottom-format.top)/max(1L,metric.tmHeight));
+    const int lines=static_cast<int>(SendMessageW(state.edit,EM_GETLINECOUNT,0,0));
+    scroll.last=max(0,lines-scroll.page);
+    if(!scroll.last)return scroll;
+    scroll.first=static_cast<int>(SendMessageW(state.edit,EM_GETFIRSTVISIBLELINE,0,0));
+    const LONG size=std::clamp(static_cast<LONG>(MulDiv(height,scroll.page,lines)),min(14L,height-1),height-1);
+    const LONG y=scroll.track.top+MulDiv(height-size,min(scroll.first,scroll.last),scroll.last);
+    scroll.thumb={scroll.track.left+1,y,scroll.track.left+4,y+size};
+    return scroll;
+}
+void InvalidateNoteScroll(HWND window) {
+    const RECT track=NoteScrollTrack(window);
+    InvalidateRect(window,&track,FALSE);
+}
+void ScrollNoteTo(const WidgetWindow& state,const NoteScroll& scroll,int line) {
+    const int delta=std::clamp(line,0,scroll.last)-scroll.first;
+    if(delta)SendMessageW(state.edit,EM_LINESCROLL,0,delta);
+    InvalidateNoteScroll(state.window);
+}
+void ScrollNoteWheel(WidgetWindow& state,WPARAM wheel) {
+    const auto scroll=ReadNoteScroll(state);
+    if(!scroll.last)return;
+    UINT lines=3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&lines,0);
+    if(!lines)return;
+    state.wheelRemainder+=GET_WHEEL_DELTA_WPARAM(wheel);
+    const int steps=state.wheelRemainder/WHEEL_DELTA;
+    state.wheelRemainder%=WHEEL_DELTA;
+    const int amount=lines==WHEEL_PAGESCROLL?scroll.page:static_cast<int>(min(lines,static_cast<UINT>(scroll.page)));
+    if(steps)ScrollNoteTo(state,scroll,scroll.first-steps*amount);
+}
+LRESULT CALLBACK NoteEditProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data) {
+    auto& state=*reinterpret_cast<WidgetWindow*>(data);
+    if(message==WM_MOUSEWHEEL) {
+        ScrollNoteWheel(state,wp);
+        return 0;
+    }
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(hwnd,NoteEditProc,id);
+    const LRESULT result=DefSubclassProc(hwnd,message,wp,lp);
+    if(message==WM_PAINT)InvalidateNoteScroll(state.window);
+    return result;
+}
+void LayoutNoteControls(HWND window,const WidgetWindow& state) {
+    RECT client{};GetClientRect(window,&client);
+    const int top=note::headerHeight+note::padding;
+    constexpr UINT flags=SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW;
+    if(state.edit) {
+        SetWindowPos(state.edit,nullptr,note::padding,top,max(1L,client.right-2*note::padding),
+            max(1L,client.bottom-top-note::padding),flags);
+        RECT format{};GetClientRect(state.edit,&format);
+        // Reflow the multiline editor at the new width. The gutter is
+        // outside the editor and the text never needs horizontal scrolling.
+        SendMessageW(state.edit,EM_SETRECTNP,0,reinterpret_cast<LPARAM>(&format));
+    }
+    for(int i=0;i<3;++i)if(state.buttons[i])
+        SetWindowPos(state.buttons[i],nullptr,client.right-kNoteButtonInset-(3-i)*kNoteButtonWidth,6,
+            kNoteButtonWidth,note::headerHeight-10,flags);
+}
+void RefreshNoteControls(HWND window,const WidgetWindow& state,const Layout::Widget& widget) {
+    EnableWindow(state.buttons[0],!widget.locked);
+    SetWindowTextW(state.buttons[1],widget.locked?L"解锁便签":L"锁定便签");
+    RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
+}
+POINT NoteScreenOrigin(const RECT& rect) {
+    return {rect.left+GetSystemMetrics(SM_XVIRTUALSCREEN),rect.top+GetSystemMetrics(SM_YVIRTUALSCREEN)};
 }
 void SyncWidgets() {
     if(!g_layout||!g_host.defviewParent)return;
@@ -500,20 +484,47 @@ void SyncWidgets() {
         if(!FindWidget((*it)->id)){if(IsWindow((*it)->window))DestroyWindow((*it)->window);g_paintBuffers.erase((*it)->window);it=g_widgets.erase(it);}else ++it;
     }
     for(auto& model:g_layout->widgets) {
+        if(model.closed)continue;
         auto found=std::find_if(g_widgets.begin(),g_widgets.end(),[&](const auto& item){return item->id==model.id;});
         if(found==g_widgets.end()) {
-            auto widget=std::make_unique<WidgetWindow>();widget->id=model.id;POINT p=ParentPoint({model.rect.left,model.rect.top});
-            const DWORD extended=model.type==L"weather"?(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW):WS_EX_TOOLWINDOW;
-            widget->window=CreateWindowExW(extended,L"nestlone-D.Widget",L"",SurfaceWindowStyle()|WS_CLIPCHILDREN,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,SurfaceParent(),nullptr,g_instance,widget.get());
+            auto widget=std::make_unique<WidgetWindow>();widget->id=model.id;
+            const POINT p=NoteScreenOrigin(model.rect);
+            widget->window=CreateWindowExW(WS_EX_TOOLWINDOW,L"nestlone-D.Widget",L"",WS_POPUP|WS_THICKFRAME|WS_CLIPCHILDREN,
+                p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,nullptr,nullptr,g_instance,widget.get());
             if(!widget->window)continue;
-            if(model.type==L"note")widget->edit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",model.text.c_str(),WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL,10,34,100,100,widget->window,reinterpret_cast<HMENU>(1),g_instance,nullptr);
-            if(widget->edit)SendMessageW(widget->edit,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),TRUE);
-            if(widget->edit)MoveWindow(widget->edit,8,34,max(1L,model.rect.right-model.rect.left-16),max(1L,model.rect.bottom-model.rect.top-42),TRUE);
-            SetWindowPos(widget->window,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-            ShowWindow(widget->window,SurfacePresentationAllowed()?SW_SHOWNOACTIVATE:SW_HIDE);
+            widget->edit=CreateWindowExW(0,L"EDIT",model.text.c_str(),
+                WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL,0,0,1,1,
+                widget->window,reinterpret_cast<HMENU>(1),g_instance,nullptr);
+            if(!widget->edit) {
+                DestroyWindow(widget->window);
+                continue;
+            }
+            SetWindowSubclass(widget->edit,NoteEditProc,1,reinterpret_cast<DWORD_PTR>(widget.get()));
+            SendMessageW(widget->edit,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),TRUE);
+            constexpr const wchar_t* labels[]={L"便签颜色",L"锁定便签",L"关闭便签"};
+            for(int i=0;i<3;++i) {
+                widget->buttons[i]=CreateWindowW(L"BUTTON",labels[i],WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+                    0,0,1,1,widget->window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kNoteColor+i)),g_instance,nullptr);
+            }
+            LayoutNoteControls(widget->window,*widget);
+            RefreshNoteControls(widget->window,*widget,model);
             g_widgets.push_back(std::move(widget));
-        } else {POINT p=ParentPoint({model.rect.left,model.rect.top});SetWindowPos((*found)->window,nullptr,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,SWP_NOACTIVATE|SWP_NOZORDER);ShowWindow((*found)->window,SurfacePresentationAllowed()?SW_SHOWNOACTIVATE:SW_HIDE);}
+        } else {
+            auto& widget=**found;
+            if(widget.edit&&NoteText(widget.edit)!=model.text) {
+                KillTimer(widget.window,1);
+                widget.pendingSave=false;
+                widget.syncingText=true;
+                SetWindowTextW(widget.edit,model.text.c_str());
+                widget.syncingText=false;
+            }
+            const POINT p=NoteScreenOrigin(model.rect);
+            SetWindowPos(widget.window,nullptr,p.x,p.y,model.rect.right-model.rect.left,model.rect.bottom-model.rect.top,
+                SWP_NOACTIVATE|SWP_NOZORDER);
+            RefreshNoteControls(widget.window,widget,model);
+        }
     }
+    UpdateSurfaceVisibility();
 }
 RECT ConstrainBoxToWorkArea(RECT rect,RECT work,int headerHeight) {
     const LONG width=rect.right-rect.left,height=rect.bottom-rect.top;
@@ -568,16 +579,37 @@ void PaintAll() {
 // display-friendly cadence; mouse-up always flushes immediately.
 constexpr UINT_PTR kInteractivePaintTimer=2;
 constexpr UINT_PTR kShellRefreshTimer=3;
+constexpr UINT_PTR kLayoutSaveTimer=5;
+bool g_layoutSavePending=false;
+bool g_forceShellRepaint=false;
+
+void FinishQueuedLayoutSave(bool save) {
+    if(!g_layoutSavePending)return;
+    g_layoutSavePending=false;
+    if(g_manager)KillTimer(g_manager,kLayoutSaveTimer);
+    if(save&&g_layout&&!SaveLayout(*g_layout))db::LogF("[canvas] could not save desktop layout");
+}
+void QueueLayoutSave() {
+    g_layoutSavePending=true;
+    if(!g_manager||!SetTimer(g_manager,kLayoutSaveTimer,120,nullptr))FinishQueuedLayoutSave(true);
+}
 void QueueInteractivePaint() {
     if(!g_manager||g_interactivePaintQueued)return;
     g_interactivePaintQueued=true;SetTimer(g_manager,kInteractivePaintTimer,16,nullptr);
 }
-bool SnapshotVisualsChanged(const DesktopSnapshot& before,const DesktopSnapshot& after) {
-    if(before.entries.size()!=after.entries.size() || before.iconSize!=after.iconSize ||
-       before.spacing.x!=after.spacing.x || before.spacing.y!=after.spacing.y ||
-       before.iconMode!=after.iconMode)return true;
-    for(const auto& entry:after.entries)if(!FindEntry(before,entry.path))return true;
-    return false;
+enum class DesktopVisualChange {None,Geometry,Items};
+DesktopVisualChange CompareDesktopVisuals(const DesktopSnapshot& before,const DesktopSnapshot& after) {
+    if(!before.readable||before.listview!=after.listview||before.process!=after.process||
+       before.entries.size()!=after.entries.size())return DesktopVisualChange::Items;
+    bool geometryChanged=before.iconSize!=after.iconSize||before.iconMode!=after.iconMode||
+        before.spacing.x!=after.spacing.x||before.spacing.y!=after.spacing.y;
+    for(size_t i=0;i<after.entries.size();++i) {
+        const auto& old=before.entries[i];
+        const auto& entry=after.entries[i];
+        if(old.path!=entry.path||old.displayName!=entry.displayName)return DesktopVisualChange::Items;
+        geometryChanged|=old.position.x!=entry.position.x||old.position.y!=entry.position.y;
+    }
+    return geometryChanged?DesktopVisualChange::Geometry:DesktopVisualChange::None;
 }
 void FlushInteractivePaint() {
     if(g_interactivePaintQueued&&g_manager)KillTimer(g_manager,kInteractivePaintTimer);
@@ -824,11 +856,12 @@ bool RenderIconInCurrentPass(const VisualIcon& icon) {
     for(const auto& box:g_layout->boxes)if(HasPath(box,icon.path)){owner=GroupRoot(box)->id;break;}
     return g_renderOnlyGroup.empty()?owner!=g_previewGroup:owner==g_renderOnlyGroup;
 }
-void DrawVisualIcons(Gdiplus::Graphics& g) {
+void DrawVisualIcons(Gdiplus::Graphics& g,bool iconPreview) {
     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
     g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
     Gdiplus::FontFamily family(CanvasFontFamily());
     for(auto& item:g_visualIcons) {
+        if((iconPreview||g_iconDragPreview)&&g_iconPreviewPaths.contains(item.path)!=iconPreview)continue;
         if(!RenderIconInCurrentPass(item))continue;
         const auto state=g.Save();
         if(item.list)g.SetClip(Gdiplus::Rect(item.clip.left,item.clip.top,item.clip.right-item.clip.left,item.clip.bottom-item.clip.top));
@@ -837,24 +870,60 @@ void DrawVisualIcons(Gdiplus::Graphics& g) {
         Gdiplus::StringFormat format;format.SetAlignment(item.list?Gdiplus::StringAlignmentNear:Gdiplus::StringAlignmentCenter);format.SetLineAlignment(item.list?Gdiplus::StringAlignmentCenter:Gdiplus::StringAlignmentNear);format.SetTrimming(Gdiplus::StringTrimmingEllipsisWord);if(item.list)format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);else format.SetFormatFlags(Gdiplus::StringFormatFlagsLineLimit);
         Gdiplus::SolidBrush text(Gdiplus::Color(255,255,255,255)),shadow(Gdiplus::Color(190,0,0,0));Gdiplus::Font font(&family,item.list?Gdiplus::REAL(12):Gdiplus::REAL(12),Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);Gdiplus::RectF label(static_cast<float>(item.label.left),static_cast<float>(item.label.top),static_cast<float>(max(1L,item.label.right-item.label.left)),static_cast<float>(max(1L,item.label.bottom-item.label.top))),offset=label;offset.X+=1.0f;offset.Y+=1.0f;g.DrawString(item.name.c_str(),-1,&font,offset,&format,&shadow);g.DrawString(item.name.c_str(),-1,&font,label,&format,&text);g.Restore(state);
     }
-    // A selected icon reveals its complete file name without permanently
-    // widening the grid. This mirrors the desktop's focus-only title affordance.
-    if(g_focusIcon>=0&&g_focusIcon<static_cast<int>(g_visualIcons.size())) {
-        const auto& item=g_visualIcons[g_focusIcon];
-        if(item.selected&&!item.list&&RenderIconInCurrentPass(item)) {
-            const int dpi=static_cast<int>(g_host.listview?GetDpiForWindow(g_host.listview):96);
-            Gdiplus::Font font(&family,static_cast<Gdiplus::REAL>(MulDiv(12,dpi,96)),Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);
-            Gdiplus::StringFormat format;format.SetAlignment(Gdiplus::StringAlignmentCenter);format.SetLineAlignment(Gdiplus::StringAlignmentNear);
-            const float width=static_cast<float>(min(440L,max(160L,g_snapshot.spacing.x*3L)));
-            Gdiplus::RectF measure(0,0,width-16.0f,2000.0f),used{};g.MeasureString(item.name.c_str(),-1,&font,measure,&format,&used);
-            const float height=max(static_cast<float>(MulDiv(28,dpi,96)),used.Height+10.0f);
-            const float x=max(4.0f,min(static_cast<float>(GetSystemMetrics(SM_CXVIRTUALSCREEN))-width-4.0f,static_cast<float>(item.position.x+item.size/2)-width/2.0f));
-            const float y=static_cast<float>(item.label.top);
-            Gdiplus::SolidBrush background(Gdiplus::Color(238,55,133,190));g.FillRectangle(&background,x,y,width,height);
-            Gdiplus::SolidBrush text(Gdiplus::Color(255,255,255,255));Gdiplus::RectF title(x+8.0f,y+5.0f,width-16.0f,height-10.0f);g.DrawString(item.name.c_str(),-1,&font,title,&format,&text);
+    if(!iconPreview&&g_marquee&&g_marqueeMoved){Gdiplus::SolidBrush fill(Gdiplus::Color(45,80,160,230));Gdiplus::Pen edge(Gdiplus::Color(190,130,190,255),1.0f);Gdiplus::RectF r(static_cast<float>(g_marqueeRect.left),static_cast<float>(g_marqueeRect.top),static_cast<float>(g_marqueeRect.right-g_marqueeRect.left),static_cast<float>(g_marqueeRect.bottom-g_marqueeRect.top));g.FillRectangle(&fill,r);g.DrawRectangle(&edge,r);}
+}
+HWND CreateDragPreviewWindow(const RECT& bounds,PaintBuffer& buffer) {
+    WNDCLASSW wc{};
+    wc.hInstance=g_instance;
+    wc.lpfnWndProc=DefWindowProcW;
+    wc.lpszClassName=L"nestlone-D.DragPreview";
+    RegisterClassW(&wc);
+    const POINT top=ParentPoint({bounds.left,bounds.top});
+    SIZE size{bounds.right-bounds.left,bounds.bottom-bounds.top};
+    HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
+        wc.lpszClassName,L"",SurfaceWindowStyle(),top.x,top.y,size.cx,size.cy,SurfaceParent(),nullptr,g_instance,nullptr);
+    if(!preview)return nullptr;
+    POINT source{};
+    BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+    if(UpdateLayeredWindow(preview,nullptr,nullptr,&size,buffer.dc,&source,0,&blend,ULW_ALPHA))return preview;
+    DestroyWindow(preview);
+    return nullptr;
+}
+void EndIconDragPreview() {
+    HWND preview=g_iconDragPreview;
+    g_iconDragPreview=nullptr;
+    g_iconPreviewPaths.clear();
+    if(preview)DestroyWindow(preview);
+}
+void BeginIconDragPreview() {
+    for(const auto& start:g_iconDragStart)g_iconPreviewPaths.insert(start.first);
+    RECT bounds{};
+    for(const auto& item:g_visualIcons) {
+        if(!g_iconPreviewPaths.contains(item.path))continue;
+        RECT visible=item.hit;
+        if(item.list&&!IntersectRect(&visible,&item.hit,&item.clip))continue;
+        UnionRect(&bounds,&bounds,&visible);
+    }
+    if(!IsRectEmpty(&bounds)) {
+        InflateRect(&bounds,2,2);
+        const int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
+        PaintBuffer buffer;
+        if(buffer.Ensure(width,height)) {
+            Gdiplus::Bitmap surface(width,height,width*4,PixelFormat32bppPARGB,static_cast<BYTE*>(buffer.pixels));
+            Gdiplus::Graphics graphics(&surface);
+            graphics.Clear(Gdiplus::Color(0,0,0,0));
+            graphics.TranslateTransform(static_cast<float>(-bounds.left),static_cast<float>(-bounds.top));
+            DrawVisualIcons(graphics,true);
+            graphics.Flush();
+            g_iconDragPreview=CreateDragPreviewWindow(bounds,buffer);
         }
     }
-    if(g_marquee&&g_marqueeMoved){Gdiplus::SolidBrush fill(Gdiplus::Color(45,80,160,230));Gdiplus::Pen edge(Gdiplus::Color(190,130,190,255),1.0f);Gdiplus::RectF r(static_cast<float>(g_marqueeRect.left),static_cast<float>(g_marqueeRect.top),static_cast<float>(g_marqueeRect.right-g_marqueeRect.left),static_cast<float>(g_marqueeRect.bottom-g_marqueeRect.top));g.FillRectangle(&fill,r);g.DrawRectangle(&edge,r);}
+    if(g_iconDragPreview) {
+        g_iconPreviewOrigin=ParentPoint({bounds.left,bounds.top});
+        PaintWindow(g_background);
+    } else {
+        g_iconPreviewPaths.clear();
+    }
 }
 void EndDragPreview() {
     HWND preview=g_dragPreview;g_dragPreview=nullptr;g_previewGroup.clear();g_renderOnlyGroup.clear();
@@ -865,7 +934,7 @@ bool BeginDragPreview(Box& box) {
     if(!g_nativeHidden||g_resizing)return false;
     // Multiple separately selected groups continue to use the normal path.
     for(const auto& start:g_boxDragStart)if(auto* member=FindBox(start.first))if(GroupRoot(*member)!=&box)return false;
-    PaintAll();
+    if(g_visualDirty||g_visualGeometryDirty)PaintAll();
     RECT bounds=DisplayRect(box);const int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
     PaintBuffer buffer;if(width<=0||height<=0||!buffer.Ensure(width,height))return false;
     {
@@ -876,12 +945,8 @@ bool BeginDragPreview(Box& box) {
         Rounded(graphics,bounds,Background(box.color,g_layout->opacity),CornerDiameter(*g_layout));
         g_renderOnlyGroup=box.id;DrawVisualIcons(graphics);g_renderOnlyGroup.clear();graphics.Flush();
     }
-    WNDCLASSW wc{};wc.hInstance=g_instance;wc.lpfnWndProc=DefWindowProcW;wc.lpszClassName=L"nestlone-D.DragPreview";RegisterClassW(&wc);
-    POINT top=ParentPoint({bounds.left,bounds.top});
-    HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,wc.lpszClassName,L"",SurfaceWindowStyle(),top.x,top.y,width,height,SurfaceParent(),nullptr,g_instance,nullptr);
+    HWND preview=CreateDragPreviewWindow(bounds,buffer);
     if(!preview)return false;
-    POINT source{};SIZE size{width,height};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
-    if(!UpdateLayeredWindow(preview,nullptr,nullptr,&size,buffer.dc,&source,0,&blend,ULW_ALPHA)){DestroyWindow(preview);return false;}
     g_dragPreview=preview;g_previewGroup=box.id;
     // Remove only the moving group's pixels from the static desktop once.
     PaintWindow(g_background);
@@ -889,15 +954,28 @@ bool BeginDragPreview(Box& box) {
     return true;
 }
 void MoveDragPreview(Box& box) {
-    POINT p=ParentPoint({box.rect.left,box.rect.top});
-    SetWindowPos(g_dragPreview,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
-    for(auto& d:g_decorations)if(d->id==box.id){
-        SetWindowPos(d->header,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
-        p=ParentPoint({box.rect.right-18,box.rect.bottom-18});
-        SetWindowPos(d->grip,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
-        p=ParentPoint({box.rect.left,box.rect.bottom-18});
-        SetWindowPos(d->gripLeft,SurfaceControlInsertAfter(),p.x,p.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+    const POINT top=ParentPoint({box.rect.left,box.rect.top});
+    const POINT right=ParentPoint({box.rect.right-18,box.rect.bottom-18});
+    const POINT left=ParentPoint({box.rect.left,box.rect.bottom-18});
+    const auto decoration=std::find_if(g_decorations.begin(),g_decorations.end(),
+        [&](const auto& item){return item->id==box.id;});
+    constexpr UINT flags=SWP_NOSIZE|SWP_NOACTIVATE;
+    if(decoration!=g_decorations.end()) {
+        const auto& d=**decoration;
+        // Present the cached body and its controls as one position update.
+        HDWP batch=BeginDeferWindowPos(4);
+        if(batch)batch=DeferWindowPos(batch,g_dragPreview,HWND_TOP,top.x,top.y,0,0,flags);
+        if(batch)batch=DeferWindowPos(batch,d.header,HWND_TOP,top.x,top.y,0,0,flags);
+        if(batch)batch=DeferWindowPos(batch,d.grip,HWND_TOP,right.x,right.y,0,0,flags);
+        if(batch)batch=DeferWindowPos(batch,d.gripLeft,HWND_TOP,left.x,left.y,0,0,flags);
+        if(batch&&EndDeferWindowPos(batch))return;
+        SetWindowPos(g_dragPreview,HWND_TOP,top.x,top.y,0,0,flags);
+        SetWindowPos(d.header,HWND_TOP,top.x,top.y,0,0,flags);
+        SetWindowPos(d.grip,HWND_TOP,right.x,right.y,0,0,flags);
+        SetWindowPos(d.gripLeft,HWND_TOP,left.x,left.y,0,0,flags);
+        return;
     }
+    SetWindowPos(g_dragPreview,HWND_TOP,top.x,top.y,0,0,flags);
 }
 void Arrange(Box& box,const DesktopSnapshot& snapshot=g_snapshot) {
     if(!snapshot.readable || box.collapsed)return;
@@ -942,28 +1020,85 @@ void Observe(const DesktopSnapshot& before,const DesktopSnapshot& after) {
 void PlaceNewDesktopEntries(const DesktopSnapshot& before,const DesktopSnapshot& after) {
     if(!g_layout||!before.readable||before.listview!=after.listview)return;
     std::vector<std::pair<std::wstring,POINT>> added;
-    for(const auto& entry:after.entries)if(!FindEntry(before,entry.path))added.push_back({entry.path,entry.position});
-    if(added.empty())return;
+    bool organized=false;
+    for(const auto& entry:after.entries) {
+        if(FindEntry(before,entry.path))continue;
+        auto& boxes=g_layout->boxes;
+        if(std::any_of(boxes.begin(),boxes.end(),[&](const Box& box){return HasPath(box,entry.path);}))continue;
+        int target=-1;
+        if(g_layout->autoOrganize&&!g_layout->autoRules.empty()) {
+            const DWORD attributes=GetFileAttributesW(entry.path.c_str());
+            if(attributes!=INVALID_FILE_ATTRIBUTES) {
+                const bool directory=(attributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+                const auto extension=std::filesystem::path(entry.path).extension().wstring();
+                for(const auto& rule:g_layout->autoRules) {
+                    if(!MatchesAutoRule(rule,directory,extension))continue;
+                    const auto box=std::find_if(boxes.begin(),boxes.end(),[&](const Box& item){return item.id==rule.boxId;});
+                    if(box!=boxes.end()){target=static_cast<int>(box-boxes.begin());break;}
+                }
+            }
+        }
+        if(target>=0)organized|=AssignDesktopItem(*g_layout,entry.path,target,entry.position);
+        else added.push_back({entry.path,entry.position});
+    }
+    if(added.empty()&&!organized)return;
     // Explorer can place a just-created item at a coordinate occupied by our
     // presentation layer.  Retain its intended vicinity, but resolve it to a
     // vacant desktop grid cell before the next paint.
     const auto placed=SnapDesktopDrop(added);
     for(const auto& item:placed)AssignDesktopItem(*g_layout,item.first,-1,item.second);
     std::vector<DesktopMove> moves;for(const auto& item:placed)moves.push_back({item.first,item.second});
-    QueueMoves(moves);SaveLayout(*g_layout);
+    if(!moves.empty())QueueMoves(moves);
+    QueueLayoutSave();
+}
+void ApplyDesktopSnapshot(DesktopSnapshot&& next,bool forceRepaint=false) {
+    const auto change=CompareDesktopVisuals(g_snapshot,next);
+    if(change==DesktopVisualChange::Items) {
+        PlaceNewDesktopEntries(g_snapshot,next);
+        g_iconCache.clear();
+    }
+    ReconcilePendingShellDrops(next);
+    g_snapshot=std::move(next);
+    if(g_nativeHidden&&(forceRepaint||g_visualDirty||change!=DesktopVisualChange::None)) {
+        g_visualDirty=true;
+        PaintAll();
+    }
+}
+constexpr UINT kFinishRenameMessage=WM_APP+10;
+void RequestFinishRename(HWND edit) {
+    PostMessageW(g_manager,kFinishRenameMessage,0,reinterpret_cast<LPARAM>(edit));
+}
+LRESULT CALLBACK RenameMouseProc(int code,WPARAM message,LPARAM data) {
+    // The desktop canvas uses MA_NOACTIVATE, so clicking it can leave the
+    // editor focused. Observe outside presses without consuming them.
+    if(code==HC_ACTION&&g_edit&&(message==WM_LBUTTONDOWN||message==WM_RBUTTONDOWN||
+        message==WM_MBUTTONDOWN||message==WM_XBUTTONDOWN)) {
+        const auto* mouse=reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
+        const HWND clicked=WindowFromPoint(mouse->pt);
+        if(clicked!=g_edit&&!IsChild(g_edit,clicked))RequestFinishRename(g_edit);
+    }
+    return CallNextHookEx(nullptr,code,message,data);
 }
 void FinishRename(bool save) {
     HWND edit=g_edit;if(!edit)return;g_edit=nullptr;
-    wchar_t value[81]{};GetWindowTextW(edit,value,81);
-    std::wstring text=value;auto first=text.find_first_not_of(L" \t\r\n");
-    if(save&&first!=std::wstring::npos) {
+    if(g_renameMouseHook) {
+        UnhookWindowsHookEx(g_renameMouseHook);
+        g_renameMouseHook=nullptr;
+    }
+    const bool modified=SendMessageW(edit,EM_GETMODIFY,0,0)!=0;
+    std::wstring text(static_cast<size_t>(GetWindowTextLengthW(edit))+1,L'\0');
+    text.resize(GetWindowTextW(edit,text.data(),static_cast<int>(text.size())));
+    ShowWindow(edit,SW_HIDE);
+    const auto first=text.find_first_not_of(L" \t\r\n");
+    if(save&&modified&&first!=std::wstring::npos) {
         const std::wstring trimmed=text.substr(first,text.find_last_not_of(L" \t\r\n")-first+1);
         if(!g_editItemPath.empty()) {
+            const std::wstring newName=trimmed+g_editHiddenExtension;
             ComPtr<IShellItem> item;ComPtr<IFileOperation> operation;
             const HRESULT itemResult=SHCreateItemFromParsingName(g_editItemPath.c_str(),nullptr,IID_PPV_ARGS(&item));
             const HRESULT operationResult=SUCCEEDED(itemResult)?CoCreateInstance(CLSID_FileOperation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&operation)):itemResult;
             if(SUCCEEDED(operationResult) && SUCCEEDED(operation->SetOperationFlags(FOF_NOCONFIRMATION)) &&
-               SUCCEEDED(operation->RenameItem(item.Get(),trimmed.c_str(),nullptr)) && SUCCEEDED(operation->PerformOperations())) {
+               SUCCEEDED(operation->RenameItem(item.Get(),newName.c_str(),nullptr)) && SUCCEEDED(operation->PerformOperations())) {
                 g_shellRefreshAttempts=10;SetTimer(g_manager,kShellRefreshTimer,120,nullptr);
             } else g_status=L"无法重命名该桌面项目";
         } else if(auto* box=FindBox(g_editId)) {
@@ -971,13 +1106,22 @@ void FinishRename(bool save) {
             SaveLayout(*g_layout);
         }
     }
-    DestroyWindow(edit);g_editId.clear();g_editItemPath.clear();g_editGroupTitle=false;PaintAll();
+    DestroyWindow(edit);g_editId.clear();g_editItemPath.clear();g_editHiddenExtension.clear();g_editGroupTitle=false;PaintAll();
 }
 LRESULT CALLBACK EditProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
     if(msg==WM_KEYDOWN&&(wp==VK_RETURN||wp==VK_ESCAPE)){FinishRename(wp==VK_RETURN);return 0;}
-    if(msg==WM_KILLFOCUS){PostMessageW(g_manager,WM_APP+10,0,0);return 0;}
+    if(msg==WM_KILLFOCUS){RequestFinishRename(hwnd);return 0;}
     if(msg==WM_NCDESTROY)RemoveWindowSubclass(hwnd,EditProc,1);
     return DefSubclassProc(hwnd,msg,wp,lp);
+}
+void ShowRenameEditor(int selectionEnd) {
+    SetWindowSubclass(g_edit,EditProc,1,0);
+    SendMessageW(g_edit,EM_SETMODIFY,FALSE,0);
+    g_renameMouseHook=SetWindowsHookExW(WH_MOUSE_LL,RenameMouseProc,g_instance,0);
+    ShowWindow(g_edit,SW_SHOW);
+    SetForegroundWindow(g_edit);
+    SetFocus(g_edit);
+    SendMessageW(g_edit,EM_SETSEL,0,selectionEnd);
 }
 void BeginRename(Box& box,bool groupTitle=false) {
     FinishRename(true);g_editId=box.id;g_editGroupTitle=groupTitle;
@@ -990,26 +1134,45 @@ void BeginRename(Box& box,bool groupTitle=false) {
     if(g_editFont)DeleteObject(g_editFont);
     g_editFont=CreateFontW(-HeaderHeight()*2/5,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
     SendMessageW(g_edit,WM_SETFONT,reinterpret_cast<WPARAM>(g_editFont),TRUE);SendMessageW(g_edit,EM_SETLIMITTEXT,80,0);
-    SetWindowSubclass(g_edit,EditProc,1,0);ShowWindow(g_edit,SW_SHOW);SetForegroundWindow(g_edit);SetFocus(g_edit);SendMessageW(g_edit,EM_SETSEL,0,-1);
+    ShowRenameEditor(-1);
 }
-void BeginItemRename(const std::wstring& path) {
+void BeginItemRename(const std::wstring& requestedPath) {
+    const std::wstring path=requestedPath;
+    FinishRename(true);
     auto found=std::find_if(g_visualIcons.begin(),g_visualIcons.end(),[&](const auto& icon){return _wcsicmp(icon.path.c_str(),path.c_str())==0;});
     if(found==g_visualIcons.end())return;
-    FinishRename(true);g_editItemPath=path;
-    RECT label=found->label;const LONG width=max(120L,label.right-label.left);
-    POINT top{label.left+(label.right-label.left-width)/2,label.top};
+    RECT label=found->label;
+    if(found->list&&!IntersectRect(&label,&found->label,&found->clip))return;
+    if(IsRectEmpty(&label))return;
+    POINT top{label.left,label.top};
     top.x+=GetSystemMetrics(SM_XVIRTUALSCREEN);top.y+=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    g_edit=CreateWindowExW(WS_EX_TOOLWINDOW,L"EDIT",found->name.c_str(),WS_POPUP|ES_CENTER|ES_AUTOHSCROLL,
-        top.x,top.y,width,max(22L,label.bottom-label.top),nullptr,nullptr,g_instance,nullptr);
-    if(!g_edit){g_editItemPath.clear();return;}
+    const DWORD alignment=found->list?ES_LEFT:ES_CENTER;
+    g_edit=CreateWindowExW(WS_EX_TOOLWINDOW,L"EDIT",found->name.c_str(),WS_POPUP|alignment|ES_AUTOHSCROLL,
+        top.x,top.y,label.right-label.left,label.bottom-label.top,nullptr,nullptr,g_instance,nullptr);
+    if(!g_edit)return;
+    g_editItemPath=path;
+    int selectEnd=-1;
+    const DWORD attributes=GetFileAttributesW(path.c_str());
+    if(attributes!=INVALID_FILE_ATTRIBUTES&&!(attributes&FILE_ATTRIBUTE_DIRECTORY)) {
+        const auto filename=std::filesystem::path(path).filename();
+        const auto extension=filename.extension().wstring();
+        if(!extension.empty()&&filename.stem().wstring()==found->name) {
+            // Explorer's display name can omit extensions, including .lnk.
+            g_editHiddenExtension=extension;
+        } else if(!extension.empty()&&filename.wstring()==found->name) {
+            selectEnd=static_cast<int>(found->name.size()-extension.size());
+        }
+    }
     if(g_editFont)DeleteObject(g_editFont);
     g_editFont=CreateFontW(-max(12,HeaderHeight()*2/5),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,CanvasFontFamily());
     SendMessageW(g_edit,WM_SETFONT,reinterpret_cast<WPARAM>(g_editFont),TRUE);SendMessageW(g_edit,EM_SETLIMITTEXT,260,0);
-    SetWindowSubclass(g_edit,EditProc,1,0);ShowWindow(g_edit,SW_SHOW);SetForegroundWindow(g_edit);SetFocus(g_edit);
-    const auto dot=found->name.find_last_of(L'.');const int selectEnd=(dot!=std::wstring::npos&&dot!=0)?static_cast<int>(dot):-1;SendMessageW(g_edit,EM_SETSEL,0,selectEnd);
+    ShowRenameEditor(selectEnd);
 }
 void DestroyDecorations() {
     EndDragPreview();
+    EndIconDragPreview();
+    g_iconDrag=-1;g_iconMoved=false;g_iconDragStart.clear();
+    g_marquee=false;g_marqueeMoved=false;g_selectionStart.clear();
     FinishRename(false);
     for(auto& widget:g_widgets){if(IsWindow(widget->window))DestroyWindow(widget->window);g_paintBuffers.erase(widget->window);}
     g_widgets.clear();
@@ -1018,62 +1181,274 @@ void DestroyDecorations() {
     ReleaseVisualIcons();if(IsWindow(g_hiddenListview))ReleaseHiddenDesktopListView(g_hiddenListview);g_hiddenListview=nullptr;g_nativeHidden=false;
 }
 LRESULT CALLBACK DecorationProc(HWND,UINT,WPARAM,LPARAM);
-void DrawWidgetLockGlyph(HDC dc,const RECT& bounds,bool locked,COLORREF background) {
-    const int x=bounds.left+(bounds.right-bounds.left-22)/2,y=bounds.top+3;
-    HPEN pen=CreatePen(PS_SOLID,2,RGB(25,49,60));HGDIOBJ oldPen=SelectObject(dc,pen);HGDIOBJ oldBrush=SelectObject(dc,GetStockObject(HOLLOW_BRUSH));
-    RoundRect(dc,x+4,y,x+18,y+16,8,8);
-    HBRUSH clear=CreateSolidBrush(background);RECT lower{x+3,y+11,x+19,y+17};FillRect(dc,&lower,clear);DeleteObject(clear);
-    if(!locked){HBRUSH gap=CreateSolidBrush(background);RECT open{x+13,y-1,x+21,y+11};FillRect(dc,&open,gap);DeleteObject(gap);}
-    HBRUSH body=CreateSolidBrush(RGB(25,49,60));SelectObject(dc,body);RoundRect(dc,x+1,y+12,x+21,y+27,3,3);SelectObject(dc,oldBrush);DeleteObject(body);SelectObject(dc,oldPen);DeleteObject(pen);
+void FillNoteRect(HDC dc,const RECT& rect,COLORREF color) {
+    SetDCBrushColor(dc,color);
+    FillRect(dc,&rect,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
-void DrawWeatherIcon(HDC dc,const RECT& bounds,const std::wstring& code) {
-    const wchar_t glyph=WeatherGlyph(code);
-    if(glyph&&g_weatherIconFamily){Gdiplus::Graphics graphics(dc);graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);Gdiplus::Font font(g_weatherIconFamily.get(),48,Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);Gdiplus::SolidBrush ink(Gdiplus::Color(255,28,105,137));Gdiplus::RectF target(static_cast<Gdiplus::REAL>(bounds.left),static_cast<Gdiplus::REAL>(bounds.top),static_cast<Gdiplus::REAL>(bounds.right-bounds.left),static_cast<Gdiplus::REAL>(bounds.bottom-bounds.top));graphics.DrawString(&glyph,1,&font,target,nullptr,&ink);return;}
-    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(28,105,137));DrawTextW(dc,L"☁",-1,const_cast<RECT*>(&bounds),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+COLORREF NoteInk(COLORREF color) {
+    return GetRValue(color)*299+GetGValue(color)*587+GetBValue(color)*114>=145000?note::ink:note::paper;
 }
-bool PaintWeatherWidget(HWND hwnd,const Layout::Widget& widget) {
-    RECT r{};if(!GetClientRect(hwnd,&r)||r.right<=0||r.bottom<=0)return false;
-    auto& stored=g_paintBuffers[hwnd];if(!stored)stored=std::make_unique<PaintBuffer>();auto& buffer=*stored;if(!buffer.Ensure(r.right,r.bottom))return false;
-    Gdiplus::Bitmap surface(r.right,r.bottom,r.right*4,PixelFormat32bppPARGB,static_cast<BYTE*>(buffer.pixels));Gdiplus::Graphics graphics(&surface);graphics.Clear(Gdiplus::Color(0,0,0,0));graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);Rounded(graphics,r,Gdiplus::Color(255,215,241,248),16);Rounded(graphics,{0,0,r.right,31},Gdiplus::Color(255,157,216,231),16);
-    Gdiplus::FontFamily family(CanvasFontFamily());Gdiplus::Font title(&family,13,Gdiplus::FontStyleBold,Gdiplus::UnitPixel),body(&family,14,Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);Gdiplus::SolidBrush ink(Gdiplus::Color(255,25,49,60));Gdiplus::StringFormat centered;centered.SetAlignment(Gdiplus::StringAlignmentCenter);centered.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    const std::wstring heading=L"天气 · "+widget.weatherLocation;graphics.DrawString(heading.c_str(),-1,&title,Gdiplus::RectF(8,0,static_cast<Gdiplus::REAL>(r.right-44),31),&centered,&ink);const std::wstring value=(widget.weatherValid?std::to_wstring(widget.temperature)+L"°C":L"--")+L"  "+widget.weather;graphics.DrawString(value.c_str(),-1,&body,Gdiplus::RectF(72,47,static_cast<Gdiplus::REAL>(max(1L,r.right-84)),40),&centered,&ink);graphics.Flush();
-    // Keep all pixels in the same PARGB graphics surface. GDI writes into this
-    // DIB can zero alpha and make lock/icon pixels invisible to hit testing.
-    const wchar_t glyph=WeatherGlyph(widget.weatherIcon);
-    if(glyph&&g_weatherIconFamily){Gdiplus::Font iconFont(g_weatherIconFamily.get(),48,Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);graphics.DrawString(&glyph,1,&iconFont,Gdiplus::RectF(12,42,56,58),&centered,&ink);}
-    const float x=static_cast<float>(r.right-26);
-    Gdiplus::Pen lockPen(Gdiplus::Color(255,25,49,60),2);
-    graphics.DrawArc(&lockPen,x+3,5.0f,10.0f,12.0f,180.0f,widget.locked?180.0f:130.0f);
-    graphics.DrawLine(&lockPen,x+3,11.0f,x+3,15.0f);
-    if(widget.locked)graphics.DrawLine(&lockPen,x+13,11.0f,x+13,15.0f);
-    Rounded(graphics,{r.right-26,14,r.right-10,26},Gdiplus::Color(255,25,49,60),4);
-    graphics.Flush(Gdiplus::FlushIntentionSync);
-    POINT source{};SIZE size{r.right,r.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};return UpdateLayeredWindow(hwnd,nullptr,nullptr,&size,buffer.dc,&source,0,&blend,ULW_ALPHA)!=FALSE;
+COLORREF NoteMix(COLORREF base,COLORREF ink,int percent) {
+    const auto mix=[percent](int a,int b){return (a*(100-percent)+b*percent)/100;};
+    return RGB(mix(GetRValue(base),GetRValue(ink)),mix(GetGValue(base),GetGValue(ink)),mix(GetBValue(base),GetBValue(ink)));
+}
+void PaintNote(HWND hwnd,HDC dc,const Layout::Widget& widget,const WidgetWindow& state) {
+    RECT client{};GetClientRect(hwnd,&client);
+    const COLORREF ink=NoteInk(widget.color),edge=NoteMix(widget.color,ink,17);
+    FillNoteRect(dc,client,widget.color);
+    RECT header=client;header.bottom=note::headerHeight;
+    FillNoteRect(dc,header,NoteMix(widget.color,ink,5));
+    FillNoteRect(dc,{0,header.bottom-1,client.right,header.bottom},edge);
+    SetDCBrushColor(dc,edge);
+    FrameRect(dc,&client,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+
+    SetBkMode(dc,TRANSPARENT);
+    SetTextColor(dc,ink);
+    const auto font=SelectObject(dc,GetStockObject(DEFAULT_GUI_FONT));
+    RECT title{note::padding,0,client.right-3*kNoteButtonWidth-kNoteButtonInset-6,note::headerHeight};
+    DrawTextW(dc,L"便签",-1,&title,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+    SelectObject(dc,font);
+    const auto scroll=ReadNoteScroll(state);
+    if(scroll.last)FillNoteRect(dc,scroll.thumb,NoteMix(widget.color,ink,state.scrollGrab>=0?48:27));
+}
+void DrawNoteButton(const DRAWITEMSTRUCT& draw,const Layout::Widget& widget) {
+    const HDC dc=draw.hDC;
+    const RECT r=draw.rcItem;
+    const auto ink=NoteInk(widget.color);
+    const bool pressed=(draw.itemState&ODS_SELECTED)!=0;
+    const bool disabled=(draw.itemState&ODS_DISABLED)!=0;
+    const bool locked=draw.CtlID==kNoteLock&&widget.locked;
+    FillNoteRect(dc,r,NoteMix(widget.color,ink,pressed?24:locked?16:5));
+    const int x=(r.left+r.right)/2,y=(r.top+r.bottom)/2;
+    const auto oldPen=SelectObject(dc,GetStockObject(DC_PEN));
+    const auto oldBrush=SelectObject(dc,GetStockObject(NULL_BRUSH));
+    SetDCPenColor(dc,disabled?NoteMix(widget.color,ink,35):ink);
+    if(draw.CtlID==kNoteClose) {
+        MoveToEx(dc,x-5,y-5,nullptr);LineTo(dc,x+6,y+6);
+        MoveToEx(dc,x-5,y+5,nullptr);LineTo(dc,x+6,y-6);
+    } else if(draw.CtlID==kNoteLock) {
+        RoundRect(dc,x-6,y-1,x+7,y+8,3,3);
+        Arc(dc,x-4,y-8,x+5,y+1,x+5,y-4,x-4,y-4);
+        MoveToEx(dc,x-4,y-4,nullptr);LineTo(dc,x-4,y-1);
+        if(locked){MoveToEx(dc,x+4,y-4,nullptr);LineTo(dc,x+4,y-1);}
+    } else {
+        RECT sample{x-6,y-6,x+7,y+7};
+        FillNoteRect(dc,sample,widget.color);
+        RoundRect(dc,sample.left,sample.top,sample.right,sample.bottom,4,4);
+    }
+    SelectObject(dc,oldBrush);SelectObject(dc,oldPen);
+    if(draw.itemState&ODS_FOCUS){RECT focus=r;InflateRect(&focus,-2,-2);DrawFocusRect(dc,&focus);}
+}
+LRESULT NoteResizeHit(const RECT& r,POINT point,bool locked) {
+    if(locked)return HTCLIENT;
+    constexpr LONG edge=6;
+    const bool left=point.x<r.left+edge,right=point.x>=r.right-edge;
+    if(point.y<r.top+edge)return left?HTTOPLEFT:right?HTTOPRIGHT:HTTOP;
+    if(point.y>=r.bottom-edge)return left?HTBOTTOMLEFT:right?HTBOTTOMRIGHT:HTBOTTOM;
+    return left?HTLEFT:right?HTRIGHT:HTCLIENT;
+}
+void PickNoteColor(HWND hwnd,const std::wstring& id,COLORREF color) {
+    static COLORREF recent[16]={RGB(255,255,255),RGB(255,249,213),RGB(248,231,233),RGB(227,242,232),RGB(226,237,250)};
+    CHOOSECOLORW picker{};
+    picker.lStructSize=sizeof(picker);
+    picker.hwndOwner=hwnd;
+    picker.rgbResult=color;
+    picker.lpCustColors=recent;
+    picker.Flags=CC_RGBINIT|CC_FULLOPEN;
+    if(!ChooseColorW(&picker))return;
+    auto* model=FindWidget(id);
+    auto* state=FindWidgetWindow(hwnd);
+    if(!model||!state||model->locked)return;
+    model->color=picker.rgbResult;
+    RefreshNoteControls(hwnd,*state,*model);
+    QueueLayoutSave();
 }
 LRESULT CALLBACK WidgetProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     auto* state=reinterpret_cast<WidgetWindow*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
-    if(message==WM_NCCREATE){auto* create=reinterpret_cast<CREATESTRUCTW*>(lp);state=static_cast<WidgetWindow*>(create->lpCreateParams);SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(state));}
+    if(message==WM_NCCREATE) {
+        auto* create=reinterpret_cast<CREATESTRUCTW*>(lp);
+        state=static_cast<WidgetWindow*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(state));
+    }
     Layout::Widget* widget=state?FindWidget(state->id):nullptr;
     if(!widget)return DefWindowProcW(hwnd,message,wp,lp);
     switch(message) {
-    case WM_NCHITTEST:return HTCLIENT;
-    case WM_MOUSEACTIVATE:return widget->type==L"weather"?MA_NOACTIVATE:MA_ACTIVATE;
+    case WM_NCCALCSIZE:
+    case WM_NCPAINT:return 0;
+    case WM_NCACTIVATE:return TRUE;
+    case WM_NCHITTEST: {
+        RECT bounds{};GetWindowRect(hwnd,&bounds);
+        return NoteResizeHit(bounds,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)},widget->locked);
+    }
+    case WM_GETMINMAXINFO: {
+        auto* info=reinterpret_cast<MINMAXINFO*>(lp);
+        info->ptMinTrackSize={160,100};
+        return 0;
+    }
+    case WM_ENTERSIZEMOVE:state->resizing=true;return 0;
+    case WM_EXITSIZEMOVE:
+        state->resizing=false;
+        if(!widget->locked&&GetWindowRect(hwnd,&widget->rect)) {
+            OffsetRect(&widget->rect,-GetSystemMetrics(SM_XVIRTUALSCREEN),-GetSystemMetrics(SM_YVIRTUALSCREEN));
+            QueueLayoutSave();
+        }
+        RedrawWindow(hwnd,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);
+        return 0;
+    case WM_MOUSEACTIVATE:return MA_ACTIVATE;
     case WM_ERASEBKGND:return 1;
-    case WM_PAINT:{PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);if(widget->type==L"weather"){EndPaint(hwnd,&ps);PaintWeatherWidget(hwnd,*widget);}else {RECT r{};GetClientRect(hwnd,&r);const COLORREF headerColor=RGB(246,220,122);HBRUSH body=CreateSolidBrush(RGB(255,247,190));FillRect(dc,&r,body);DeleteObject(body);HBRUSH header=CreateSolidBrush(headerColor);RECT top=r;top.bottom=30;FillRect(dc,&top,header);DeleteObject(header);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(25,49,60));HFONT old=static_cast<HFONT>(SelectObject(dc,GetStockObject(DEFAULT_GUI_FONT)));RECT title=top;title.right-=36;DrawTextW(dc,L"便签",-1,&title,DT_SINGLELINE|DT_VCENTER|DT_CENTER);RECT lock=top;lock.left=lock.right-34;DrawWidgetLockGlyph(dc,lock,widget->locked,headerColor);SelectObject(dc,old);EndPaint(hwnd,&ps);}return 0;}
-    case WM_SIZE:{const int width=max(1,LOWORD(lp)),height=max(1,HIWORD(lp));if(widget->type==L"weather")PaintWeatherWidget(hwnd,*widget);else {HRGN region=CreateRoundRectRgn(0,0,width+1,height+1,16,16);SetWindowRgn(hwnd,region,TRUE);if(state->edit)MoveWindow(state->edit,8,34,max(1,width-16),max(1,height-42),TRUE);}return 0;}
-    case WM_COMMAND:if(state->edit&&reinterpret_cast<HWND>(lp)==state->edit){if(HIWORD(wp)==EN_CHANGE){wchar_t text[4096]{};GetWindowTextW(state->edit,text,4096);widget->text=text;state->pendingSave=true;SetTimer(hwnd,1,450,nullptr);}else if(HIWORD(wp)==EN_KILLFOCUS&&state->pendingSave){KillTimer(hwnd,1);state->pendingSave=false;SaveLayout(*g_layout);}}return 0;
-    case WM_LBUTTONDOWN:if(GET_Y_LPARAM(lp)<30&&GET_X_LPARAM(lp)>=widget->rect.right-widget->rect.left-36){widget->locked=!widget->locked;SaveLayout(*g_layout);InvalidateRect(hwnd,nullptr,TRUE);return 0;}else if(GET_Y_LPARAM(lp)<30&&!widget->locked){SetWindowPos(hwnd,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);state->dragging=true;state->start=widget->rect;GetCursorPos(&state->mouse);SetCapture(hwnd);}return 0;
-    case WM_MOUSEMOVE:if(state->dragging&&GetCapture()==hwnd){POINT p{};GetCursorPos(&p);const LONG dx=p.x-state->mouse.x,dy=p.y-state->mouse.y;widget->rect=state->start;OffsetRect(&widget->rect,dx,dy);widget->rect=KeepBoxOnScreen(widget->rect,30);POINT top=ParentPoint({widget->rect.left,widget->rect.top});SetWindowPos(hwnd,nullptr,top.x,top.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER);return 0;}break;
-    case WM_LBUTTONUP:if(state->dragging){state->dragging=false;ReleaseCapture();SaveLayout(*g_layout);}return 0;
-    case WM_CAPTURECHANGED:if(state->dragging){state->dragging=false;SaveLayout(*g_layout);}return 0;
-    case WM_CANCELMODE:if(GetCapture()==hwnd)ReleaseCapture();return 0;
-    case WM_DESTROY:KillTimer(hwnd,1);if(state->pendingSave&&g_layout)SaveLayout(*g_layout);g_paintBuffers.erase(hwnd);return 0;
-    case WM_TIMER:if(wp==1&&state->pendingSave){KillTimer(hwnd,1);state->pendingSave=false;SaveLayout(*g_layout);}return 0;
-    case WM_LBUTTONDBLCLK:if(widget->type==L"weather")RefreshWeatherNow();return 0;
-    case WM_RBUTTONUP:{POINT point{};GetCursorPos(&point);HMENU menu=CreatePopupMenu();if(widget->type==L"weather")AppendMenuW(menu,MF_STRING,1,L"刷新天气");AppendMenuW(menu,MF_STRING|(widget->locked?MF_GRAYED:0),2,L"删除组件");const int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,hwnd,nullptr);DestroyMenu(menu);if(command==1)RefreshWeatherNow();if(command==2&&!widget->locked){auto id=widget->id;g_layout->widgets.erase(std::remove_if(g_layout->widgets.begin(),g_layout->widgets.end(),[&](const auto& item){return item.id==id;}),g_layout->widgets.end());SaveLayout(*g_layout);UpdateWeatherSchedule();PostMessageW(g_manager,WM_APP+11,0,0);}return 0;}
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        PaintNote(hwnd,BeginPaint(hwnd,&paint),*widget,*state);
+        EndPaint(hwnd,&paint);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT: {
+        const auto dc=reinterpret_cast<HDC>(wp);
+        SetTextColor(dc,NoteInk(widget->color));
+        SetBkColor(dc,widget->color);
+        SetDCBrushColor(dc,widget->color);
+        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+    }
+    case WM_SIZE: {
+        const int width=max(1,LOWORD(lp)),height=max(1,HIWORD(lp));
+        if(HRGN region=CreateRoundRectRgn(0,0,width+1,height+1,12,12))
+            if(!SetWindowRgn(hwnd,region,FALSE))DeleteObject(region);
+        LayoutNoteControls(hwnd,*state);
+        // Paint the exposed paper and the moved editor/buttons together.
+        RedrawWindow(hwnd,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        const auto& draw=*reinterpret_cast<const DRAWITEMSTRUCT*>(lp);
+        if(draw.CtlType!=ODT_BUTTON)return FALSE;
+        DrawNoteButton(draw,*widget);
+        return TRUE;
+    }
+    case WM_CLOSE:
+        widget->closed=true;
+        ShowWindow(hwnd,SW_HIDE);
+        QueueLayoutSave();
+        return 0;
+    case WM_COMMAND:
+        if(HIWORD(wp)==BN_CLICKED) {
+            switch(LOWORD(wp)) {
+            case kNoteClose:SendMessageW(hwnd,WM_CLOSE,0,0);return 0;
+            case kNoteLock:
+                widget->locked=!widget->locked;
+                RefreshNoteControls(hwnd,*state,*widget);
+                QueueLayoutSave();
+                return 0;
+            case kNoteColor:
+                if(!widget->locked)PickNoteColor(hwnd,std::wstring(widget->id),widget->color);
+                return 0;
+            }
+        }
+        if(state->edit&&reinterpret_cast<HWND>(lp)==state->edit&&!state->syncingText) {
+            if(HIWORD(wp)==EN_CHANGE) {
+                widget->text=NoteText(state->edit);
+                InvalidateNoteScroll(hwnd);
+                state->pendingSave=true;
+                SetTimer(hwnd,1,450,nullptr);
+            } else if(HIWORD(wp)==EN_KILLFOCUS&&state->pendingSave) {
+                KillTimer(hwnd,1);
+                state->pendingSave=false;
+                QueueLayoutSave();
+            }
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        ScrollNoteWheel(*state,wp);
+        return 0;
+    case WM_LBUTTONDOWN:
+        if(GET_Y_LPARAM(lp)>=note::headerHeight) {
+            const POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            const auto scroll=ReadNoteScroll(*state);
+            if(scroll.last&&PtInRect(&scroll.track,point)) {
+                if(point.y>=scroll.thumb.top&&point.y<scroll.thumb.bottom) {
+                    state->scrollGrab=point.y-scroll.thumb.top;
+                    SetCapture(hwnd);
+                    InvalidateNoteScroll(hwnd);
+                } else {
+                    ScrollNoteTo(*state,scroll,scroll.first+(point.y<scroll.thumb.top?-scroll.page:scroll.page));
+                }
+            }
+            return 0;
+        }
+        if(!widget->locked) {
+            SetWindowPos(hwnd,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            state->dragging=true;
+            state->start=widget->rect;
+            GetCursorPos(&state->mouse);
+            SetCapture(hwnd);
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if(state->scrollGrab>=0&&GetCapture()==hwnd) {
+            const auto scroll=ReadNoteScroll(*state);
+            const LONG travel=(scroll.track.bottom-scroll.track.top)-(scroll.thumb.bottom-scroll.thumb.top);
+            if(scroll.last&&travel>0) {
+                const LONG y=std::clamp(GET_Y_LPARAM(lp)-state->scrollGrab-scroll.track.top,0L,travel);
+                ScrollNoteTo(*state,scroll,MulDiv(y,scroll.last,travel));
+            }
+            return 0;
+        }
+        if(state->dragging&&GetCapture()==hwnd) {
+            POINT cursor{};GetCursorPos(&cursor);
+            widget->rect=state->start;
+            OffsetRect(&widget->rect,cursor.x-state->mouse.x,cursor.y-state->mouse.y);
+            widget->rect=KeepBoxOnScreen(widget->rect,note::headerHeight);
+            const POINT top=NoteScreenOrigin(widget->rect);
+            SetWindowPos(hwnd,nullptr,top.x,top.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        if(state->scrollGrab>=0) {
+            state->scrollGrab=-1;
+            if(message==WM_LBUTTONUP)ReleaseCapture();
+            InvalidateNoteScroll(hwnd);
+            return 0;
+        }
+        if(state->dragging) {
+            state->dragging=false;
+            if(message==WM_LBUTTONUP)ReleaseCapture();
+            QueueLayoutSave();
+        }
+        return 0;
+    case WM_CANCELMODE:
+        if(GetCapture()==hwnd)ReleaseCapture();
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd,1);
+        if(state->pendingSave&&g_layout)SaveLayout(*g_layout);
+        return 0;
+    case WM_TIMER:
+        if(wp==1&&state->pendingSave) {
+            KillTimer(hwnd,1);
+            state->pendingSave=false;
+            SaveLayout(*g_layout);
+        }
+        return 0;
+    case WM_RBUTTONUP: {
+        POINT cursor{};GetCursorPos(&cursor);
+        HMENU menu=CreatePopupMenu();
+        if(!menu)return 0;
+        AppendMenuW(menu,MF_STRING|(widget->locked?MF_GRAYED:0),1,L"删除便签");
+        const UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,cursor.x,cursor.y,0,hwnd,nullptr);
+        DestroyMenu(menu);
+        if(command==1) {
+            const auto id=state->id;
+            std::erase_if(g_layout->widgets,[&](const auto& item){return item.id==id&&!item.locked;});
+            QueueLayoutSave();
+            PostMessageW(g_manager,WM_APP+11,0,0);
+        }
+        return 0;
+    }
     }
     return DefWindowProcW(hwnd,message,wp,lp);
 }
+
 int HitVisualIcon(int x,int y) { for(int i=static_cast<int>(g_visualIcons.size())-1;i>=0;--i)if(PtInRect(&g_visualIcons[i].hit,POINT{x,y}))return i;return -1; }
 ComPtr<IDropTarget> ShellDropTargetFor(const std::wstring& path) {
     PIDLIST_ABSOLUTE pidl=nullptr;ComPtr<IShellFolder> parent;PCUITEMID_CHILD child=nullptr;ComPtr<IDropTarget> target;
@@ -1120,6 +1495,15 @@ void RefreshIconHit(VisualIcon& item) {
     item.hit={item.position.x-padding,item.position.y,item.position.x-padding+g_snapshot.spacing.x,item.position.y+g_snapshot.spacing.y};
     item.label={item.hit.left,item.position.y+item.size+3,item.hit.right,item.hit.bottom};
 }
+void ApplyIconDragOffset(POINT offset) {
+    for(auto& item:g_visualIcons) {
+        const auto start=std::find_if(g_iconDragStart.begin(),g_iconDragStart.end(),
+            [&](const auto& value){return value.first==item.path;});
+        if(start==g_iconDragStart.end())continue;
+        item.position=ClampDesktopPosition({start->second.x+offset.x,start->second.y+offset.y});
+        RefreshIconHit(item);
+    }
+}
 void ClearSelections() {
     for(auto& item:g_visualIcons)item.selected=false;
     for(auto& box:g_layout->boxes)box.selected=false;
@@ -1127,6 +1511,13 @@ void ClearSelections() {
 }
 bool DesktopPointerActive() {
     if(!g_background||!IsWindowVisible(g_background))return false;
+    // The owned desktop does not activate on click. Keep keyboard shortcuts
+    // with the app's focused settings controls or widget editors.
+    if(HWND focus=GetFocus()) {
+        if(IsChild(g_background,focus))return false;
+        const HWND root=GetAncestor(focus,GA_ROOT);
+        if(FindWidgetWindow(root)||db::ClassOf(root)==L"nestlone-D.Settings")return false;
+    }
     POINT cursor{};GetCursorPos(&cursor);
     HWND underCursor=WindowFromPoint(cursor);
     return underCursor==g_background||IsChild(g_background,underCursor);
@@ -1168,7 +1559,14 @@ void UpdateMarquee(POINT point) {
     for(auto& item:g_visualIcons){RECT overlap{};bool inside=IntersectRect(&overlap,&g_marqueeRect,&item.hit)!=FALSE;bool initial=std::any_of(g_selectionStart.begin(),g_selectionStart.end(),[&](const auto& path){return _wcsicmp(path.c_str(),item.path.c_str())==0;});if(g_marqueeCtrl)item.selected=initial!=inside;else if(g_marqueeShift)item.selected=initial||inside;else item.selected=inside;}
 }
 void FinishMarquee() {g_marquee=false;g_marqueeMoved=false;g_selectionStart.clear();g_visualDirty=true;PaintAll();}
-void CancelIconGesture() {g_marquee=false;g_marqueeMoved=false;g_iconDrag=-1;g_iconMoved=false;g_iconDragStart.clear();g_selectionStart.clear();if(GetCapture())ReleaseCapture();PaintAll();}
+void CancelIconGesture(bool releaseCapture) {
+    if(g_iconMoved)g_visualGeometryDirty=true;
+    EndIconDragPreview();
+    g_marquee=false;g_marqueeMoved=false;g_iconDrag=-1;g_iconMoved=false;
+    g_iconDragStart.clear();g_selectionStart.clear();
+    if(releaseCapture&&GetCapture())ReleaseCapture();
+    PaintAll();
+}
 void ShowShellMenu(HWND owner,const std::wstring& path,POINT screen) {
     PIDLIST_ABSOLUTE pidl=nullptr;ComPtr<IShellFolder> parent;PCUITEMID_CHILD child=nullptr;
     if(FAILED(SHParseDisplayName(path.c_str(),nullptr,&pidl,0,nullptr))||!pidl)return;
@@ -1217,8 +1615,11 @@ void BeginExternalShellDrag() {
     ComPtr<IDataObject> data;
     const HRESULT create=CreateDesktopDataObject(paths,data.GetAddressOf());
     if(FAILED(create)){db::LogF("[drag] desktop data object unavailable: 0x%08lx",static_cast<unsigned long>(create));return;}
+    const bool hadPreview=g_iconDragPreview!=nullptr;
+    EndIconDragPreview();
     g_iconDrag=-1;g_iconMoved=false;g_iconDragStart.clear();
     if(GetCapture())ReleaseCapture();
+    if(hadPreview)PaintWindow(g_background);
     auto* source=new DesktopDragSource();DWORD effect=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
     const HRESULT result=DoDragDrop(data.Get(),source,effect,&effect);
     source->Release();
@@ -1320,7 +1721,9 @@ void FinishVisualDrag() {
     }
     if(target<0)for(const auto& item:dragged)moves.push_back({item.first,item.second});
     if(!moves.empty())QueueMoves(moves);
-    SaveLayout(*g_layout);g_visualDirty=true;g_iconDrag=-1;g_iconDragStart.clear();PaintAll();
+    g_visualDirty=true;g_iconDrag=-1;g_iconDragStart.clear();
+    PaintAll();
+    QueueLayoutSave();
 }
 bool PrimeSurface() {
     if(!g_background||!IsWindow(g_background))return false;
@@ -1404,7 +1807,6 @@ bool Attach() {
         ShowPreparedSurface();
         if(!PrimeSurface()||!HideNativeDesktopAfterSurfaceIsReady()) {db::LogF("[canvas] attach failed: surface presentation");DestroyDecorations();return false;}
     }
-    UpdateWeatherSchedule();
     return true;
 }
 void Rebuild(){
@@ -1431,7 +1833,7 @@ void Rebuild(){
         SetWindowPos(d->grip,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         g_decorations.push_back(std::move(d));
     }
-    g_visualDirty=true;PaintAll();SyncWidgets();UpdateWeatherSchedule();SaveLayout(*g_layout);
+    g_visualDirty=true;PaintAll();SyncWidgets();SaveLayout(*g_layout);
 }
 void ToggleBoxView(Box& box) {box.iconView=!box.iconView;box.listScroll=0;SyncGroupRect(box);SaveLayout(*g_layout);g_visualDirty=true;PaintAll();}
 void CreateBoxAt(POINT point) {
@@ -1496,15 +1898,72 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             if(shift&&g_focusIcon>=0){int first=min(g_focusIcon,hit),last=max(g_focusIcon,hit);if(!ctrl)for(auto& item:g_visualIcons)item.selected=false;for(int i=first;i<=last;++i)g_visualIcons[i].selected=true;}
             else if(ctrl)g_visualIcons[hit].selected=!g_visualIcons[hit].selected;
             else if(!alreadySelected){for(auto& item:g_visualIcons)item.selected=false;g_visualIcons[hit].selected=true;}
-            g_focusIcon=hit;g_iconDrag=hit;g_iconMoved=false;g_iconDragStart.clear();for(const auto& item:g_visualIcons)if(item.selected)g_iconDragStart.push_back({item.path,item.position});GetCursorPos(&g_iconMouseStart);SetCapture(hwnd);PaintWindow(hwnd);return 0;
+            g_focusIcon=hit;g_iconDrag=g_visualIcons[hit].selected?hit:-1;g_iconMoved=false;g_iconDragStart.clear();for(const auto& item:g_visualIcons)if(item.selected)g_iconDragStart.push_back({item.path,item.position});GetCursorPos(&g_iconMouseStart);if(g_iconDrag>=0)SetCapture(hwnd);PaintWindow(hwnd);return 0;
         }
         if(hwnd==g_background && message==WM_MOUSEMOVE && GetCapture()==hwnd) {
             POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
             if(g_marquee){UpdateMarquee(point);QueueInteractivePaint();return 0;}
-            if(g_iconDrag>=0){POINT cursor{};GetCursorPos(&cursor);LONG dx=cursor.x-g_iconMouseStart.x,dy=cursor.y-g_iconMouseStart.y;if(!g_iconMoved&&abs(dx)<4&&abs(dy)<4)return 0;if(!IsCanvasSurfaceWindow(WindowFromPoint(cursor))){BeginExternalShellDrag();return 0;}g_iconMoved=true;for(auto& item:g_visualIcons)if(item.selected){auto start=std::find_if(g_iconDragStart.begin(),g_iconDragStart.end(),[&](const auto& value){return _wcsicmp(value.first.c_str(),item.path.c_str())==0;});if(start!=g_iconDragStart.end()){item.position=ClampDesktopPosition({start->second.x+dx,start->second.y+dy});RefreshIconHit(item);}}QueueInteractivePaint();return 0;}
+            if(g_iconDrag>=0) {
+                POINT cursor{};GetCursorPos(&cursor);
+                const POINT offset{cursor.x-g_iconMouseStart.x,cursor.y-g_iconMouseStart.y};
+                if(!g_iconMoved&&abs(offset.x)<4&&abs(offset.y)<4)return 0;
+                if(!IsCanvasSurfaceWindow(WindowFromPoint(cursor))) {
+                    BeginExternalShellDrag();
+                    return 0;
+                }
+                if(!g_iconMoved)BeginIconDragPreview();
+                g_iconMoved=true;
+                if(g_iconDragPreview) {
+                    SetWindowPos(g_iconDragPreview,nullptr,g_iconPreviewOrigin.x+offset.x,
+                        g_iconPreviewOrigin.y+offset.y,0,0,
+                        SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+                } else {
+                    ApplyIconDragOffset(offset);
+                    QueueInteractivePaint();
+                }
+                return 0;
+            }
         }
-        if(hwnd==g_background && message==WM_LBUTTONUP){if(g_marquee){ReleaseCapture();FinishMarquee();return 0;}if(g_iconDrag>=0){ReleaseCapture();if(g_iconMoved)FinishVisualDrag();else{g_iconDrag=-1;g_iconDragStart.clear();}return 0;}}
-        if(hwnd==g_background && message==WM_LBUTTONDBLCLK){int hit=HitVisualIcon(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));if(hit>=0)ShellExecuteW(nullptr,L"open",g_visualIcons[hit].path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);return 0;}
+        if(hwnd==g_background && message==WM_LBUTTONUP) {
+            if(g_marquee){FinishMarquee();ReleaseCapture();return 0;}
+            if(g_iconDrag>=0) {
+                POINT cursor{};GetCursorPos(&cursor);
+                if(g_iconMoved&&!IsCanvasSurfaceWindow(WindowFromPoint(cursor))) {
+                    CancelIconGesture();
+                    return 0;
+                }
+                const int anchor=g_iconDrag;
+                g_iconDrag=-1;
+                ReleaseCapture();
+                if(g_iconMoved) {
+                    g_iconDrag=anchor;
+                    ApplyIconDragOffset({cursor.x-g_iconMouseStart.x,cursor.y-g_iconMouseStart.y});
+                    EndIconDragPreview();
+                    FinishVisualDrag();
+                    g_iconMoved=false;
+                } else {
+                    g_iconDragStart.clear();
+                }
+                return 0;
+            }
+        }
+        if(hwnd==g_background&&(message==WM_CAPTURECHANGED||message==WM_CANCELMODE)&&
+            (g_iconDrag>=0||g_marquee)) {
+            CancelIconGesture(message!=WM_CAPTURECHANGED);
+            return 0;
+        }
+        if(hwnd==g_background && message==WM_LBUTTONDBLCLK) {
+            const POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            const int hit=HitVisualIcon(point.x,point.y);
+            if(hit>=0) {
+                const auto& icon=g_visualIcons[hit];
+                if(PtInRect(&icon.label,point)&&(!icon.list||PtInRect(&icon.clip,point)))
+                    BeginItemRename(icon.path);
+                else
+                    ShellExecuteW(nullptr,L"open",icon.path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+            }
+            return 0;
+        }
         if(hwnd==g_background && message==WM_RBUTTONDOWN){int hit=HitVisualIcon(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));if(hit>=0&&!g_visualIcons[hit].selected){for(auto& item:g_visualIcons)item.selected=false;g_visualIcons[hit].selected=true;g_focusIcon=hit;PaintWindow(hwnd);}return 0;}
         if(hwnd==g_background && message==WM_RBUTTONUP){
             int hit=HitVisualIcon(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));POINT screen{};GetCursorPos(&screen);
@@ -1516,13 +1975,14 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                     bool createBox=false;
                     if(ShowShellBackgroundMenu(hwnd,screen,&createBox)) {
                         if(createBox)CreateBoxAt(virtualPoint);
-                        else PostMessageW(g_manager,WM_APP+12,0,0);
+                        else PostMessageW(g_manager,WM_APP+12,TRUE,0);
                     }
                 }
             }
             return 0;
         }
         if(hwnd==g_background && message==WM_MOUSEWHEEL) {
+            if(g_iconDrag>=0)return 0;
             POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&point);
             for(auto& root:g_layout->boxes)if(IsGroupRoot(root)&&!root.collapsed) {
                 Box* active=ActiveBox(root);if(!active||active->iconView)continue;
@@ -1593,9 +2053,9 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         }
         if(g_drag && GetCapture()==hwnd) {
             if(auto* dragged=FindBox(g_dragId))box=dragged;
-            if(!g_resizing&&!g_dragPreview)BeginDragPreview(*box);
-            POINT p{};GetCursorPos(&p);LONG dx=p.x-g_mouseStart.x,dy=p.y-g_mouseStart.y;box->rect=g_boxStart;
+            POINT p{};GetCursorPos(&p);LONG dx=p.x-g_mouseStart.x,dy=p.y-g_mouseStart.y;
             if(g_resizing){
+                box->rect=g_boxStart;
                 if(g_resizeFromLeft)box->rect.left=min(box->rect.right-240,box->rect.left+dx);
                 else box->rect.right=max(box->rect.left+240,box->rect.right+dx);
                 box->rect.bottom=max(box->rect.top+BoxHeaderHeight(*box)+100,box->rect.bottom+dy);box->rect=FitGrid(*box,g_snapshot);
@@ -1604,9 +2064,17 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             else {
                 RECT desired=g_boxStart;OffsetRect(&desired,dx,dy);
                 const RECT constrained=KeepBoxOnScreen(desired,BoxHeaderHeight(*box));
+                if(EqualRect(&constrained,&box->rect)&&g_boxDragStart.size()==1)return 0;
+                if(!g_dragPreview)BeginDragPreview(*box);
                 dx=constrained.left-g_boxStart.left;dy=constrained.top-g_boxStart.top;
-                for(auto& start:g_boxDragStart)if(auto* selected=FindBox(start.first)){selected->rect=start.second;OffsetRect(&selected->rect,dx,dy);}
-                RecoverBoxPositions();
+                for(const auto& start:g_boxDragStart)if(auto* selected=FindBox(start.first)) {
+                    if(selected==box)selected->rect=constrained;
+                    else {
+                        RECT position=start.second;OffsetRect(&position,dx,dy);
+                        selected->rect=KeepBoxOnScreen(position,BoxHeaderHeight(*selected));
+                    }
+                    SyncGroupRect(*selected);
+                }
                 if(g_nativeHidden){g_visualGeometryDirty=true;}else {std::vector<DesktopMove> moves=g_dragStart;for(auto& m:moves){m.position.x+=dx;m.position.y+=dy;}if(!moves.empty())QueueMoves(moves);}
             }
             if(g_dragPreview)MoveDragPreview(*box);else QueueInteractivePaint();
@@ -1627,8 +2095,8 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         if(g_boxButton){int button=g_boxButton;g_boxButton=0;ReleaseCapture();if(button==1)ToggleBoxView(*ActiveBox(*box));else if(button==2){box->collapsed=!box->collapsed;g_visualDirty=true;SaveLayout(*g_layout);PaintAll();}else {auto id=box->id;g_layout->boxes.erase(std::remove_if(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const auto& b){return b.id==id;}),g_layout->boxes.end());PostMessageW(g_manager,WM_APP+11,0,0);}return 0;}
         if(g_drag){
             if(auto* dragged=FindBox(g_dragId))box=dragged;
-            g_drag=false;ReleaseCapture();EndDragPreview();FlushInteractivePaint();
-            if(g_resizing)Arrange(*box);
+            g_drag=false;ReleaseCapture();EndDragPreview();
+            if(g_resizing){FlushInteractivePaint();Arrange(*box);}
             else {
                 POINT cursor{};GetCursorPos(&cursor);cursor.x-=GetSystemMetrics(SM_XVIRTUALSCREEN);cursor.y-=GetSystemMetrics(SM_YVIRTUALSCREEN);
                 Box* source=GroupRoot(*box);Box* destination=nullptr;
@@ -1643,8 +2111,15 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                     for(auto* member:existing)member->tabOrder=order++;
                     for(auto* member:members)member->tabOrder=order++;
                     for(auto* candidate:members) {candidate->groupId=destination->id;candidate->rect=destination->rect;candidate->color=destination->color;}
-                    destination->activeTabId=box->id;g_visualDirty=true;g_boxDragStart.clear();SaveLayout(*g_layout);PostMessageW(g_manager,WM_APP+11,0,0);return 0;
+                    destination->activeTabId=box->id;
+                    g_visualDirty=true;
+                    g_tabDetached=false;
+                    g_boxDragStart.clear();
+                    // Rebuild presents and saves the merged state in one pass.
+                    if(!PostMessageW(g_manager,WM_APP+11,0,0))Rebuild();
+                    return 0;
                 }
+                FlushInteractivePaint();
             }
             const bool rebuildDecorations=g_tabDetached;g_tabDetached=false;g_resizeFromLeft=false;
             g_boxDragStart.clear();SaveLayout(*g_layout);
@@ -1657,18 +2132,12 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     return DefWindowProcW(hwnd,message,wp,lp);
 }
 LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
-    if(message==WM_APP+10){FinishRename(true);return 0;}
+    if(message==kFinishRenameMessage){if(g_edit==reinterpret_cast<HWND>(lp))FinishRename(true);return 0;}
     if(message==WM_APP+11){Rebuild();return 0;}
     if(message==WM_APP+13){DeleteSelection();return 0;}
     if(message==WM_APP+14){std::unique_ptr<std::wstring> path(reinterpret_cast<std::wstring*>(lp));if(path)BeginItemRename(*path);return 0;}
     if(message==WM_APP+15){std::unique_ptr<ShellDropOperation> operation(reinterpret_cast<ShellDropOperation*>(lp));if(operation)CompleteDesktopShellDrop(*operation);return 0;}
     if(message==WM_APP+16){if(PasteDesktopClipboard(g_background))PostMessageW(hwnd,WM_APP+12,0,0);return 0;}
-    if(message==WM_APP+20){
-        std::unique_ptr<WeatherReply> reply(reinterpret_cast<WeatherReply*>(lp));
-        if(reply&&!reply->diagnostic.empty())db::LogF("[weather] %s",db::ToUtf8(reply->diagnostic).c_str());
-        if(reply&&g_layout){for(auto& widget:g_layout->widgets)if(widget.type==L"weather"){widget.temperature=reply->temperature;widget.weather=reply->summary;widget.weatherIcon=reply->icon;widget.weatherValid=reply->valid;widget.weatherLocation=reply->source;}SaveLayout(*g_layout);for(auto& window:g_widgets)if(IsWindow(window->window)){if(auto* model=FindWidget(window->id);model&&model->type==L"weather")PaintWeatherWidget(window->window,*model);else InvalidateRect(window->window,nullptr,TRUE);}}
-        return 0;
-    }
     if(message==WM_APP+21){UpdateSurfaceVisibility();return 0;}
     if(message==WM_APP+12){
         // Explorer may commit a background-menu command (New, View size,
@@ -1677,36 +2146,47 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         // Explorer's visible ListView.
         // New and pasted items should appear promptly. Explorer may still be
         // committing the operation, so keep a brief high-frequency window.
+        g_forceShellRepaint|=wp!=0;
         g_shellRefreshAttempts=g_pendingShellDrops.empty()?24:40;SetTimer(hwnd,kShellRefreshTimer,g_pendingShellDrops.empty()?40:50,nullptr);return 0;
     }
     if(message==WM_TIMER&&wp==kInteractivePaintTimer) {
         KillTimer(hwnd,kInteractivePaintTimer);g_interactivePaintQueued=false;
         if(g_visible){
-            if(g_drag)PaintAll();
-            else if((g_marquee||g_iconDrag>=0)&&g_background)PaintWindow(g_background);
+            if(g_drag&&!g_dragPreview)PaintAll();
+            else if((g_marquee||(g_iconDrag>=0&&!g_iconDragPreview))&&g_background)PaintWindow(g_background);
         }
+        return 0;
+    }
+    const auto gestureActive=[] {
+        return g_drag||g_tabPending||g_marquee||g_iconDrag>=0||
+            std::any_of(g_widgets.begin(),g_widgets.end(),[](const auto& w){return w->dragging||w->resizing;});
+    };
+    if(message==WM_TIMER&&wp==kLayoutSaveTimer) {
+        if(!gestureActive())FinishQueuedLayoutSave(true);
         return 0;
     }
     if(message==WM_TIMER&&wp==kShellRefreshTimer) {
-        if(!g_visible||g_shellRefreshAttempts--<=0){KillTimer(hwnd,kShellRefreshTimer);return 0;}
+        if(!g_visible||g_shellRefreshAttempts<=0) {
+            KillTimer(hwnd,kShellRefreshTimer);
+            g_forceShellRepaint=false;
+            return 0;
+        }
+        // A refresh can rebuild the icons while their drag is still active.
+        // Preserve the remaining refresh attempts until the gesture ends.
+        if(gestureActive())return 0;
+        --g_shellRefreshAttempts;
         DesktopSnapshot next;
         if(PollDesktop(next)&&next.readable) {
-            const bool changed=SnapshotVisualsChanged(g_snapshot,next);
-            PlaceNewDesktopEntries(g_snapshot,next);
-            ReconcilePendingShellDrops(next);
-            g_snapshot=std::move(next);
-            if(changed)g_iconCache.clear();
-            // Force an owned-canvas redraw even for a shell command whose
-            // result has the same item count, such as a view-size change.
-            g_visualDirty=true;PaintAll();
+            const bool forceRepaint=g_forceShellRepaint;
+            g_forceShellRepaint=false;
+            ApplyDesktopSnapshot(std::move(next),forceRepaint);
         }
         return 0;
     }
-    if(message==WM_TIMER&&wp==kWeatherTimer) {RefreshWeatherNow();return 0;}
     if(message==WM_TIMER) {
         // Host discovery enumerates Explorer windows and sends synchronous
         // messages. Defer maintenance while the pointer gesture is active.
-        if(g_drag||g_tabPending||g_marquee||g_iconDrag>=0||std::any_of(g_widgets.begin(),g_widgets.end(),[](const auto& w){return w->dragging;}))return 0;
+        if(gestureActive())return 0;
         Attach();
         if(!g_visible)return 0;
         DesktopSnapshot next;
@@ -1718,11 +2198,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
                 if(!g_nativeHidden && !settling && !g_drag && !(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000))Observe(g_snapshot,next);
                 // Keep the pre-drag baseline until Explorer has finished native drag/drop.
                 if(!(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000)){
-                    bool resourcesChanged=SnapshotVisualsChanged(g_snapshot,next);
-                    PlaceNewDesktopEntries(g_snapshot,next);
-                    ReconcilePendingShellDrops(next);
-                    g_snapshot=std::move(next);
-                    if(g_nativeHidden&&resourcesChanged){g_iconCache.clear();g_visualDirty=true;PaintAll();}
+                    ApplyDesktopSnapshot(std::move(next));
                 }
             }
         }
@@ -1742,18 +2218,88 @@ bool CreateCanvas(HINSTANCE instance,HWND,Layout* layout) {
     if(!g_manager)return false;
     g_keyboardHook=SetWindowsHookExW(WH_KEYBOARD_LL,KeyboardProc,instance,0);
     g_foregroundHook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,ForegroundProc,0,0,WINEVENT_OUTOFCONTEXT);
-    SetTimer(g_manager,1,350,nullptr);Attach();PollDesktop(g_snapshot);RefreshWeatherNow();return true;
+    SetTimer(g_manager,1,350,nullptr);Attach();PollDesktop(g_snapshot);return true;
 }
 void DestroyCanvas() {
+    FinishQueuedLayoutSave(true);
+    g_forceShellRepaint=false;
     CancelDesktopMoves();DestroyDecorations();if(g_manager)DestroyWindow(g_manager);g_manager=nullptr;
     if(g_keyboardHook){UnhookWindowsHookEx(g_keyboardHook);g_keyboardHook=nullptr;}
     if(g_foregroundHook){UnhookWinEvent(g_foregroundHook);g_foregroundHook=nullptr;}
     g_interactivePaintQueued=false;g_paintBuffers.clear();g_iconCache.clear();
     if(g_editFont){DeleteObject(g_editFont);g_editFont=nullptr;}
-    g_weatherIconFamily.reset();g_weatherIconFonts.reset();g_weatherIconCss.clear();
     if(g_token){Gdiplus::GdiplusShutdown(g_token);g_token=0;}
 }
 bool CanvasVisible(){return g_visible;}
+RECT NewNoteRect(const RECT& work,const RECT& settings,LONG offset) {
+    constexpr LONG gap=16;
+    const LONG width=min(280L,work.right-work.left),height=min(220L,work.bottom-work.top);
+    const LONG y=std::clamp(settings.top+offset,work.top,work.bottom-height);
+    const LONG x=std::clamp(settings.left+offset,work.left,work.right-width);
+    if(settings.right+gap+width<=work.right)
+        return {settings.right+gap,y,settings.right+gap+width,y+height};
+    if(settings.left-gap-width>=work.left)
+        return {settings.left-gap-width,y,settings.left-gap,y+height};
+    if(settings.bottom+gap+height<=work.bottom)
+        return {x,settings.bottom+gap,x+width,settings.bottom+gap+height};
+    if(settings.top-gap-height>=work.top)
+        return {x,settings.top-gap-height,x+width,settings.top-gap};
+    return {x,y,x+width,y+height};
+}
+static bool NoteSurfaceReady() {
+    return g_layout&&g_visible&&(IsWindowVisible(g_background)||(Attach()&&IsWindowVisible(g_background)));
+}
+static bool PresentNote(const std::wstring& id) {
+    SyncWidgets();
+    const auto created=std::find_if(g_widgets.begin(),g_widgets.end(),[&](const auto& window){
+        return window->id==id&&IsWindowVisible(window->window)&&IsWindow(window->edit);
+    });
+    if(created==g_widgets.end())return false;
+    const auto& window=**created;
+    SetForegroundWindow(window.window);
+    if(GetForegroundWindow()==window.window)SetFocus(window.edit);
+    RedrawWindow(window.window,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW);
+    return true;
+}
+bool CanvasCreateNote(HWND settings) {
+    if(!NoteSurfaceReady())return false;
+
+    RECT settingsRect{};
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    if(!GetWindowRect(settings,&settingsRect)||
+        !GetMonitorInfoW(MonitorFromWindow(settings,MONITOR_DEFAULTTONEAREST),&monitor))return false;
+
+    Layout::Widget widget;
+    const auto id=std::to_wstring(GetTickCount64());
+    widget.id=id;
+    for(unsigned suffix=1;FindWidget(widget.id);++suffix)widget.id=id+L"-"+std::to_wstring(suffix);
+    const LONG offset=static_cast<LONG>(g_layout->widgets.size()%6)*20;
+    widget.rect=NewNoteRect(monitor.rcWork,settingsRect,offset);
+    OffsetRect(&widget.rect,-GetSystemMetrics(SM_XVIRTUALSCREEN),-GetSystemMetrics(SM_YVIRTUALSCREEN));
+    g_layout->widgets.push_back(std::move(widget));
+    if(!PresentNote(g_layout->widgets.back().id)) {
+        g_layout->widgets.pop_back();
+        SyncWidgets();
+        db::LogF("[note] creation did not produce a visible editor");
+        return false;
+    }
+    QueueLayoutSave();
+    return true;
+}
+bool CanvasShowNote(const std::wstring& id) {
+    if(!NoteSurfaceReady())return false;
+    auto* widget=FindWidget(id);
+    if(!widget)return false;
+    const bool wasClosed=widget->closed;
+    widget->closed=false;
+    if(!PresentNote(id)) {
+        widget->closed=wasClosed;
+        SyncWidgets();
+        return false;
+    }
+    if(wasClosed)QueueLayoutSave();
+    return true;
+}
 void CanvasSetOpacity(int opacity){if(g_layout){g_layout->opacity=std::clamp(opacity,0,100);PaintAll();}}
 void CanvasNotifyDesktopHostChanged() {
     CancelDesktopMoves();
@@ -1766,6 +2312,7 @@ void CanvasNotifyDesktopHostChanged() {
 void HandleCanvasCommand(CanvasCommand command) {
     if(!g_layout)return;
     if(command==CanvasCommand::Toggle) {
+        if(g_iconDrag>=0||g_marquee)CancelIconGesture();
         g_visible=!g_visible;CancelDesktopMoves();g_pending=0;g_moves.clear();g_snapshot={};FinishRename(true);
         if(!g_visible) {
             if(g_background)ShowWindow(g_background,SW_HIDE);
@@ -1776,18 +2323,20 @@ void HandleCanvasCommand(CanvasCommand command) {
         } else {
             // Attach prepares and proves the surface before it hides Explorer.
             // If discovery or painting fails, the native desktop stays visible.
-            if(!Attach()) {g_visible=false;UpdateWeatherSchedule();return;}
+            if(!Attach()) {g_visible=false;return;}
             DesktopSnapshot current;if(ReadDesktop(current)){g_snapshot=std::move(current);g_visualDirty=true;}
         }
-        UpdateWeatherSchedule();if(g_visible)RefreshWeatherNow();
         if(g_visible)PaintAll();
         UpdateSurfaceVisibility();
     }
     if(command==CanvasCommand::NewBox)CreateBoxAt({160,160});
-    if(command==CanvasCommand::NewWeather&&!WeatherConfigured()) {MessageBoxW(nullptr,L"无法添加天气组件，请前往设置中心的“配置”填写天气接口信息。",L"天气组件",MB_OK|MB_ICONINFORMATION);return;}
-    if(command==CanvasCommand::NewNote||command==CanvasCommand::NewWeather) {Layout::Widget widget;widget.id=std::to_wstring(GetTickCount64());widget.type=command==CanvasCommand::NewNote?L"note":L"weather";widget.rect={220,160,480,command==CanvasCommand::NewNote?390:310};widget.text=L"双击编辑内容";widget.weather=L"正在获取天气";g_layout->widgets.push_back(std::move(widget));SaveLayout(*g_layout);SyncWidgets();UpdateWeatherSchedule();if(command==CanvasCommand::NewWeather)RefreshWeatherNow();}
-    if(command==CanvasCommand::ClearWidgets) {g_layout->widgets.clear();SaveLayout(*g_layout);SyncWidgets();UpdateWeatherSchedule();}
-    if(command==CanvasCommand::Reload){g_iconCache.clear();*g_layout=LoadLayout();Rebuild();}
+    if(command==CanvasCommand::ClearWidgets) {g_layout->widgets.clear();SyncWidgets();QueueLayoutSave();}
+    if(command==CanvasCommand::RefreshLayout)Rebuild();
+    if(command==CanvasCommand::Reload) {
+        // A backup restore replaces the file before requesting Reload.
+        FinishQueuedLayoutSave(false);
+        g_iconCache.clear();*g_layout=LoadLayout();Rebuild();
+    }
     if(command==CanvasCommand::Exit)DestroyCanvas();
 }
 }

@@ -38,11 +38,12 @@ LRESULT CALLBACK ControlProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         case nestlone::ID_TRAY_TOGGLE: DispatchCanvas(nestlone::CanvasCommand::Toggle); break;
         case nestlone::ID_TRAY_NEW_BOX: DispatchCanvas(nestlone::CanvasCommand::NewBox); break;
         case nestlone::ID_TRAY_RELOAD: DispatchCanvas(nestlone::CanvasCommand::Reload); break;
-        case nestlone::ID_TRAY_SETTINGS: nestlone::ShowSettings(GetModuleHandleW(nullptr), &g_layout); break;
+        case nestlone::ID_TRAY_SETTINGS: nestlone::ShowSettings(GetModuleHandleW(nullptr), hwnd, &g_layout); break;
         case nestlone::ID_TRAY_EXIT: DestroyWindow(hwnd); break;
         }
         return 0;
     case WM_DESTROY:
+        nestlone::CloseSettings();
         nestlone::SaveLayout(g_layout);
         nestlone::DestroyCanvas();
         nestlone::TrayRemove(hwnd);
@@ -106,7 +107,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     }
 
     MSG message{};
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if(nestlone::ProcessSettingsMessage(message))continue;
+        TranslateMessage(&message);DispatchMessageW(&message);
+    }
     db::LogClose();
     OleUninitialize();
     CloseHandle(g_mutex);
