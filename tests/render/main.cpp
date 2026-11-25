@@ -219,6 +219,30 @@ int main() {
     nestlone::g_host.defviewParent=host;
     HWND background=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"background",WS_POPUP,0,0,800,600,nullptr,nullptr,nestlone::g_instance,nullptr);
     nestlone::g_background=background;nestlone::g_host.defview=host;
+    {
+        auto& backgroundCache=nestlone::g_paintBuffers[background];
+        backgroundCache=std::make_unique<nestlone::PaintBuffer>();
+        check(backgroundCache->Ensure(800,600),"drag background cache is available");
+        auto* pixels=static_cast<DWORD*>(backgroundCache->pixels);
+        pixels[0]=0x12345678;
+        HWND preview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT,L"STATIC",L"preview",
+            WS_CHILD,10,10,80,60,background,nullptr,nestlone::g_instance,nullptr);
+        nestlone::g_dragPreview=preview;
+        nestlone::PaintWindow(background);
+        nestlone::DecorationProc(background,WM_PAINT,0,0);
+        check(pixels[0]==0x12345678,"drag-time paint requests retain the background pixels");
+        nestlone::Box moving;moving.id=L"moving";moving.rect={40,50,120,110};
+        HWND sibling=CreateWindowExW(0,L"STATIC",L"sibling",WS_CHILD,0,0,10,10,background,nullptr,nestlone::g_instance,nullptr);
+        const HWND above=GetWindow(preview,GW_HWNDPREV);
+        nestlone::MoveDragPreview(moving);
+        RECT moved{};GetWindowRect(preview,&moved);MapWindowPoints(nullptr,background,reinterpret_cast<POINT*>(&moved),2);
+        check(moved.left==40&&moved.top==50&&GetWindow(preview,GW_HWNDPREV)==above,
+            "moving a cached preview preserves its sibling stacking");
+        nestlone::EndDragPreview();
+        check(!IsWindow(preview)&&!nestlone::g_dragPreview&&pixels[0]!=0x12345678,
+            "ending a drag restores the formal surface before removing the preview");
+        DestroyWindow(sibling);nestlone::g_paintBuffers.erase(background);
+    }
     check(!nestlone::CanvasCreateNote(background)&&widgets.widgets.size()==1,
         "creating a note while the desktop is hidden does not add an invisible entry");
     HWND normal=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"normal app",WS_POPUP,0,0,10,10,nullptr,nullptr,nestlone::g_instance,nullptr);

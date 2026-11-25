@@ -43,7 +43,7 @@ HWND g_iconDragPreview=nullptr;
 POINT g_iconPreviewOrigin{};
 std::unordered_set<std::wstring> g_iconPreviewPaths;
 std::wstring g_previewGroup,g_renderOnlyGroup;
-void EndDragPreview();
+void EndDragPreview(bool restoreSurface=true);
 HWND g_hiddenListview=nullptr;
 bool g_dropRegistered=false;
 db::HostInfo g_host;
@@ -292,7 +292,11 @@ void Label(Gdiplus::Graphics& g,const std::wstring& value,RECT r) {
     Gdiplus::Pen outline(Gdiplus::Color(230,22,38,49),1.4f);Gdiplus::SolidBrush ink(Gdiplus::Color(255,255,255,255));
     g.DrawPath(&outline,&text);g.FillPath(&ink,&text);
 }
-bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false,bool leftGrip=false) {
+bool PaintWindow(HWND hwnd,Box* box=nullptr,bool grip=false,bool leftGrip=false,bool previewTransition=false) {
+    // Moving child windows can invalidate their layered parent. Its retained
+    // pixels already exclude the moving group; do not upload the full desktop
+    // again underneath the preview for each resulting WM_PAINT.
+    if(hwnd==g_background&&g_dragPreview&&!previewTransition)return true;
     RECT r{};if(!GetClientRect(hwnd,&r)||r.right<=0||r.bottom<=0)return false;
     auto& stored=g_paintBuffers[hwnd];if(!stored)stored=std::make_unique<PaintBuffer>();
     auto& buffer=*stored;if(!buffer.Ensure(r.right,r.bottom))return false;
@@ -936,8 +940,10 @@ void BeginIconDragPreview() {
         g_iconPreviewPaths.clear();
     }
 }
-void EndDragPreview() {
+void EndDragPreview(bool restoreSurface) {
     HWND preview=g_dragPreview;g_dragPreview=nullptr;g_previewGroup.clear();g_renderOnlyGroup.clear();
+    // Restore the final body before removing its cached overlay.
+    if(restoreSurface&&preview&&IsWindow(g_background)&&g_layout)PaintAll();
     if(preview)DestroyWindow(preview);
 }
 bool BeginDragPreview(Box& box) {
@@ -960,8 +966,16 @@ bool BeginDragPreview(Box& box) {
     if(!preview)return false;
     g_dragPreview=preview;g_previewGroup=box.id;
     // Remove only the moving group's pixels from the static desktop once.
-    PaintWindow(g_background);
+    PaintWindow(g_background,nullptr,false,false,true);
     SetWindowPos(preview,SurfaceControlInsertAfter(),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    // Establish stacking once. Movement only changes coordinates, avoiding
+    // repeated sibling reordering and the associated parent repaint requests.
+    for(const auto& decoration:g_decorations)if(decoration->id==box.id) {
+        SetWindowPos(decoration->header,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(decoration->grip,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(decoration->gripLeft,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        break;
+    }
     return true;
 }
 void MoveDragPreview(Box& box) {
@@ -970,7 +984,7 @@ void MoveDragPreview(Box& box) {
     const POINT left=ParentPoint({box.rect.left,box.rect.bottom-18});
     const auto decoration=std::find_if(g_decorations.begin(),g_decorations.end(),
         [&](const auto& item){return item->id==box.id;});
-    constexpr UINT flags=SWP_NOSIZE|SWP_NOACTIVATE;
+    constexpr UINT flags=SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOREDRAW|SWP_NOCOPYBITS;
     if(decoration!=g_decorations.end()) {
         const auto& d=**decoration;
         // Present the cached body and its controls as one position update.
@@ -1212,7 +1226,7 @@ void BeginItemRename(const std::wstring& requestedPath) {
     ShowRenameEditor(selectEnd);
 }
 void DestroyDecorations() {
-    EndDragPreview();
+    EndDragPreview(false);
     EndIconDragPreview();
     g_iconDrag=-1;g_iconMoved=false;g_iconDragStart.clear();
     g_marquee=false;g_marqueeMoved=false;g_selectionStart.clear();
