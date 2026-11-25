@@ -1120,13 +1120,48 @@ void ShowRenameEditor(int selectionEnd) {
     SetFocus(g_edit);
     SendMessageW(g_edit,EM_SETSEL,0,selectionEnd);
 }
+Box* HeaderRenameTarget(Box& root,POINT local,bool& groupTitle) {
+    groupTitle=false;
+    const int h=HeaderHeight(),width=root.rect.right-root.rect.left;
+    if(local.x<0||local.x>=width||local.y<0)return nullptr;
+    if(local.y<h) {
+        if(local.x>=width-3*h)return nullptr;
+        groupTitle=HasGroupTabs(root);
+        return &root;
+    }
+    if(local.y>=2*h||!HasGroupTabs(root))return nullptr;
+    auto tabs=GroupTabs(root);
+    // Use the same integer boundaries as header painting, including widths
+    // that are not evenly divisible by the number of tabs.
+    for(size_t i=0;i<tabs.size();++i)
+        if(local.x<static_cast<int>((i+1)*width/tabs.size()))return tabs[i];
+    return nullptr;
+}
+RECT BoxRenameRect(Box& box,bool groupTitle) {
+    Box* root=GroupRoot(box);
+    const int h=HeaderHeight(),width=root->rect.right-root->rect.left;
+    RECT rect{root->rect.left+h,root->rect.top+h/4,root->rect.right-3*h,root->rect.top+h};
+    if(!groupTitle&&HasGroupTabs(*root)) {
+        auto tabs=GroupTabs(*root);
+        const auto found=std::find(tabs.begin(),tabs.end(),&box);
+        if(found!=tabs.end()) {
+            const size_t index=static_cast<size_t>(found-tabs.begin());
+            rect={root->rect.left+static_cast<LONG>(index*width/tabs.size())+4,
+                root->rect.top+h+h/4,
+                root->rect.left+static_cast<LONG>((index+1)*width/tabs.size())-4,
+                root->rect.top+2*h};
+        }
+    }
+    return rect;
+}
 void BeginRename(Box& box,bool groupTitle=false) {
     FinishRename(true);g_editId=box.id;g_editGroupTitle=groupTitle;
-    POINT p{box.rect.left+HeaderHeight(),box.rect.top+HeaderHeight()/4};
+    const RECT rect=BoxRenameRect(box,groupTitle);
+    POINT p{rect.left,rect.top};
     p.x+=GetSystemMetrics(SM_XVIRTUALSCREEN);p.y+=GetSystemMetrics(SM_YVIRTUALSCREEN);
     const std::wstring& value=groupTitle?GroupTitle(box):box.title;
     g_edit=CreateWindowExW(WS_EX_TOOLWINDOW,L"EDIT",value.c_str(),WS_POPUP|ES_CENTER|ES_AUTOHSCROLL,p.x,p.y,
-        max(40L,box.rect.right-box.rect.left-4*HeaderHeight()),HeaderHeight()*3/4,nullptr,nullptr,g_instance,nullptr);
+        max(1L,rect.right-rect.left),rect.bottom-rect.top,nullptr,nullptr,g_instance,nullptr);
     if(!g_edit)return;
     if(g_editFont)DeleteObject(g_editFont);
     g_editFont=CreateFontW(-HeaderHeight()*2/5,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
@@ -2011,7 +2046,16 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     case WM_NCHITTEST:return HTCLIENT;
     case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
     case WM_PAINT:{PAINTSTRUCT ps{};BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);PaintWindow(hwnd,box,hwnd==d->grip||hwnd==d->gripLeft,hwnd==d->gripLeft);return 0;}
-    case WM_LBUTTONDBLCLK:if(hwnd==d->header && GET_Y_LPARAM(lp)<HeaderHeight() && GET_X_LPARAM(lp)<box->rect.right-box->rect.left-3*HeaderHeight())BeginRename(*box,HasGroupTabs(*box));return 0;
+    case WM_LBUTTONDBLCLK:
+        if(hwnd==d->header) {
+            bool groupTitle=false;
+            if(auto* target=HeaderRenameTarget(*box,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)},groupTitle)) {
+                g_drag=false;g_tabPending=false;g_tabInsert=-1;g_boxButton=0;
+                if(GetCapture()==hwnd)ReleaseCapture();
+                BeginRename(*target,groupTitle);
+            }
+        }
+        return 0;
     case WM_CONTEXTMENU:{POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};if(p.x==-1)GetCursorPos(&p);Menu(hwnd,*box,p);return 0;}
     case WM_LBUTTONDOWN: {
         FinishRename(true);int h=HeaderHeight(),x=GET_X_LPARAM(lp),y=GET_Y_LPARAM(lp),width=box->rect.right-box->rect.left;
@@ -2022,10 +2066,9 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             SetCapture(hwnd);return 0;
         }
         if(hwnd==d->header && y>=h && HasGroupTabs(*box)) {
-            auto tabs=GroupTabs(*box);
-            if(tabs.size()>1) {
-                const size_t index=min(tabs.size()-1,static_cast<size_t>(max(0,x)*static_cast<int>(tabs.size())/max(1,width)));
-                g_tabPending=true;g_tabInsert=-1;g_dragId=tabs[index]->id;g_boxStart=tabs[index]->rect;GetCursorPos(&g_mouseStart);SetCapture(hwnd);return 0;
+            bool groupTitle=false;
+            if(auto* tab=HeaderRenameTarget(*box,{x,y},groupTitle)) {
+                g_tabPending=true;g_tabInsert=-1;g_dragId=tab->id;g_boxStart=tab->rect;GetCursorPos(&g_mouseStart);SetCapture(hwnd);return 0;
             }
         }
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;

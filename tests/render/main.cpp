@@ -99,7 +99,7 @@ int main() {
     nestlone::Box list;list.rect={10,10,220,80};list.items={L"0",L"1"};list.iconView=false;auto listRect=nestlone::FitGrid(list,snapshot);check(listRect.bottom>=list.rect.top+nestlone::HeaderHeight()+16+2*nestlone::HeaderHeight(),"list view expands one row per item");check(nestlone::BoxSlot(list,{20,list.rect.top+nestlone::HeaderHeight()+10})==0,"list view hit testing uses rows");
     nestlone::Layout groups;
     nestlone::Box a,b,c;a.id=L"a";a.title=L"A";a.groupTitle=L"Group";a.activeTabId=L"c";
-    b.id=L"b";b.groupId=L"a";c.id=L"c";c.groupId=L"a";groups.boxes={a,b,c};nestlone::g_layout=&groups;
+    b.id=L"b";b.title=L"B";b.groupId=L"a";c.id=L"c";c.title=L"C";c.groupId=L"a";groups.boxes={a,b,c};nestlone::g_layout=&groups;
     nestlone::ReorderTab(groups.boxes[0],3);
     auto ordered=nestlone::GroupTabs(groups.boxes[0]);
     check(ordered[0]->id==L"b"&&ordered[1]->id==L"c"&&ordered[2]->id==L"a","root tab can move to end without changing group root");
@@ -108,6 +108,35 @@ int main() {
     check(ordered[0]->id==L"c"&&ordered[1]->id==L"b"&&ordered[2]->id==L"a","member can move from middle to first");
     nestlone::ReorderTab(groups.boxes[2],1);ordered=nestlone::GroupTabs(groups.boxes[0]);
     check(ordered[0]->id==L"c","drop beside original slot keeps order");
+    const int headerHeight=nestlone::HeaderHeight();
+    const int groupWidth=groups.boxes[0].rect.right-groups.boxes[0].rect.left;
+    bool groupTitle=false;
+    check(nestlone::HeaderRenameTarget(groups.boxes[0],{40,headerHeight/2},groupTitle)==&groups.boxes[0]&&groupTitle,
+        "double clicking group title targets the group name");
+    for(size_t i=0;i<ordered.size();++i) {
+        const LONG left=static_cast<LONG>(i*groupWidth/ordered.size());
+        check(nestlone::HeaderRenameTarget(groups.boxes[0],{left,headerHeight+2},groupTitle)==ordered[i]&&!groupTitle,
+            "each tab boundary targets its own box after reordering");
+        const RECT editRect=nestlone::BoxRenameRect(*ordered[i],false);
+        check(editRect.left==groups.boxes[0].rect.left+left+4&&editRect.top>groups.boxes[0].rect.top+headerHeight,
+            "tab editor is positioned over the second-row label");
+    }
+    check(!nestlone::HeaderRenameTarget(groups.boxes[0],{groupWidth-1,2},groupTitle),
+        "header buttons do not trigger renaming");
+    nestlone::g_instance=GetModuleHandleW(nullptr);
+    nestlone::BeginRename(groups.boxes[2]);
+    DWORD selectionStart=99,selectionEnd=99;
+    SendMessageW(nestlone::g_edit,EM_GETSEL,reinterpret_cast<WPARAM>(&selectionStart),reinterpret_cast<LPARAM>(&selectionEnd));
+    check(nestlone::g_edit&&selectionStart==0&&selectionEnd==1,
+        "tab rename selects the full existing name");
+    SendMessageW(nestlone::g_edit,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(L"Renamed tab"));
+    SendMessageW(nestlone::g_edit,WM_KEYDOWN,VK_RETURN,0);
+    check(!nestlone::g_edit&&groups.boxes[2].title==L"Renamed tab"&&groups.boxes[0].groupTitle==L"Group"&&
+        groups.boxes[0].activeTabId==L"c","Enter saves only the tab name while retaining group and selection");
+    nestlone::BeginRename(groups.boxes[2]);
+    SendMessageW(nestlone::g_edit,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(L"Cancelled"));
+    SendMessageW(nestlone::g_edit,WM_KEYDOWN,VK_ESCAPE,0);
+    check(groups.boxes[2].title==L"Renamed tab"&&!nestlone::g_edit,"Escape cancels tab renaming");
     nestlone::Layout::Widget savedNote,legacyWeather;
     savedNote.id=L"saved-note";savedNote.text=L"保留这张便签";savedNote.locked=true;
     savedNote.closed=true;savedNote.color=RGB(248,231,233);
