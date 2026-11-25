@@ -39,6 +39,38 @@ int main() {
     afterRefresh.entries[0].displayName=L"Updated name";
     check(nestlone::CompareDesktopVisuals(beforeRefresh,afterRefresh)==DesktopVisualChange::Items,
         "desktop display name change repaints even with identical paths");
+    {
+        nestlone::Layout refreshLayout;
+        nestlone::Box root,tab;root.id=L"refresh-root";tab.id=L"refresh-tab";
+        root.activeTabId=tab.id;tab.groupId=root.id;
+        root.items={L"C:\\refresh-root.txt"};tab.items={L"C:\\refresh-tab.txt"};
+        refreshLayout.boxes={root,tab};nestlone::g_layout=&refreshLayout;
+        auto original=snapshot;
+        original.entries={{root.items[0],L"Root"},{tab.items[0],L"Tab"},{L"C:\\refresh-desktop.txt",L"Desktop",{120,220}}};
+        nestlone::g_snapshot=original;
+        auto reordered=original;std::reverse(reordered.entries.begin(),reordered.entries.end());
+        for(auto& entry:reordered.entries)entry.position={900,800};
+        nestlone::ApplyDesktopSnapshot(std::move(reordered));
+        const auto saved=nestlone::VisualPosition(L"C:\\refresh-desktop.txt");
+        check(saved.x==120&&saved.y==220,"refresh preserves desktop coordinates instead of Explorer's rearrangement");
+        check(refreshLayout.boxes[0].items==root.items&&refreshLayout.boxes[1].items==tab.items&&
+            refreshLayout.boxes[0].activeTabId==tab.id,"refresh retains grouped ownership and active tab");
+        nestlone::RebuildVisualIcons();
+        check(nestlone::g_visualIcons.size()==2&&
+            std::none_of(nestlone::g_visualIcons.begin(),nestlone::g_visualIcons.end(),[&](const auto& icon){return icon.path==root.items[0];}),
+            "refresh keeps inactive tab icons hidden");
+        auto unreadable=original;unreadable.readable=false;unreadable.entries.clear();
+        nestlone::ApplyDesktopSnapshot(std::move(unreadable));
+        check(nestlone::g_snapshot.entries.size()==3,"an unreadable refresh cannot erase the presented desktop");
+        auto empty=original;empty.entries.clear();nestlone::ApplyDesktopSnapshot(std::move(empty));
+        auto returned=original;for(auto& entry:returned.entries)entry.position={700,600};
+        nestlone::ApplyDesktopSnapshot(std::move(returned));
+        const auto restored=nestlone::VisualPosition(L"C:\\refresh-desktop.txt");
+        check(restored.x==120&&restored.y==220&&refreshLayout.desktop.size()==1&&
+            refreshLayout.boxes[1].items==tab.items,"items returning after enumeration rebuild retain their placement and owner");
+        nestlone::ReleaseVisualIcons();nestlone::FinishQueuedLayoutSave(false);
+        nestlone::g_snapshot={};nestlone::g_layout=nullptr;
+    }
     nestlone::Box grid;grid.rect={103,57,387,300};grid.iconView=true;
     for(int i=0;i<7;++i){nestlone::DesktopEntry e;e.path=std::to_wstring(i);snapshot.entries.push_back(e);grid.items.push_back(e.path);}
     grid.rect=nestlone::FitGrid(grid,snapshot);

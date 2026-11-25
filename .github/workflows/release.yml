@@ -1,7 +1,10 @@
 name: Build and publish Windows release
 
 on:
+  workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -33,6 +36,10 @@ jobs:
           Copy-Item .\README.md $dist
           Compress-Archive -Path (Join-Path $dist '*') -DestinationPath "$env:RUNNER_TEMP\nestlone-D-windows-x64.zip"
 
+      - name: Run regression checks
+        shell: cmd
+        run: tests\render\run.bat
+
       - name: Preserve build output
         uses: actions/upload-artifact@v4
         with:
@@ -44,6 +51,7 @@ jobs:
           retention-days: 14
 
       - name: Create or update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

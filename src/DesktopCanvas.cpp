@@ -999,23 +999,15 @@ void Arrange(Box& box,const DesktopSnapshot& snapshot=g_snapshot) {
     if(!moves.empty())QueueMoves(moves);
     PaintAll();SaveLayout(*g_layout);
 }
-void Observe(const DesktopSnapshot& before,const DesktopSnapshot& after) {
-    if(!before.readable||before.listview!=after.listview||before.process!=after.process)return;
-    bool changed=false;std::vector<bool> arrange(g_layout->boxes.size(),false);
-    for(const auto& entry:after.entries) {
-        auto old=FindEntry(before,entry.path);
-        if(old && old->position.x==entry.position.x && old->position.y==entry.position.y)continue;
-        int owner=-1;for(int i=0;i<static_cast<int>(g_layout->boxes.size());++i)if(HasPath(g_layout->boxes[i],entry.path)){owner=i;break;}
-        int target=ContainingBox(entry);
-        if(target>=0)arrange[target]=true;
-        if(owner>=0)arrange[owner]=true;
-        if(target==owner)continue;
-        for(auto& box:g_layout->boxes)box.items.erase(std::remove_if(box.items.begin(),box.items.end(),[&](const auto& p){return _wcsicmp(p.c_str(),entry.path.c_str())==0;}),box.items.end());
-        if(target>=0)AddItem(g_layout->boxes[target],entry.path);
-        changed=true;
+void RememberDesktopPositions(const DesktopSnapshot& snapshot) {
+    if(!g_layout||!snapshot.readable)return;
+    bool changed=false;
+    for(const auto& entry:snapshot.entries) {
+        if(std::any_of(g_layout->boxes.begin(),g_layout->boxes.end(),[&](const Box& box){return HasPath(box,entry.path);}))continue;
+        if(std::any_of(g_layout->desktop.begin(),g_layout->desktop.end(),[&](const auto& item){return _wcsicmp(item.path.c_str(),entry.path.c_str())==0;}))continue;
+        g_layout->desktop.push_back({entry.path,entry.position});changed=true;
     }
-    if(changed)SaveLayout(*g_layout);
-    for(size_t i=0;i<arrange.size();++i)if(arrange[i])Arrange(g_layout->boxes[i],after);
+    if(changed)QueueLayoutSave();
 }
 void PlaceNewDesktopEntries(const DesktopSnapshot& before,const DesktopSnapshot& after) {
     if(!g_layout||!before.readable||before.listview!=after.listview)return;
@@ -1025,6 +1017,9 @@ void PlaceNewDesktopEntries(const DesktopSnapshot& before,const DesktopSnapshot&
         if(FindEntry(before,entry.path))continue;
         auto& boxes=g_layout->boxes;
         if(std::any_of(boxes.begin(),boxes.end(),[&](const Box& box){return HasPath(box,entry.path);}))continue;
+        // A refresh can briefly remove an item from Explorer's enumeration.
+        // Reappearance must not overwrite its saved position or classification.
+        if(std::any_of(g_layout->desktop.begin(),g_layout->desktop.end(),[&](const auto& item){return _wcsicmp(item.path.c_str(),entry.path.c_str())==0;}))continue;
         int target=-1;
         if(g_layout->autoOrganize&&!g_layout->autoRules.empty()) {
             const DWORD attributes=GetFileAttributesW(entry.path.c_str());
@@ -1052,6 +1047,8 @@ void PlaceNewDesktopEntries(const DesktopSnapshot& before,const DesktopSnapshot&
     QueueLayoutSave();
 }
 void ApplyDesktopSnapshot(DesktopSnapshot&& next,bool forceRepaint=false) {
+    if(!next.readable)return;
+    RememberDesktopPositions(g_snapshot);
     const auto change=CompareDesktopVisuals(g_snapshot,next);
     if(change==DesktopVisualChange::Items) {
         PlaceNewDesktopEntries(g_snapshot,next);
@@ -1752,11 +1749,23 @@ bool HideNativeDesktopAfterSurfaceIsReady() {
     g_nativeHidden=true;
     return true;
 }
+bool MaintainNativeDesktopVisibility() {
+    if(!g_visible||!g_nativeHidden)return true;
+    if(!IsWindow(g_host.listview))return false;
+    if(!IsWindowVisible(g_host.listview))return true;
+    // Explorer may show its ListView again after Refresh. Revalidate our
+    // presented surface before reclaiming visibility, retaining the layout.
+    if(!PrimeSurface()||!HideNativeDesktopAfterSurfaceIsReady())return false;
+    db::LogF("[canvas] restored owned desktop after Explorer showed its icons");
+    return true;
+}
 bool Attach() {
     // Foreground changes only require ordering our window. Do not enumerate
     // every Explorer child or synchronously query its ListView every 350 ms.
     if(IsWindow(g_background)&&IsWindow(g_host.listview)&&IsWindow(g_host.defviewParent)&&g_nativeHidden) {
-        UpdateSurfaceVisibility();return true;
+        UpdateSurfaceVisibility();
+        if(!MaintainNativeDesktopVisibility()){DestroyDecorations();return false;}
+        return true;
     }
     auto host=db::DiscoverDesktopHost();
     if(!host.listview || !host.defviewParent){db::LogF("[canvas] attach deferred: desktop host unavailable");return false;}
@@ -1780,6 +1789,7 @@ bool Attach() {
         return false;
     }
     g_snapshot=std::move(initial);g_visualDirty=true;
+    RememberDesktopPositions(g_snapshot);
     POINT origin{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)};
     g_background=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
         L"nestlone-D.Decoration",L"",WS_POPUP,origin.x,origin.y,GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_CYVIRTUALSCREEN),nullptr,nullptr,g_instance,nullptr);
@@ -2181,6 +2191,7 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             g_forceShellRepaint=false;
             ApplyDesktopSnapshot(std::move(next),forceRepaint);
         }
+        if(!MaintainNativeDesktopVisibility())DestroyDecorations();
         return 0;
     }
     if(message==WM_TIMER) {
@@ -2195,7 +2206,8 @@ LRESULT CALLBACK ManagerProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             if(next.readable) {
                 bool settling=g_pending!=0;
                 if(settling && next.applied>=g_pending){g_pending=0;g_moves.clear();g_status=next.error;}
-                if(!g_nativeHidden && !settling && !g_drag && !(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000))Observe(g_snapshot,next);
+                // Shell refresh/reordering is not a user drag. Box membership
+                // changes only through our explicit drop/classification paths.
                 // Keep the pre-drag baseline until Explorer has finished native drag/drop.
                 if(!(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !(GetAsyncKeyState(VK_RBUTTON)&0x8000)){
                     ApplyDesktopSnapshot(std::move(next));

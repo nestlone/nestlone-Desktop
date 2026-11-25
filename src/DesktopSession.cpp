@@ -136,7 +136,7 @@ bool ReadDesktop(DesktopSnapshot& result) {
     int count=0;if(FAILED(view->ItemCount(SVGIO_ALLVIEW,&count)))return false;
     for(int i=0;i<count;++i) {
         PITEMID_CHILD item=nullptr;
-        if(FAILED(view->Item(i,&item))||!item)continue;
+        if(FAILED(view->Item(i,&item))||!item){CoTaskMemFree(item);return false;}
         STRRET parsed{},display{};wchar_t path[32768]{},name[32768]{};POINT position{};
         if(SUCCEEDED(folder->GetDisplayNameOf(item,SHGDN_FORPARSING,&parsed)) &&
            SUCCEEDED(StrRetToBufW(&parsed,item,path,32768)) && SUCCEEDED(view->GetItemPosition(item,&position))) {
@@ -154,6 +154,17 @@ bool ReadDesktop(DesktopSnapshot& result) {
         }
         CoTaskMemFree(item);
     }
+    // Refresh can replace the Shell view while this COM enumeration is in
+    // flight. Never publish a partial or mixed generation as a full desktop.
+    int finalCount=0;
+    const auto currentHost=db::DiscoverDesktopHost();
+    if(result.entries.size()!=static_cast<size_t>(count)||
+       FAILED(view->ItemCount(SVGIO_ALLVIEW,&finalCount))||finalCount!=count||
+       currentHost.listview!=result.listview)return false;
+    std::vector<std::wstring> paths;paths.reserve(result.entries.size());
+    for(const auto& entry:result.entries)paths.push_back(entry.path);
+    std::sort(paths.begin(),paths.end(),[](const auto& a,const auto& b){return _wcsicmp(a.c_str(),b.c_str())<0;});
+    if(std::adjacent_find(paths.begin(),paths.end(),[](const auto& a,const auto& b){return _wcsicmp(a.c_str(),b.c_str())==0;})!=paths.end())return false;
     result.readable=true;return true;
 }
 HRESULT CreateDesktopDataObject(const std::vector<std::wstring>& paths,IDataObject** output) {
