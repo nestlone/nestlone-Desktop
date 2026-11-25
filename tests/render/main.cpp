@@ -166,6 +166,21 @@ int main() {
     check(groups.boxes[1].groupTitle==L"Group"&&groups.boxes[1].activeTabId==L"c","root promotion preserves title and active tab");
     nestlone::DetachTab(groups.boxes[2]);
     check(groups.boxes[2].groupId.empty()&&groups.boxes[1].activeTabId.empty(),"active member detaches and remaining root becomes active");
+    for(auto& member:groups.boxes)member.selected=true;
+    nestlone::PrepareBoxDrag(groups.boxes[0]);
+    check(nestlone::g_boxDragStart.size()==1&&nestlone::g_boxDragStart[0].first==L"a"&&
+        !groups.boxes[1].selected&&!groups.boxes[2].selected,
+        "normal drag excludes unrelated boxes even when every box has stale selection");
+    groups.boxes={a,b,c};
+    nestlone::PrepareBoxDrag(groups.boxes[1]);
+    check(nestlone::g_boxDragStart.size()==3,"dragging a group captures only its own members");
+    nestlone::DetachTab(groups.boxes[2]);
+    nestlone::PrepareBoxDrag(groups.boxes[2]);
+    check(nestlone::g_boxDragStart.size()==1&&nestlone::g_boxDragStart[0].first==L"c"&&
+        !groups.boxes[0].selected&&!groups.boxes[1].selected,
+        "detached tab drag clears former group selection");
+    nestlone::g_boxDragStart.clear();
+    groups.boxes={a,b,c};
     groups.boxes[0].items={L"cached-item"};
     nestlone::VisualIcon cached;cached.path=L"cached-item";
     nestlone::g_previewGroup=L"a";

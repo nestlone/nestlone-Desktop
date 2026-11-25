@@ -179,6 +179,17 @@ void SyncGroupRect(Box& box) {
     const RECT rect=box.rect;
     for(auto& candidate:g_layout->boxes)if(GroupRoot(candidate)==root)candidate.rect=rect;
 }
+void PrepareBoxDrag(Box& box) {
+    Box* root=GroupRoot(box);
+    g_boxDragStart.clear();
+    // Selection can outlive tab merges and detachments. It must never expand
+    // the scope of a normal drag to unrelated desktop groups.
+    for(auto& candidate:g_layout->boxes) {
+        const bool belongs=GroupRoot(candidate)==root;
+        candidate.selected=belongs;
+        if(belongs)g_boxDragStart.push_back({candidate.id,candidate.rect});
+    }
+}
 bool HasPath(const Box& box,const std::wstring& path) {
     return std::any_of(box.items.begin(),box.items.end(),[&](const auto& p){return _wcsicmp(p.c_str(),path.c_str())==0;});
 }
@@ -2074,13 +2085,8 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         if(!ctrl)for(auto& item:g_visualIcons)item.selected=false;
         if(ctrl){box->selected=!box->selected;if(!box->selected){g_visualDirty=true;PaintAll();}return 0;}
-        if(!box->selected)for(auto& candidate:g_layout->boxes)candidate.selected=false;
-        box->selected=true;g_drag=true;g_resizing=hwnd==d->grip||hwnd==d->gripLeft;g_resizeFromLeft=hwnd==d->gripLeft;g_dragId=box->id;g_boxStart=box->rect;GetCursorPos(&g_mouseStart);g_dragStart.clear();g_boxDragStart.clear();
-        if(HasGroupTabs(*box)) {
-            for(const auto& candidate:g_layout->boxes)if(GroupRoot(candidate)==box)g_boxDragStart.push_back({candidate.id,candidate.rect});
-        } else {
-            for(const auto& candidate:g_layout->boxes)if(candidate.selected)g_boxDragStart.push_back({candidate.id,candidate.rect});
-        }
+        PrepareBoxDrag(*box);
+        g_drag=true;g_resizing=hwnd==d->grip||hwnd==d->gripLeft;g_resizeFromLeft=hwnd==d->gripLeft;g_dragId=box->id;g_boxStart=box->rect;GetCursorPos(&g_mouseStart);g_dragStart.clear();
         for(const auto& e:g_snapshot.entries)if(HasPath(*box,e.path))g_dragStart.push_back({e.path,e.position});
         SetCapture(hwnd);return 0;
     }
@@ -2100,7 +2106,7 @@ LRESULT CALLBACK DecorationProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             g_tabInsert=-1;
             if(auto* tab=FindBox(g_dragId)) {
                 DetachTab(*tab);
-                tab->rect=g_boxStart;tab->selected=true;g_boxDragStart={{tab->id,g_boxStart}};g_drag=true;g_tabPending=false;g_tabDetached=true;g_resizing=false;g_visualDirty=true;box=tab;
+                tab->rect=g_boxStart;PrepareBoxDrag(*tab);g_drag=true;g_tabPending=false;g_tabDetached=true;g_resizing=false;g_visualDirty=true;box=tab;
                 Rebuild();
             }
         }
