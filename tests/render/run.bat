@@ -2,7 +2,13 @@
 setlocal
 set VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools
 if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" set VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools
+if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" set VSDIR=C:\Program Files\Microsoft Visual Studio\2022\BuildTools
+if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" set VSDIR=
+if "%VSDIR%"=="" set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
+if "%VSDIR%"=="" if exist "%VSWHERE%" for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSDIR=%%I
+if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" exit /b 1
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
+if errorlevel 1 exit /b 1
 pushd "%~dp0..\.."
 if not exist build\obj mkdir build\obj
 cl /nologo /std:c++20 /utf-8 /EHsc /W4 /DUNICODE /D_UNICODE /DDESKBOX_TESTING tests\render\main.cpp src\BoxModel.cpp src\DesktopSession.cpp src\DesktopHost.cpp src\DesktopItems.cpp src\Settings.cpp src\log.cpp /Fo"build\obj\\" /Fe"build\render-test.exe" /link /MANIFEST:EMBED /MANIFESTINPUT:src\compatibility.xml user32.lib shell32.lib shlwapi.lib gdi32.lib gdiplus.lib ole32.lib oleaut32.lib comctl32.lib comdlg32.lib advapi32.lib
